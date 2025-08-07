@@ -271,6 +271,11 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 	trafficStat.UploadBytes += length
 	trafficStat.APIPut += trafficStat.UploadChunkCount
 
+	// 清理懒加载文件的本地chunks
+	for _, file := range uploadFiles {
+		repo.cleanupLazyFileChunks(file)
+	}
+
 	// 更新云端索引信息
 	err = repo.updateCloudIndexes(latest, trafficStat, context)
 	if nil != err {

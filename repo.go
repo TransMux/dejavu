@@ -45,14 +45,15 @@ import (
 
 // Repo 描述了逮虾户数据仓库。
 type Repo struct {
-	DataPath    string   // 数据文件夹的绝对路径，如：F:\\SiYuan\\data\\
-	Path        string   // 仓库的绝对路径，如：F:\\SiYuan\\repo\\
-	HistoryPath string   // 数据历史文件夹的绝对路径，如：F:\\SiYuan\\history\\
-	TempPath    string   // 临时文件夹的绝对路径，如：F:\\SiYuan\\temp\\
-	DeviceID    string   // 设备 ID
-	DeviceName  string   // 设备名称
-	DeviceOS    string   // 操作系统
-	IgnoreLines []string // 忽略配置文件内容行，是用 .gitignore 语法
+	DataPath            string   // 数据文件夹的绝对路径，如：F:\\SiYuan\\data\\
+	Path                string   // 仓库的绝对路径，如：F:\\SiYuan\\repo\\
+	HistoryPath         string   // 数据历史文件夹的绝对路径，如：F:\\SiYuan\\history\\
+	TempPath            string   // 临时文件夹的绝对路径，如：F:\\SiYuan\\temp\\
+	DeviceID            string   // 设备 ID
+	DeviceName          string   // 设备名称
+	DeviceOS            string   // 操作系统
+	IgnoreLines         []string // 忽略配置文件内容行，是用 .gitignore 语法
+	LazyLoadingPatterns []string // 懒加载文件夹模式匹配，使用 .gitignore 语法
 
 	store    *Store      // 仓库的存储
 	chunkPol chunker.Pol // 文件分块多项式值
@@ -61,19 +62,25 @@ type Repo struct {
 
 // NewRepo 创建一个新的仓库。
 func NewRepo(dataPath, repoPath, historyPath, tempPath, deviceID, deviceName, deviceOS string, aesKey []byte, ignoreLines []string, cloud cloud.Cloud) (ret *Repo, err error) {
+	return NewRepoWithLazyLoading(dataPath, repoPath, historyPath, tempPath, deviceID, deviceName, deviceOS, aesKey, ignoreLines, nil, cloud)
+}
+
+// NewRepoWithLazyLoading 创建一个新的仓库，支持懒加载配置。
+func NewRepoWithLazyLoading(dataPath, repoPath, historyPath, tempPath, deviceID, deviceName, deviceOS string, aesKey []byte, ignoreLines []string, lazyLoadingPatterns []string, cloud cloud.Cloud) (ret *Repo, err error) {
 	if nil != cloud {
 		cloud.GetConf().RepoPath = repoPath
 	}
 	ret = &Repo{
-		DataPath:    filepath.Clean(dataPath),
-		Path:        filepath.Clean(repoPath),
-		HistoryPath: filepath.Clean(historyPath),
-		TempPath:    filepath.Clean(tempPath),
-		DeviceID:    deviceID,
-		DeviceName:  deviceName,
-		DeviceOS:    deviceOS,
-		cloud:       cloud,
-		chunkPol:    chunker.Pol(0x3DA3358B4DC173), // 固定分块多项式值
+		DataPath:            filepath.Clean(dataPath),
+		Path:                filepath.Clean(repoPath),
+		HistoryPath:         filepath.Clean(historyPath),
+		TempPath:            filepath.Clean(tempPath),
+		DeviceID:            deviceID,
+		DeviceName:          deviceName,
+		DeviceOS:            deviceOS,
+		cloud:               cloud,
+		chunkPol:            chunker.Pol(0x3DA3358B4DC173), // 固定分块多项式值
+		LazyLoadingPatterns: lazyLoadingPatterns,
 	}
 	if !strings.HasSuffix(ret.DataPath, string(os.PathSeparator)) {
 		ret.DataPath += string(os.PathSeparator)
@@ -86,6 +93,7 @@ func NewRepo(dataPath, repoPath, historyPath, tempPath, deviceID, deviceName, de
 	}
 	ignoreLines = gulu.Str.RemoveDuplicatedElem(ignoreLines)
 	ret.IgnoreLines = ignoreLines
+	ret.LazyLoadingPatterns = gulu.Str.RemoveDuplicatedElem(ret.LazyLoadingPatterns)
 	ret.store, err = NewStore(ret.Path, aesKey)
 	return
 }
@@ -909,6 +917,23 @@ func (repo *Repo) ignoreMatcher() *ignore.GitIgnore {
 	return ignore.CompileIgnoreLines(repo.IgnoreLines...)
 }
 
+// lazyLoadingMatcher 返回懒加载模式匹配器
+func (repo *Repo) lazyLoadingMatcher() *ignore.GitIgnore {
+	if len(repo.LazyLoadingPatterns) == 0 {
+		return ignore.CompileIgnoreLines() // 返回空匹配器
+	}
+	return ignore.CompileIgnoreLines(repo.LazyLoadingPatterns...)
+}
+
+// isLazyLoadingFile 检查文件是否为懒加载文件
+func (repo *Repo) isLazyLoadingFile(filePath string) bool {
+	if len(repo.LazyLoadingPatterns) == 0 {
+		return false
+	}
+	matcher := repo.lazyLoadingMatcher()
+	return matcher.MatchesPath(filePath)
+}
+
 func (repo *Repo) absPath(relPath string) string {
 	return filepath.Join(repo.DataPath, relPath)
 }
@@ -920,6 +945,40 @@ func (repo *Repo) relPath(absPath string) string {
 
 func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{}, count, total int) (err error) {
 	absPath := repo.absPath(file.Path)
+
+	// 检查是否为懒加载文件
+	if repo.isLazyLoadingFile(file.Path) {
+		// 对于懒加载文件，需要处理chunks用于云端存储，但标记为懒加载
+		logging.LogInfof("processing lazy loading file [%s] for cloud storage", file.Path)
+
+		// 验证文件仍然存在且未被修改
+		newInfo, statErr := os.Stat(absPath)
+		if nil != statErr {
+			logging.LogErrorf("stat lazy loading file [%s] failed: %s", absPath, statErr)
+			err = statErr
+			return
+		}
+
+		newSize := newInfo.Size()
+		newUpdated := newInfo.ModTime().Unix()
+		if file.Size != newSize || file.SecUpdated() != newUpdated {
+			logging.LogErrorf("lazy loading file changed [%s], size [%d -> %d], updated [%d -> %d]", absPath, file.Size, newSize, file.SecUpdated(), newUpdated)
+			err = ErrIndexFileChanged
+			return
+		}
+
+		// 为懒加载文件创建chunks（用于云端存储）
+		err = repo.createLazyFileChunks(file, absPath)
+		if nil != err {
+			logging.LogErrorf("create lazy file chunks failed: %s", err)
+			return
+		}
+
+		eventbus.Publish(eventbus.EvtIndexUpsertFile, context, count, total)
+		// 存储文件元数据（包含chunks信息用于云端）
+		err = repo.store.PutFile(file)
+		return
+	}
 
 	if chunker.MinSize > file.Size {
 		var data []byte
@@ -1066,6 +1125,27 @@ func (repo *Repo) checkoutFiles(files []*entity.File, context map[string]interfa
 	}
 
 	//now := time.Now()
+
+	// 过滤掉懒加载文件
+	var filteredFiles []*entity.File
+	var skippedLazyFiles []*entity.File
+	for _, file := range files {
+		if repo.isLazyLoadingFile(file.Path) {
+			skippedLazyFiles = append(skippedLazyFiles, file)
+			logging.LogInfof("skipping checkout for lazy loading file [%s]", file.Path)
+		} else {
+			filteredFiles = append(filteredFiles, file)
+		}
+	}
+
+	if len(skippedLazyFiles) > 0 {
+		logging.LogInfof("skipped [%d] lazy loading files during checkout", len(skippedLazyFiles))
+	}
+
+	files = filteredFiles
+	if 1 > len(files) {
+		return
+	}
 
 	var dotSiYuans, assets, emojis, storage, plugins, widgets, templates, public, others, all []*entity.File
 	for _, file := range files {
@@ -1254,4 +1334,230 @@ func (repo *Repo) isCloudSiYuan() bool {
 	default:
 		return false
 	}
+}
+
+// LazyLoadFile 按需加载指定的懒加载文件
+func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) (err error) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	relPath := repo.relPath(filePath)
+
+	// 检查是否为懒加载文件
+	if !repo.isLazyLoadingFile(relPath) {
+		return fmt.Errorf("file [%s] is not a lazy loading file", relPath)
+	}
+
+	// 检查文件是否已存在
+	absPath := repo.absPath(relPath)
+	if gulu.File.IsExist(absPath) {
+		logging.LogInfof("file [%s] already exists locally", relPath)
+		return nil
+	}
+
+	// 获取最新索引
+	latest, err := repo.Latest()
+	if nil != err {
+		return fmt.Errorf("get latest index failed: %s", err)
+	}
+
+	// 从索引中查找文件
+	var targetFile *entity.File
+	latestFiles, err := repo.getFiles(latest.Files)
+	if nil != err {
+		return fmt.Errorf("get latest files failed: %s", err)
+	}
+
+	for _, file := range latestFiles {
+		if file.Path == relPath {
+			targetFile = file
+			break
+		}
+	}
+
+	if nil == targetFile {
+		return fmt.Errorf("file [%s] not found in latest index", relPath)
+	}
+
+	// 如果是云同步，从云端下载文件和chunks
+	if nil != repo.cloud {
+		err = repo.lazyLoadFromCloud(targetFile, context)
+		if nil != err {
+			return fmt.Errorf("lazy load from cloud failed: %s", err)
+		}
+	} else {
+		return fmt.Errorf("lazy loading requires cloud storage")
+	}
+
+	// 检出文件到本地
+	err = repo.checkoutFile(targetFile, repo.DataPath, 1, 1, context)
+	if nil != err {
+		return fmt.Errorf("checkout file failed: %s", err)
+	}
+
+	logging.LogInfof("lazy loaded file [%s] successfully", relPath)
+	return nil
+}
+
+// lazyLoadFromCloud 从云端加载文件及其chunks
+func (repo *Repo) lazyLoadFromCloud(file *entity.File, context map[string]interface{}) (err error) {
+	// 检查文件是否已在本地存储
+	localFile, err := repo.store.GetFile(file.ID)
+	if nil == err && nil != localFile {
+		// 文件已存在，检查chunks
+		return repo.ensureChunksAvailable(file, context)
+	}
+
+	// 从云端下载文件元数据
+	length, cloudFile, err := repo.downloadCloudFile(file.ID, 1, 1, context)
+	if nil != err {
+		return fmt.Errorf("download cloud file failed: %s", err)
+	}
+
+	// 存储文件元数据
+	err = repo.store.PutFile(cloudFile)
+	if nil != err {
+		return fmt.Errorf("put file failed: %s", err)
+	}
+
+	logging.LogInfof("downloaded file metadata [%s], size: %d bytes", file.Path, length)
+
+	// 下载所有chunks
+	return repo.ensureChunksAvailable(cloudFile, context)
+}
+
+// ensureChunksAvailable 确保文件的所有chunks都可用
+func (repo *Repo) ensureChunksAvailable(file *entity.File, context map[string]interface{}) (err error) {
+	// 检查本地缺失的chunks
+	missingChunks, err := repo.localNotFoundChunks(file.Chunks)
+	if nil != err {
+		return fmt.Errorf("check local chunks failed: %s", err)
+	}
+
+	if len(missingChunks) == 0 {
+		logging.LogInfof("all chunks for file [%s] are already available", file.Path)
+		return nil
+	}
+
+	// 从云端下载缺失的chunks
+	length, err := repo.downloadCloudChunksPut(missingChunks, context)
+	if nil != err {
+		return fmt.Errorf("download cloud chunks failed: %s", err)
+	}
+
+	logging.LogInfof("downloaded [%d] chunks for file [%s], size: %d bytes", len(missingChunks), file.Path, length)
+	return nil
+}
+
+// createLazyFileChunks 为懒加载文件创建chunks，但不在本地存储chunks数据
+func (repo *Repo) createLazyFileChunks(file *entity.File, absPath string) (err error) {
+	// 对于懒加载文件，我们需要创建chunks用于云端存储
+	// 但这些chunks不会在本地持久化，只用于上传
+
+	if chunker.MinSize > file.Size {
+		// 小文件直接作为一个chunk
+		var data []byte
+		data, err = filelock.ReadFile(absPath)
+		if nil != err {
+			logging.LogErrorf("read lazy file [%s] failed: %s", absPath, err)
+			return
+		}
+
+		chunkHash := util.Hash(data)
+		file.Chunks = append(file.Chunks, chunkHash)
+
+		// 临时存储chunk用于上传
+		chunk := &entity.Chunk{ID: chunkHash, Data: data}
+		if err = repo.store.PutChunk(chunk); nil != err {
+			logging.LogErrorf("put lazy chunk [%s] failed: %s", chunkHash, err)
+			return
+		}
+		return
+	}
+
+	// 大文件分块处理
+	reader, err := filelock.OpenFile(absPath, os.O_RDONLY, 0644)
+	if nil != err {
+		logging.LogErrorf("open lazy file [%s] failed: %s", absPath, err)
+		return
+	}
+	defer filelock.CloseFile(reader)
+
+	chnkr := chunker.NewWithBoundaries(reader, repo.chunkPol, chunker.MinSize, chunker.MaxSize)
+	for {
+		buf := make([]byte, chunker.MaxSize)
+		chnk, chnkErr := chnkr.Next(buf)
+		if io.EOF == chnkErr {
+			break
+		}
+		if nil != chnkErr {
+			err = chnkErr
+			logging.LogErrorf("chunk lazy file [%s] failed: %s", absPath, chnkErr)
+			return
+		}
+
+		chunkHash := util.Hash(chnk.Data)
+		file.Chunks = append(file.Chunks, chunkHash)
+
+		// 临时存储chunk用于上传
+		chunk := &entity.Chunk{ID: chunkHash, Data: chnk.Data}
+		if err = repo.store.PutChunk(chunk); nil != err {
+			logging.LogErrorf("put lazy chunk [%s] failed: %s", chunkHash, err)
+			return
+		}
+	}
+
+	logging.LogInfof("created [%d] chunks for lazy file [%s]", len(file.Chunks), file.Path)
+	return
+}
+
+// cleanupLazyFileChunks 清理懒加载文件的本地chunks（上传后调用）
+func (repo *Repo) cleanupLazyFileChunks(file *entity.File) {
+	if !repo.isLazyLoadingFile(file.Path) {
+		return
+	}
+
+	for _, chunkID := range file.Chunks {
+		err := repo.store.Remove(chunkID)
+		if nil != err {
+			logging.LogWarnf("remove lazy chunk [%s] failed: %s", chunkID, err)
+		}
+	}
+	logging.LogInfof("cleaned up [%d] chunks for lazy file [%s]", len(file.Chunks), file.Path)
+}
+
+// LazyLoadFiles 批量按需加载多个懒加载文件
+func (repo *Repo) LazyLoadFiles(filePaths []string, context map[string]interface{}) (err error) {
+	for i, filePath := range filePaths {
+		err = repo.LazyLoadFile(filePath, context)
+		if nil != err {
+			return fmt.Errorf("lazy load file [%s] failed: %s", filePath, err)
+		}
+
+		if nil != context {
+			eventbus.Publish(eventbus.EvtCheckoutUpsertFile, context, i+1, len(filePaths))
+		}
+	}
+	return nil
+}
+
+// GetLazyLoadingFiles 获取当前索引中的所有懒加载文件列表
+func (repo *Repo) GetLazyLoadingFiles() (lazyFiles []*entity.File, err error) {
+	latest, err := repo.Latest()
+	if nil != err {
+		return nil, fmt.Errorf("get latest index failed: %s", err)
+	}
+
+	files, err := repo.getFiles(latest.Files)
+	if nil != err {
+		return nil, fmt.Errorf("get files failed: %s", err)
+	}
+
+	for _, file := range files {
+		if repo.isLazyLoadingFile(file.Path) {
+			lazyFiles = append(lazyFiles, file)
+		}
+	}
+
+	return lazyFiles, nil
 }

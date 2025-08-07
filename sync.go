@@ -1557,6 +1557,11 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 	trafficStat.UploadFileCount += len(upsertFiles)
 	trafficStat.UploadBytes += length
 	trafficStat.APIPut += trafficStat.UploadFileCount
+
+	// 清理懒加载文件的本地chunks
+	for _, file := range upsertFiles {
+		repo.cleanupLazyFileChunks(file)
+	}
 	return
 }
 
