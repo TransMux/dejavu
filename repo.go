@@ -782,6 +782,22 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		}
 	}
 
+	// 保留懒加载文件：
+	// 如果上一个最新索引中包含匹配懒加载规则的文件，但它们未被检出到本地（被 checkout 过滤），
+	// 那么当前遍历将无法发现这些文件，导致在本次索引中被误删。
+	// 这里将这些懒加载文件补充回 files 列表，以确保它们仍被包含到新索引中。
+	if 0 < len(latestFiles) && 0 < len(repo.LazyLoadingPatterns) {
+		existing := map[string]bool{}
+		for _, f := range files {
+			existing[f.Path] = true
+		}
+		for _, lf := range latestFiles {
+			if repo.isLazyLoadingFile(lf.Path) && !existing[lf.Path] {
+				files = append(files, lf)
+			}
+		}
+	}
+
 	upserts, removes = repo.diffUpsertRemove(files, latestFiles, false)
 	if 1 > len(upserts) && 1 > len(removes) {
 		ret = latest
