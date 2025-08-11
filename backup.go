@@ -17,10 +17,11 @@
 package dejavu
 
 import (
-	"github.com/siyuan-note/dejavu/cloud"
 	"os"
 	"path"
 	"strings"
+
+	"github.com/siyuan-note/dejavu/cloud"
 
 	"github.com/88250/gulu"
 	"github.com/siyuan-note/dejavu/entity"
@@ -79,8 +80,21 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 	downloadFileCount = len(fetchFileIDs)
 	apiGet += downloadFileCount
 
-	// 从文件列表中得到去重后的分块列表
-	cloudChunkIDs := repo.getChunks(fetchedFiles)
+	// 仅为非懒加载文件下载缺失的分块
+	var nonLazyFetched []*entity.File
+	skippedLazy := 0
+	for _, f := range fetchedFiles {
+		if repo.isLazyLoadingFile(f.Path) {
+			skippedLazy++
+			continue
+		}
+		nonLazyFetched = append(nonLazyFetched, f)
+	}
+	if skippedLazy > 0 {
+		logging.LogInfof("[Lazy Load] skip downloading chunks for [%d] files during index download", skippedLazy)
+	}
+	// 从非懒加载文件列表中得到去重后的分块列表
+	cloudChunkIDs := repo.getChunks(nonLazyFetched)
 
 	// 计算本地缺失的分块
 	fetchChunkIDs, err := repo.localNotFoundChunks(cloudChunkIDs)

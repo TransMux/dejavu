@@ -198,8 +198,21 @@ func (repo *Repo) sync0(context map[string]interface{},
 		return
 	}
 
-	// 从文件列表中得到去重后的分块列表
-	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
+	// 仅对非懒加载文件下载缺失的分块
+	var nonLazyCloudFiles []*entity.File
+	skippedLazy := 0
+	for _, f := range cloudLatestFiles {
+		if repo.isLazyLoadingFile(f.Path) {
+			skippedLazy++
+			continue
+		}
+		nonLazyCloudFiles = append(nonLazyCloudFiles, f)
+	}
+	if skippedLazy > 0 {
+		logging.LogInfof("[Lazy Load] skip downloading chunks for [%d] files during sync", skippedLazy)
+	}
+	// 从非懒加载文件列表中得到去重后的分块列表
+	cloudChunkIDs := repo.getChunks(nonLazyCloudFiles)
 
 	waitGroup := sync.WaitGroup{}
 	waitGroup.Add(1)
@@ -393,6 +406,27 @@ func (repo *Repo) sync0(context map[string]interface{},
 		// logging.LogInfof("sync merge ignore remove [%s]", remove.Path)
 	}
 	mergeResult.Removes = mergeResultRemovesTmp
+
+	// 确保冲突文件具备所需分块（懒加载文件在同步阶段默认不下载分块，这里按需下载）
+	if 0 < len(tmpMergeConflicts) {
+		var conflictChunkIDs []string
+		for _, f := range tmpMergeConflicts {
+			cf, getErr := repo.store.GetFile(f.ID)
+			if nil != getErr || nil == cf {
+				continue
+			}
+			conflictChunkIDs = append(conflictChunkIDs, cf.Chunks...)
+		}
+		if 0 < len(conflictChunkIDs) {
+			// 只下载缺失分块
+			missing, missErr := repo.localNotFoundChunks(conflictChunkIDs)
+			if nil == missErr && 0 < len(missing) {
+				if _, dlErr := repo.downloadCloudChunksPut(missing, context); nil != dlErr {
+					logging.LogWarnf("[Lazy Load] download conflict chunks failed: %s", dlErr)
+				}
+			}
+		}
+	}
 
 	// 冲突文件复制到数据历史文件夹
 	if 0 < len(tmpMergeConflicts) {
