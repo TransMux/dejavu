@@ -965,7 +965,7 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 	// 检查是否为懒加载文件
 	if repo.isLazyLoadingFile(file.Path) {
 		// 对于懒加载文件，需要处理chunks用于云端存储，但标记为懒加载
-		logging.LogInfof("processing lazy loading file [%s] for cloud storage", file.Path)
+		logging.LogInfof("[Lazy Load] processing file [%s] for cloud storage", file.Path)
 
 		// 验证文件仍然存在且未被修改
 		newInfo, statErr := os.Stat(absPath)
@@ -1148,14 +1148,13 @@ func (repo *Repo) checkoutFiles(files []*entity.File, context map[string]interfa
 	for _, file := range files {
 		if repo.isLazyLoadingFile(file.Path) {
 			skippedLazyFiles = append(skippedLazyFiles, file)
-			logging.LogInfof("skipping checkout for lazy loading file [%s]", file.Path)
 		} else {
 			filteredFiles = append(filteredFiles, file)
 		}
 	}
 
 	if len(skippedLazyFiles) > 0 {
-		logging.LogInfof("skipped [%d] lazy loading files during checkout", len(skippedLazyFiles))
+		logging.LogInfof("[Lazy Load] skipped [%d] files during checkout", len(skippedLazyFiles))
 	}
 
 	files = filteredFiles
@@ -1367,7 +1366,7 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 	// 检查文件是否已存在
 	absPath := repo.absPath(relPath)
 	if gulu.File.IsExist(absPath) {
-		logging.LogInfof("file [%s] already exists locally", relPath)
+		logging.LogInfof("[Lazy Load] file [%s] already exists locally", relPath)
 		return nil
 	}
 
@@ -1411,7 +1410,7 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 		return fmt.Errorf("checkout file failed: %s", err)
 	}
 
-	logging.LogInfof("lazy loaded file [%s] successfully", relPath)
+	logging.LogInfof("[Lazy Load] file [%s] successfully loaded", relPath)
 	return nil
 }
 
@@ -1436,7 +1435,7 @@ func (repo *Repo) lazyLoadFromCloud(file *entity.File, context map[string]interf
 		return fmt.Errorf("put file failed: %s", err)
 	}
 
-	logging.LogInfof("downloaded file metadata [%s], size: %d bytes", file.Path, length)
+	logging.LogInfof("[Lazy Load] downloaded file metadata [%s], size: %d bytes", file.Path, length)
 
 	// 下载所有chunks
 	return repo.ensureChunksAvailable(cloudFile, context)
@@ -1461,7 +1460,7 @@ func (repo *Repo) ensureChunksAvailable(file *entity.File, context map[string]in
 		return fmt.Errorf("download cloud chunks failed: %s", err)
 	}
 
-	logging.LogInfof("downloaded [%d] chunks for file [%s], size: %d bytes", len(missingChunks), file.Path, length)
+	logging.LogInfof("[Lazy Load] downloaded [%d] chunks for file [%s], size: %d bytes", len(missingChunks), file.Path, length)
 	return nil
 }
 
@@ -1523,7 +1522,7 @@ func (repo *Repo) createLazyFileChunks(file *entity.File, absPath string) (err e
 		}
 	}
 
-	logging.LogInfof("created [%d] chunks for lazy file [%s]", len(file.Chunks), file.Path)
+	logging.LogInfof("[Lazy Load] created [%d] chunks for file [%s]", len(file.Chunks), file.Path)
 	return
 }
 
@@ -1539,7 +1538,7 @@ func (repo *Repo) cleanupLazyFileChunks(file *entity.File) {
 			logging.LogWarnf("remove lazy chunk [%s] failed: %s", chunkID, err)
 		}
 	}
-	logging.LogInfof("cleaned up [%d] chunks for lazy file [%s]", len(file.Chunks), file.Path)
+	logging.LogInfof("[Lazy Load] cleaned up [%d] chunks for file [%s]", len(file.Chunks), file.Path)
 }
 
 // LazyLoadFiles 批量按需加载多个懒加载文件
