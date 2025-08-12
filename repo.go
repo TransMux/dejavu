@@ -1376,7 +1376,7 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 		return fmt.Errorf("get latest index failed: %s", err)
 	}
 
-	// 从索引中查找文件
+	// 从本地最新索引中查找文件
 	var targetFile *entity.File
 	latestFiles, err := repo.getFiles(latest.Files)
 	if nil != err {
@@ -1390,8 +1390,33 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 		}
 	}
 
+	// 如果本地 latest 未包含该文件，则尝试从云端最新索引中查找（避免由于本地 latest 过旧导致失败）
 	if nil == targetFile {
-		return fmt.Errorf("file [%s] not found in latest index", relPath)
+		if nil == repo.cloud {
+			return fmt.Errorf("file [%s] not found in latest index", relPath)
+		}
+
+		// 拉取云端最新索引并在其中查找目标文件
+		_, cloudLatest, dlErr := repo.downloadCloudLatest(context)
+		if nil != dlErr {
+			return fmt.Errorf("file [%s] not found in latest index and get cloud latest failed: %s", relPath, dlErr)
+		}
+		if nil != cloudLatest {
+			cloudFiles, gfErr := repo.getFiles(cloudLatest.Files)
+			if nil != gfErr {
+				return fmt.Errorf("get cloud latest files failed: %s", gfErr)
+			}
+			for _, f := range cloudFiles {
+				if f.Path == relPath {
+					targetFile = f
+					break
+				}
+			}
+		}
+
+		if nil == targetFile {
+			return fmt.Errorf("file [%s] not found in latest index (also not found in cloud latest)", relPath)
+		}
 	}
 
 	// 如果是云同步，从云端下载文件和chunks
