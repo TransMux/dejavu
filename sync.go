@@ -1824,7 +1824,16 @@ func (repo *Repo) getHistoryDirNow(now, suffix string) (ret string, err error) {
 func (repo *Repo) CheckoutFilesFromCloud(files []*entity.File, context map[string]interface{}) (stat *DownloadTrafficStat, err error) {
 	stat = &DownloadTrafficStat{}
 
-	chunkIDs := repo.getChunks(files)
+	// 仅为非懒加载文件下载缺失 chunks
+	var nonLazyFiles []*entity.File
+	for _, f := range files {
+		if repo.isLazyLoadingFile(f.Path) {
+			continue
+		}
+		nonLazyFiles = append(nonLazyFiles, f)
+	}
+
+	chunkIDs := repo.getChunks(nonLazyFiles)
 	chunkIDs, err = repo.localNotFoundChunks(chunkIDs)
 	if nil != err {
 		return
@@ -1836,6 +1845,7 @@ func (repo *Repo) CheckoutFilesFromCloud(files []*entity.File, context map[strin
 	}
 	stat.DownloadChunkCount += len(chunkIDs)
 
+	// 检出所有文件，但懒加载文件在 checkoutFiles 内部会被过滤，不会写入工作区
 	err = repo.checkoutFiles(files, context)
 	return
 }
