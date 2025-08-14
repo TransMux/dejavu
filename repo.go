@@ -1356,27 +1356,28 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 统一处理绝对路径和相对路径
-	var relPath string
+	// 与索引路径格式保持一致：
+	// 1) 将传入路径归一化为 DataPath 下的绝对路径
+	// 2) 通过 repo.relPath 生成以 "/" 开头、统一正斜杠的相对路径（索引路径格式）
+	var absPath string
 	if filepath.IsAbs(filePath) {
-		relPath = repo.relPath(filePath)
-	} else {
-		// 对于相对路径，确保格式一致（以 "/" 开头）
-		cleanPath := filepath.ToSlash(filepath.Clean(filePath))
-		if !strings.HasPrefix(cleanPath, "/") {
-			relPath = "/" + cleanPath
-		} else {
-			relPath = cleanPath
+		absPath = filepath.Clean(filePath)
+		// 确保绝对路径在 DataPath 下
+		relToData, relErr := filepath.Rel(repo.DataPath, absPath)
+		if relErr != nil || strings.HasPrefix(relToData, "..") {
+			return fmt.Errorf("file path [%s] is outside data directory", filePath)
 		}
+	} else {
+		absPath = filepath.Clean(filepath.Join(repo.DataPath, filePath))
 	}
+	relPath := repo.relPath(absPath)
 
-	// 检查是否为懒加载文件
+	// 检查是否为懒加载文件（使用与索引一致的路径格式）
 	if !repo.isLazyLoadingFile(relPath) {
 		return fmt.Errorf("file [%s] is not a lazy loading file", relPath)
 	}
 
 	// 检查文件是否已存在
-	absPath := repo.absPath(relPath)
 	if gulu.File.IsExist(absPath) {
 		logging.LogInfof("[Lazy Load] file [%s] already exists locally", relPath)
 		return nil
