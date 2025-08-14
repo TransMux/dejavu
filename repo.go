@@ -1356,7 +1356,19 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 	lock.Lock()
 	defer lock.Unlock()
 
-	relPath := repo.relPath(filePath)
+	// 统一处理绝对路径和相对路径
+	var relPath string
+	if filepath.IsAbs(filePath) {
+		relPath = repo.relPath(filePath)
+	} else {
+		// 对于相对路径，确保格式一致（以 "/" 开头）
+		cleanPath := filepath.ToSlash(filepath.Clean(filePath))
+		if !strings.HasPrefix(cleanPath, "/") {
+			relPath = "/" + cleanPath
+		} else {
+			relPath = cleanPath
+		}
+	}
 
 	// 检查是否为懒加载文件
 	if !repo.isLazyLoadingFile(relPath) {
