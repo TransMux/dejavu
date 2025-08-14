@@ -1357,20 +1357,32 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 	defer lock.Unlock()
 
 	// 与索引路径格式保持一致：
-	// 1) 将传入路径归一化为 DataPath 下的绝对路径
-	// 2) 通过 repo.relPath 生成以 "/" 开头、统一正斜杠的相对路径（索引路径格式）
+	// 1) 统一为绝对路径比较，确保路径在 DataPath 下
+	// 2) 再派生索引一致的相对路径（以 "/" 开头，正斜杠）
 	var absPath string
+	repoDataAbs, _ := filepath.Abs(filepath.Clean(repo.DataPath))
 	if filepath.IsAbs(filePath) {
 		absPath = filepath.Clean(filePath)
-		// 确保绝对路径在 DataPath 下
-		relToData, relErr := filepath.Rel(repo.DataPath, absPath)
-		if relErr != nil || strings.HasPrefix(relToData, "..") {
+	} else {
+		absCandidate, _ := filepath.Abs(filepath.Clean(filePath))
+		absPath = absCandidate
+	}
+
+	// 如果 absPath 不在 DataPath 下，尝试将其视为仓库内相对路径拼接到 DataPath
+	relToData, relErr := filepath.Rel(repoDataAbs, absPath)
+	if relErr != nil || strings.HasPrefix(relToData, "..") {
+		joined := filepath.Clean(filepath.Join(repoDataAbs, filePath))
+		joinedAbs, _ := filepath.Abs(joined)
+		relToData2, relErr2 := filepath.Rel(repoDataAbs, joinedAbs)
+		if relErr2 != nil || strings.HasPrefix(relToData2, "..") {
 			return fmt.Errorf("file path [%s] is outside data directory", filePath)
 		}
-	} else {
-		absPath = filepath.Clean(filepath.Join(repo.DataPath, filePath))
+		absPath = joinedAbs
+		relToData = relToData2
 	}
-	relPath := repo.relPath(absPath)
+
+	// 生成与索引一致的路径格式
+	relPath := "/" + filepath.ToSlash(filepath.Clean(relToData))
 
 	// 检查是否为懒加载文件（使用与索引一致的路径格式）
 	if !repo.isLazyLoadingFile(relPath) {
