@@ -938,7 +938,16 @@ func (repo *Repo) lazyLoadingMatcher() *ignore.GitIgnore {
 	if len(repo.LazyLoadingPatterns) == 0 {
 		return ignore.CompileIgnoreLines() // 返回空匹配器
 	}
-	return ignore.CompileIgnoreLines(repo.LazyLoadingPatterns...)
+	// 统一移除前导 '/'，以消除路径格式差异
+	var normalized []string
+	for _, p := range repo.LazyLoadingPatterns {
+		if strings.HasPrefix(p, "/") {
+			normalized = append(normalized, p[1:])
+		} else {
+			normalized = append(normalized, p)
+		}
+	}
+	return ignore.CompileIgnoreLines(normalized...)
 }
 
 // isLazyLoadingFile 检查文件是否为懒加载文件
@@ -947,7 +956,12 @@ func (repo *Repo) isLazyLoadingFile(filePath string) bool {
 		return false
 	}
 	matcher := repo.lazyLoadingMatcher()
-	return matcher.MatchesPath(filePath)
+	// 去除被检测路径的前导 '/'
+	normalized := filePath
+	if strings.HasPrefix(normalized, "/") {
+		normalized = normalized[1:]
+	}
+	return matcher.MatchesPath(normalized)
 }
 
 func (repo *Repo) absPath(relPath string) string {
