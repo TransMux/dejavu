@@ -17,6 +17,7 @@
 package dejavu
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1430,6 +1431,7 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 	}
 
 	// 如果本地 latest 未包含该文件，则尝试从云端最新索引中查找（避免由于本地 latest 过旧导致失败）
+	var cloudFiles []*entity.File
 	if nil == targetFile {
 		if nil == repo.cloud {
 			return fmt.Errorf("file [%s] not found in latest index", relPath)
@@ -1441,7 +1443,8 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 			return fmt.Errorf("file [%s] not found in latest index and get cloud latest failed: %s", relPath, dlErr)
 		}
 		if nil != cloudLatest {
-			cloudFiles, gfErr := repo.getFiles(cloudLatest.Files)
+			var gfErr error
+			cloudFiles, gfErr = repo.getFiles(cloudLatest.Files)
 			if nil != gfErr {
 				return fmt.Errorf("get cloud latest files failed: %s", gfErr)
 			}
@@ -1454,6 +1457,10 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 		}
 
 		if nil == targetFile {
+			// 保存cloudFiles到temp以供检查
+			if err := repo.saveCloudFilesForDebug(cloudFiles, relPath, context); err != nil {
+				logging.LogWarnf("failed to save cloud files for debug: %s", err)
+			}
 			return fmt.Errorf("file [%s] not found in latest index (also not found in cloud latest)", relPath)
 		}
 	}
@@ -1639,4 +1646,47 @@ func (repo *Repo) GetLazyLoadingFiles() (lazyFiles []*entity.File, err error) {
 	}
 
 	return lazyFiles, nil
+}
+
+// saveCloudFilesForDebug 保存cloudFiles到临时目录以供调试检查
+func (repo *Repo) saveCloudFilesForDebug(cloudFiles []*entity.File, targetRelPath string, context map[string]interface{}) error {
+	if len(cloudFiles) == 0 {
+		return nil
+	}
+
+	// 创建调试目录
+	debugDir := filepath.Join(repo.TempPath, "repo", "debug", "cloudfiles")
+	if err := os.MkdirAll(debugDir, 0755); err != nil {
+		return fmt.Errorf("failed to create debug directory: %s", err)
+	}
+
+	// 生成时间戳作为文件名的一部分
+	timestamp := time.Now().Format("20060102_150405")
+	debugFileName := fmt.Sprintf("cloudfiles_%s.json", timestamp)
+	debugFilePath := filepath.Join(debugDir, debugFileName)
+
+	// 准备调试信息
+	debugInfo := map[string]interface{}{
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"targetFile": targetRelPath,
+		"totalFiles": len(cloudFiles),
+		"cloudFiles": cloudFiles,
+		"context":    context,
+	}
+
+	// 序列化为JSON
+	jsonData, err := json.MarshalIndent(debugInfo, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal debug info: %s", err)
+	}
+
+	// 写入文件
+	if err := os.WriteFile(debugFilePath, jsonData, 0644); err != nil {
+		return fmt.Errorf("failed to write debug file: %s", err)
+	}
+
+	logging.LogInfof("[Debug] Cloud files saved to %s for debugging (target: %s, total: %d files)",
+		debugFilePath, targetRelPath, len(cloudFiles))
+
+	return nil
 }
