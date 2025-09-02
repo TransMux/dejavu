@@ -177,6 +177,17 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 	trafficStat.DownloadFileCount += len(fetchFileIDs)
 	trafficStat.APIGet += trafficStat.DownloadFileCount
 
+	// 更新懒加载索引管理器（优雅方案的关键步骤）
+	if nil != repo.lazyIndexMgr && nil != cloudLatest {
+		// 获取云端索引中的所有文件
+		cloudFiles, err := repo.getFiles(cloudLatest.Files)
+		if nil == err {
+			repo.lazyIndexMgr.UpdateFromCloudIndex(cloudLatest, cloudFiles)
+		} else {
+			logging.LogWarnf("failed to get cloud files for lazy index update: %s", err)
+		}
+	}
+
 	// 执行数据同步
 	err = repo.sync0(context, fetchedFiles, cloudLatest, latest, mergeResult, trafficStat)
 	return

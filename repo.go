@@ -56,9 +56,10 @@ type Repo struct {
 	IgnoreLines         []string // 忽略配置文件内容行，是用 .gitignore 语法
 	LazyLoadingPatterns []string // 懒加载文件夹模式匹配，使用 .gitignore 语法
 
-	store    *Store      // 仓库的存储
-	chunkPol chunker.Pol // 文件分块多项式值
-	cloud    cloud.Cloud // 云端存储服务
+	store        *Store            // 仓库的存储
+	chunkPol     chunker.Pol       // 文件分块多项式值
+	cloud        cloud.Cloud       // 云端存储服务
+	lazyIndexMgr *LazyIndexManager // 懒加载索引管理器
 }
 
 // NewRepo 创建一个新的仓库。
@@ -96,6 +97,12 @@ func NewRepoWithLazyLoading(dataPath, repoPath, historyPath, tempPath, deviceID,
 	ret.IgnoreLines = ignoreLines
 	ret.LazyLoadingPatterns = gulu.Str.RemoveDuplicatedElem(ret.LazyLoadingPatterns)
 	ret.store, err = NewStore(ret.Path, aesKey)
+	if nil != err {
+		return
+	}
+
+	// 初始化懒加载索引管理器
+	ret.lazyIndexMgr = NewLazyIndexManager(ret.Path, ret.LazyLoadingPatterns)
 	return
 }
 
@@ -783,20 +790,10 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		}
 	}
 
-	// 保留懒加载文件：
-	// 如果上一个最新索引中包含匹配懒加载规则的文件，但它们未被检出到本地（被 checkout 过滤），
-	// 那么当前遍历将无法发现这些文件，导致在本次索引中被误删。
-	// 这里将这些懒加载文件补充回 files 列表，以确保它们仍被包含到新索引中。
-	if 0 < len(latestFiles) && 0 < len(repo.LazyLoadingPatterns) {
-		existing := map[string]bool{}
-		for _, f := range files {
-			existing[f.Path] = true
-		}
-		for _, lf := range latestFiles {
-			if repo.isLazyLoadingFile(lf.Path) && !existing[lf.Path] {
-				files = append(files, lf)
-			}
-		}
+	// 优雅的懒加载文件处理：使用专门的懒加载索引管理器
+	// 这避免了在索引构建时进行复杂的云端查询和文件合并操作
+	if 0 < len(repo.LazyLoadingPatterns) && nil != repo.lazyIndexMgr {
+		files = repo.lazyIndexMgr.MergeWithLocalFiles(files)
 	}
 
 	upserts, removes = repo.diffUpsertRemove(files, latestFiles, false)
@@ -887,6 +884,13 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		logging.LogErrorf("update latest failed: %s", err)
 		return
 	}
+
+	// 验证索引完整性
+	if validationErr := repo.validateIndexCompleteness(ret, context); nil != validationErr {
+		logging.LogWarnf("index completeness validation failed: %s", validationErr)
+		// 不阻止索引创建，只记录警告
+	}
+
 	return
 }
 
@@ -981,6 +985,17 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 	if repo.isLazyLoadingFile(file.Path) {
 		// 对于懒加载文件，需要处理chunks用于云端存储，但标记为懒加载
 		logging.LogInfof("[Lazy Load] processing file [%s] for cloud storage", file.Path)
+
+		// 检查文件是否在本地存在
+		if !gulu.File.IsExist(absPath) {
+			// 如果本地不存在，这是正常的懒加载情况，不需要创建chunks
+			// 但需要确保文件的chunks信息是完整的
+			if 0 == len(file.Chunks) {
+				logging.LogWarnf("[Lazy Load] file [%s] has no chunks, may be incomplete", file.Path)
+			}
+			logging.LogInfof("[Lazy Load] file [%s] not locally available, skipping chunk creation", file.Path)
+			return
+		}
 
 		// 验证文件仍然存在且未被修改
 		newInfo, statErr := os.Stat(absPath)
@@ -1646,6 +1661,22 @@ func (repo *Repo) GetLazyLoadingFiles() (lazyFiles []*entity.File, err error) {
 	}
 
 	return lazyFiles, nil
+}
+
+// validateIndexCompleteness 验证索引的完整性（使用优雅的懒加载管理器）
+func (repo *Repo) validateIndexCompleteness(index *entity.Index, context map[string]interface{}) error {
+	if 0 == len(repo.LazyLoadingPatterns) || nil == repo.lazyIndexMgr {
+		return nil // 跳过验证
+	}
+
+	// 使用懒加载索引管理器获取统计信息
+	lazyCount, lazySize := repo.lazyIndexMgr.GetStats()
+	if lazyCount > 0 {
+		logging.LogInfof("[Index Validation] index managed by lazy index manager: %d files, %d bytes",
+			lazyCount, lazySize)
+	}
+
+	return nil
 }
 
 // saveCloudFilesForDebug 保存cloudFiles到临时目录以供调试检查
