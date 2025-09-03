@@ -1472,11 +1472,25 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 		}
 
 		if nil == targetFile {
-			// 保存cloudFiles到temp以供检查
-			if err := repo.saveCloudFilesForDebug(cloudFiles, relPath, context); err != nil {
-				logging.LogWarnf("failed to save cloud files for debug: %s", err)
+			// 尝试从懒加载索引管理器中查找历史文件记录
+			if nil != repo.lazyIndexMgr {
+				lazyFiles := repo.lazyIndexMgr.GetLazyFiles()
+				for _, lazyFile := range lazyFiles {
+					if lazyFile.Path == relPath {
+						targetFile = lazyFile
+						logging.LogInfof("[Lazy Load] found file [%s] in lazy index manager (from historical snapshot)", relPath)
+						break
+					}
+				}
 			}
-			return fmt.Errorf("file [%s] not found in latest index (also not found in cloud latest)", relPath)
+
+			if nil == targetFile {
+				// 保存cloudFiles到temp以供检查
+				if err := repo.saveCloudFilesForDebug(cloudFiles, relPath, context); err != nil {
+					logging.LogWarnf("failed to save cloud files for debug: %s", err)
+				}
+				return fmt.Errorf("file [%s] not found in latest index, cloud latest, or lazy index manager", relPath)
+			}
 		}
 	}
 

@@ -76,39 +76,29 @@ func (m *LazyIndexManager) UpdateFromCloudIndex(cloudIndex *entity.Index, cloudF
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	// 更新懒加载文件映射
-	newLazyFiles := make(map[string]*entity.File)
-	for _, file := range cloudFiles {
-		if m.isLazyLoadingFile(file.Path) {
-			newLazyFiles[file.Path] = file
-		}
-	}
-
 	// 记录变化
 	added := 0
 	updated := 0
-	removed := 0
 
-	// 检查新增和更新
-	for path, newFile := range newLazyFiles {
-		if oldFile, exists := m.lazyFiles[path]; exists {
-			if oldFile.Updated != newFile.Updated {
-				updated++
+	// 处理云端索引中的懒加载文件：新增或更新
+	for _, file := range cloudFiles {
+		if m.isLazyLoadingFile(file.Path) {
+			if oldFile, exists := m.lazyFiles[file.Path]; exists {
+				if oldFile.Updated != file.Updated {
+					updated++
+					m.lazyFiles[file.Path] = file
+				}
+			} else {
+				added++
+				m.lazyFiles[file.Path] = file
 			}
-		} else {
-			added++
 		}
 	}
 
-	// 检查删除
-	for path := range m.lazyFiles {
-		if _, exists := newLazyFiles[path]; !exists {
-			removed++
-		}
-	}
+	// 重要修复：不删除不在当前云端索引中的文件记录
+	// 这些文件可能来自历史快照，仍可能需要懒加载
+	// 只记录但不删除，以支持从历史快照懒加载文件
 
-	// 应用更新
-	m.lazyFiles = newLazyFiles
 	m.lastCloudID = cloudIndex.ID
 
 	// 保存到磁盘
@@ -116,7 +106,7 @@ func (m *LazyIndexManager) UpdateFromCloudIndex(cloudIndex *entity.Index, cloudF
 		return err
 	}
 
-	logging.LogInfof("[Lazy Index] updated from cloud: +%d ~%d -%d files", added, updated, removed)
+	logging.LogInfof("[Lazy Index] updated from cloud: +%d ~%d files (preserved historical files for lazy loading)", added, updated)
 	return nil
 }
 
