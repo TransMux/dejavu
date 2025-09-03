@@ -793,6 +793,10 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	// 优雅的懒加载文件处理：使用专门的懒加载索引管理器
 	// 这避免了在索引构建时进行复杂的云端查询和文件合并操作
 	if 0 < len(repo.LazyLoadingPatterns) && nil != repo.lazyIndexMgr {
+		// 关键修复：在构建索引时，将当前发现的懒加载文件添加到LazyIndexManager中
+		// 这确保了即使文件被删除，LazyIndexManager也保留了历史记录
+		repo.lazyIndexMgr.AddLazyFilesFromIndex(files)
+		
 		files = repo.lazyIndexMgr.MergeWithLocalFiles(files)
 	}
 
@@ -1496,23 +1500,7 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 					}
 				}
 				if nil == targetFile {
-					logging.LogWarnf("[Lazy Load Debug] file [%s] not found in lazy index manager, attempting full rebuild...", relPath)
-					
-					// 关键修复：当找不到文件时，尝试重建懒加载索引
-					if rebuildErr := repo.lazyIndexMgr.RebuildFromAllIndexes(repo); rebuildErr != nil {
-						logging.LogErrorf("[Lazy Load] failed to rebuild lazy index: %s", rebuildErr)
-					} else {
-						// 重建后再次查找
-						lazyFiles = repo.lazyIndexMgr.GetLazyFiles()
-						logging.LogInfof("[Lazy Load Debug] after rebuild, checking %d files in lazy index manager", len(lazyFiles))
-						for _, lazyFile := range lazyFiles {
-							if lazyFile.Path == relPath {
-								targetFile = lazyFile
-								logging.LogInfof("[Lazy Load] found file [%s] after lazy index rebuild", relPath)
-								break
-							}
-						}
-					}
+					logging.LogWarnf("[Lazy Load Debug] file [%s] not found in lazy index manager", relPath)
 				}
 			} else {
 				logging.LogWarnf("[Lazy Load Debug] lazyIndexMgr is nil")

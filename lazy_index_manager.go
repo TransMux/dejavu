@@ -18,7 +18,6 @@ package dejavu
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,23 +57,6 @@ func NewLazyIndexManager(repoPath, dataPath string, patterns []string) *LazyInde
 	return manager
 }
 
-// EnsureLazyIndexComplete 确保懒加载索引完整性
-// 在系统启动后可调用此方法来确保索引包含所有历史文件
-func (m *LazyIndexManager) EnsureLazyIndexComplete(repo *Repo, forceRebuild bool) error {
-	if len(m.patterns) == 0 {
-		return nil // 没有懒加载模式，无需处理
-	}
-
-	currentCount := len(m.lazyFiles)
-	
-	if forceRebuild || currentCount == 0 {
-		logging.LogInfof("[Lazy Index] ensuring completeness (current: %d files, force: %v)", currentCount, forceRebuild)
-		return m.RebuildFromAllIndexes(repo)
-	}
-	
-	logging.LogInfof("[Lazy Index] index appears complete with %d files", currentCount)
-	return nil
-}
 
 // GetLazyFiles 获取所有懒加载文件
 func (m *LazyIndexManager) GetLazyFiles() []*entity.File {
@@ -128,154 +110,33 @@ func (m *LazyIndexManager) UpdateFromCloudIndex(cloudIndex *entity.Index, cloudF
 	return nil
 }
 
-// RebuildFromAllIndexes 从所有可用索引重建懒加载文件索引
-// 这是解决历史文件缺失问题的关键方法
-func (m *LazyIndexManager) RebuildFromAllIndexes(repo *Repo) error {
+// AddLazyFilesFromIndex 从索引中添加懒加载文件（不删除现有记录）
+func (m *LazyIndexManager) AddLazyFilesFromIndex(files []*entity.File) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	logging.LogInfof("[Lazy Index] starting full rebuild from all indexes...")
-	
-	originalCount := len(m.lazyFiles)
-	
-	// 1. 扫描本地所有索引
-	if err := m.scanLocalIndexes(repo); err != nil {
-		logging.LogWarnf("[Lazy Index] failed to scan local indexes: %s", err)
-	}
+	added := 0
+	updated := 0
 
-	// 2. 扫描云端索引
-	if nil != repo.cloud {
-		if err := m.scanCloudIndexes(repo); err != nil {
-			logging.LogWarnf("[Lazy Index] failed to scan cloud indexes: %s", err)
-		}
-	}
-
-	newCount := len(m.lazyFiles)
-	addedCount := newCount - originalCount
-
-	// 保存重建后的索引
-	if err := m.save(); err != nil {
-		return fmt.Errorf("save rebuilt index failed: %s", err)
-	}
-
-	logging.LogInfof("[Lazy Index] rebuild completed: %d -> %d files (+%d)", originalCount, newCount, addedCount)
-	return nil
-}
-
-// scanLocalIndexes 扫描本地所有索引以发现懒加载文件
-func (m *LazyIndexManager) scanLocalIndexes(repo *Repo) error {
-	indexesPath := filepath.Join(repo.Path, "indexes")
-	if !gulu.File.IsExist(indexesPath) {
-		return nil
-	}
-
-	entries, err := os.ReadDir(indexesPath)
-	if err != nil {
-		return fmt.Errorf("read indexes dir failed: %s", err)
-	}
-
-	scannedCount := 0
-	foundCount := 0
-
-	for _, entry := range entries {
-		if entry.IsDir() || len(entry.Name()) != 40 {
-			continue
-		}
-
-		indexID := entry.Name()
-		index, err := repo.store.GetIndex(indexID)
-		if err != nil {
-			logging.LogWarnf("[Lazy Index] failed to get local index %s: %s", indexID, err)
-			continue
-		}
-
-		files, err := repo.getFiles(index.Files)
-		if err != nil {
-			logging.LogWarnf("[Lazy Index] failed to get files for index %s: %s", indexID, err)
-			continue
-		}
-
-		for _, file := range files {
-			if m.isLazyLoadingFile(file.Path) {
-				// 只保留最新版本的文件
-				if existingFile, exists := m.lazyFiles[file.Path]; !exists || file.Updated > existingFile.Updated {
+	for _, file := range files {
+		if m.isLazyLoadingFile(file.Path) {
+			if existingFile, exists := m.lazyFiles[file.Path]; exists {
+				// 只更新更新时间更新的文件
+				if file.Updated > existingFile.Updated {
 					m.lazyFiles[file.Path] = file
-					foundCount++
+					updated++
 				}
+			} else {
+				m.lazyFiles[file.Path] = file
+				added++
 			}
 		}
-		
-		scannedCount++
 	}
 
-	logging.LogInfof("[Lazy Index] scanned %d local indexes, found %d lazy files", scannedCount, foundCount)
-	return nil
-}
-
-// scanCloudIndexes 扫描云端索引以发现懒加载文件
-func (m *LazyIndexManager) scanCloudIndexes(repo *Repo) error {
-	// 获取云端索引列表
-	data, err := repo.cloud.DownloadObject("indexes-v2.json")
-	if err != nil {
-		return fmt.Errorf("download cloud indexes failed: %s", err)
+	if added > 0 || updated > 0 {
+		m.save() // 保存更改
+		logging.LogInfof("[Lazy Index] added %d new files, updated %d files from index", added, updated)
 	}
-
-	data, err = repo.store.compressDecoder.DecodeAll(data, nil)
-	if err != nil {
-		return fmt.Errorf("decode cloud indexes failed: %s", err)
-	}
-
-	var cloudIndexes struct {
-		Indexes []*struct {
-			ID      string `json:"id"`
-			Created int64  `json:"created"`
-		} `json:"indexes"`
-	}
-
-	if err := gulu.JSON.UnmarshalJSON(data, &cloudIndexes); err != nil {
-		return fmt.Errorf("unmarshal cloud indexes failed: %s", err)
-	}
-
-	scannedCount := 0
-	foundCount := 0
-
-	// 扫描每个云端索引
-	for _, indexInfo := range cloudIndexes.Indexes {
-		cloudIndex, err := repo.cloud.GetIndex(indexInfo.ID)
-		if err != nil {
-			logging.LogWarnf("[Lazy Index] failed to get cloud index %s: %s", indexInfo.ID, err)
-			continue
-		}
-
-		// 获取索引中的所有文件ID，但不下载文件内容
-		for _, fileID := range cloudIndex.Files {
-			// 尝试从本地获取文件，如果不存在则从云端获取元数据
-			file, err := repo.store.GetFile(fileID)
-			if err != nil {
-				// 从云端下载文件元数据
-				_, cloudFile, downloadErr := repo.downloadCloudFile(fileID, 1, 1, map[string]interface{}{})
-				if downloadErr != nil {
-					continue
-				}
-				file = cloudFile
-				// 存储文件元数据到本地
-				repo.store.PutFile(file)
-			}
-
-			if m.isLazyLoadingFile(file.Path) {
-				// 只保留最新版本的文件
-				if existingFile, exists := m.lazyFiles[file.Path]; !exists || file.Updated > existingFile.Updated {
-					m.lazyFiles[file.Path] = file
-					foundCount++
-				}
-			}
-		}
-		
-		scannedCount++
-	}
-
-	logging.LogInfof("[Lazy Index] scanned %d cloud indexes, found %d lazy files", scannedCount, foundCount)
-	return nil
 }
 
 // AddLazyFile 添加懒加载文件到索引
