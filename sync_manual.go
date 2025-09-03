@@ -304,7 +304,19 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 	trafficStat.UploadBytes += length
 	trafficStat.APIPut += trafficStat.UploadChunkCount
 
-	// 清理懒加载文件的本地chunks
+	// 关键修复：先更新LazyIndexManager保存完整文件记录，再清理本地chunks
+	// 这样确保LazyIndexManager中保存的是包含完整chunks信息的文件记录
+	if nil != repo.lazyIndexMgr {
+		latestFiles, err := repo.getFiles(latest.Files)
+		if nil == err {
+			repo.lazyIndexMgr.AddLazyFilesFromIndex(latestFiles)
+			logging.LogInfof("[Lazy Index] preserved file records before cleanup")
+		} else {
+			logging.LogWarnf("failed to get latest files for lazy index update: %s", err)
+		}
+	}
+
+	// 清理懒加载文件的本地chunks（在保存完整记录之后）
 	for _, file := range uploadFiles {
 		repo.cleanupLazyFileChunks(file)
 	}
@@ -314,17 +326,6 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 	if nil != err {
 		logging.LogErrorf("update cloud indexes failed: %s", err)
 		return
-	}
-
-	// 使用AddLazyFilesFromIndex而不是UpdateFromCloudIndex
-	// UpdateFromCloudIndex会更新lastCloudID，导致跳过后续更新
-	if nil != repo.lazyIndexMgr {
-		latestFiles, err := repo.getFiles(latest.Files)
-		if nil == err {
-			repo.lazyIndexMgr.AddLazyFilesFromIndex(latestFiles)
-		} else {
-			logging.LogWarnf("failed to get latest files for lazy index update: %s", err)
-		}
 	}
 
 	// 更新本地同步点

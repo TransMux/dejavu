@@ -140,6 +140,12 @@ func (m *LazyIndexManager) AddLazyFilesFromIndex(files []*entity.File) {
 
 	for _, file := range files {
 		if m.isLazyLoadingFile(file.Path) {
+			// 跳过chunks为空的损坏文件记录（防止覆盖现有的完整记录）
+			if len(file.Chunks) == 0 {
+				logging.LogWarnf("[Lazy Index] skip file with empty chunks: %s", file.Path)
+				continue
+			}
+			
 			if existingFile, exists := m.lazyFiles[file.Path]; exists {
 				// 只更新更新时间更新的文件
 				if file.Updated > existingFile.Updated {
