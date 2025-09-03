@@ -316,6 +316,17 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 		return
 	}
 
+	// 更新懒加载索引管理器（关键修复：同步上传后也要更新LazyIndexManager）
+	if nil != repo.lazyIndexMgr {
+		// 获取最新索引中的所有文件
+		latestFiles, err := repo.getFiles(latest.Files)
+		if nil == err {
+			repo.lazyIndexMgr.UpdateFromCloudIndex(latest, latestFiles)
+		} else {
+			logging.LogWarnf("failed to get latest files for lazy index update: %s", err)
+		}
+	}
+
 	// 更新本地同步点
 	err = repo.UpdateLatestSync(latest)
 	if nil != err {
