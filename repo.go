@@ -1496,7 +1496,23 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 					}
 				}
 				if nil == targetFile {
-					logging.LogWarnf("[Lazy Load Debug] file [%s] not found in lazy index manager either", relPath)
+					logging.LogWarnf("[Lazy Load Debug] file [%s] not found in lazy index manager, attempting full rebuild...", relPath)
+					
+					// 关键修复：当找不到文件时，尝试重建懒加载索引
+					if rebuildErr := repo.lazyIndexMgr.RebuildFromAllIndexes(repo); rebuildErr != nil {
+						logging.LogErrorf("[Lazy Load] failed to rebuild lazy index: %s", rebuildErr)
+					} else {
+						// 重建后再次查找
+						lazyFiles = repo.lazyIndexMgr.GetLazyFiles()
+						logging.LogInfof("[Lazy Load Debug] after rebuild, checking %d files in lazy index manager", len(lazyFiles))
+						for _, lazyFile := range lazyFiles {
+							if lazyFile.Path == relPath {
+								targetFile = lazyFile
+								logging.LogInfof("[Lazy Load] found file [%s] after lazy index rebuild", relPath)
+								break
+							}
+						}
+					}
 				}
 			} else {
 				logging.LogWarnf("[Lazy Load Debug] lazyIndexMgr is nil")
@@ -1507,7 +1523,7 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 				if err := repo.saveCloudFilesForDebug(cloudFiles, relPath, context); err != nil {
 					logging.LogWarnf("failed to save cloud files for debug: %s", err)
 				}
-				return fmt.Errorf("file [%s] not found in latest index, cloud latest, or lazy index manager", relPath)
+				return fmt.Errorf("file [%s] not found in any available index after comprehensive search", relPath)
 			}
 		}
 	}
