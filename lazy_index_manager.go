@@ -32,6 +32,7 @@ import (
 // 核心思想：将懒加载文件索引与普通文件索引分离，避免在索引构建时的复杂补丁操作
 type LazyIndexManager struct {
 	repoPath    string                  // 仓库路径
+	dataPath    string                  // 数据文件夹路径
 	patterns    []string                // 懒加载模式
 	lazyFiles   map[string]*entity.File // 懒加载文件映射 path -> file
 	mutex       sync.RWMutex            // 读写锁
@@ -39,9 +40,10 @@ type LazyIndexManager struct {
 }
 
 // NewLazyIndexManager 创建懒加载索引管理器
-func NewLazyIndexManager(repoPath string, patterns []string) *LazyIndexManager {
+func NewLazyIndexManager(repoPath, dataPath string, patterns []string) *LazyIndexManager {
 	manager := &LazyIndexManager{
 		repoPath:  repoPath,
+		dataPath:  dataPath,
 		patterns:  patterns,
 		lazyFiles: make(map[string]*entity.File),
 	}
@@ -152,17 +154,29 @@ func (m *LazyIndexManager) MergeWithLocalFiles(localFiles []*entity.File) []*ent
 	var mergedFiles []*entity.File
 	mergedFiles = append(mergedFiles, localFiles...) // 首先添加所有本地文件
 
-	// 添加不在本地的懒加载文件
+	// 添加不在本地的懒加载文件，但只有在文件系统中实际存在时才添加
 	addedLazy := 0
+	skippedLazy := 0
 	for path, lazyFile := range m.lazyFiles {
 		if _, existsLocally := localFileMap[path]; !existsLocally {
-			mergedFiles = append(mergedFiles, lazyFile)
-			addedLazy++
+			// 检查文件在本地文件系统中是否实际存在
+			// 这防止了已删除的懒加载文件被重新加入索引
+			if fsPath := filepath.Join(m.dataPath, path); gulu.File.IsExist(fsPath) {
+				mergedFiles = append(mergedFiles, lazyFile)
+				addedLazy++
+			} else {
+				// 文件已被删除，不应该加入索引，但保留在LazyIndexManager中以支持历史快照的懒加载
+				skippedLazy++
+				logging.LogInfof("[Lazy Index] skip deleted lazy file [%s] from index merge", path)
+			}
 		}
 	}
 
 	if addedLazy > 0 {
 		logging.LogInfof("[Lazy Index] merged %d lazy files with %d local files", addedLazy, len(localFiles))
+	}
+	if skippedLazy > 0 {
+		logging.LogInfof("[Lazy Index] skipped %d deleted lazy files from index merge", skippedLazy)
 	}
 
 	return mergedFiles

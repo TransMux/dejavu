@@ -102,7 +102,7 @@ func NewRepoWithLazyLoading(dataPath, repoPath, historyPath, tempPath, deviceID,
 	}
 
 	// 初始化懒加载索引管理器
-	ret.lazyIndexMgr = NewLazyIndexManager(ret.Path, ret.LazyLoadingPatterns)
+	ret.lazyIndexMgr = NewLazyIndexManager(ret.Path, ret.DataPath, ret.LazyLoadingPatterns)
 	return
 }
 
