@@ -1441,8 +1441,13 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 	for _, file := range latestFiles {
 		if file.Path == relPath {
 			targetFile = file
+			logging.LogInfof("[Lazy Load Debug] found file [%s] in local latest index", relPath)
 			break
 		}
+	}
+
+	if nil == targetFile {
+		logging.LogInfof("[Lazy Load Debug] file [%s] not found in local latest index, will try cloud latest", relPath)
 	}
 
 	// 如果本地 latest 未包含该文件，则尝试从云端最新索引中查找（避免由于本地 latest 过旧导致失败）
@@ -1455,19 +1460,26 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 		// 拉取云端最新索引并在其中查找目标文件
 		_, cloudLatest, dlErr := repo.downloadCloudLatest(context)
 		if nil != dlErr {
+			logging.LogErrorf("[Lazy Load Debug] get cloud latest failed: %s", dlErr)
 			return fmt.Errorf("file [%s] not found in latest index and get cloud latest failed: %s", relPath, dlErr)
 		}
 		if nil != cloudLatest {
 			var gfErr error
 			cloudFiles, gfErr = repo.getFiles(cloudLatest.Files)
 			if nil != gfErr {
+				logging.LogErrorf("[Lazy Load Debug] get cloud latest files failed: %s", gfErr)
 				return fmt.Errorf("get cloud latest files failed: %s", gfErr)
 			}
+			logging.LogInfof("[Lazy Load Debug] checking %d files in cloud latest index", len(cloudFiles))
 			for _, f := range cloudFiles {
 				if f.Path == relPath {
 					targetFile = f
+					logging.LogInfof("[Lazy Load Debug] found file [%s] in cloud latest index", relPath)
 					break
 				}
+			}
+			if nil == targetFile {
+				logging.LogInfof("[Lazy Load Debug] file [%s] not found in cloud latest index, will try lazy index manager", relPath)
 			}
 		}
 
@@ -1475,13 +1487,19 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 			// 尝试从懒加载索引管理器中查找历史文件记录
 			if nil != repo.lazyIndexMgr {
 				lazyFiles := repo.lazyIndexMgr.GetLazyFiles()
+				logging.LogInfof("[Lazy Load Debug] checking %d files in lazy index manager", len(lazyFiles))
 				for _, lazyFile := range lazyFiles {
 					if lazyFile.Path == relPath {
 						targetFile = lazyFile
-						logging.LogInfof("[Lazy Load] found file [%s] in lazy index manager (from historical snapshot)", relPath)
+						logging.LogInfof("[Lazy Load Debug] found file [%s] in lazy index manager (from historical snapshot)", relPath)
 						break
 					}
 				}
+				if nil == targetFile {
+					logging.LogWarnf("[Lazy Load Debug] file [%s] not found in lazy index manager either", relPath)
+				}
+			} else {
+				logging.LogWarnf("[Lazy Load Debug] lazyIndexMgr is nil")
 			}
 
 			if nil == targetFile {
@@ -1516,16 +1534,21 @@ func (repo *Repo) LazyLoadFile(filePath string, context map[string]interface{}) 
 
 // lazyLoadFromCloud 从云端加载文件及其chunks
 func (repo *Repo) lazyLoadFromCloud(file *entity.File, context map[string]interface{}) (err error) {
+	logging.LogInfof("[Lazy Load Debug] starting lazyLoadFromCloud for file [%s] with ID [%s]", file.Path, file.ID)
+	
 	// 检查文件是否已在本地存储
 	localFile, err := repo.store.GetFile(file.ID)
 	if nil == err && nil != localFile {
+		logging.LogInfof("[Lazy Load Debug] file [%s] already exists locally, checking chunks", file.Path)
 		// 文件已存在，检查chunks
 		return repo.ensureChunksAvailable(file, context)
 	}
 
+	logging.LogInfof("[Lazy Load Debug] file [%s] not found locally, downloading from cloud", file.Path)
 	// 从云端下载文件元数据
 	length, cloudFile, err := repo.downloadCloudFile(file.ID, 1, 1, context)
 	if nil != err {
+		logging.LogErrorf("[Lazy Load Debug] download cloud file [%s] failed: %s", file.Path, err)
 		return fmt.Errorf("download cloud file failed: %s", err)
 	}
 
