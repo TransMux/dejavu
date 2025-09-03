@@ -992,10 +992,24 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 
 		// 检查文件是否在本地存在
 		if !gulu.File.IsExist(absPath) {
-			// 如果本地不存在，这是正常的懒加载情况，不需要创建chunks
-			// 但需要确保文件的chunks信息是完整的
+			// 如果本地不存在，这是正常的懒加载情况
 			if 0 == len(file.Chunks) {
-				logging.LogWarnf("[Lazy Load] file [%s] has no chunks, may be incomplete", file.Path)
+				// 文件不存在且没有chunks信息，尝试从LazyIndexManager获取完整信息
+				logging.LogWarnf("[Lazy Load] file [%s] not locally available and has no chunks, trying to get from LazyIndexManager", file.Path)
+				if nil != repo.lazyIndexMgr {
+					lazyFiles := repo.lazyIndexMgr.GetLazyFiles()
+					for _, lazyFile := range lazyFiles {
+						if lazyFile.Path == file.Path && len(lazyFile.Chunks) > 0 {
+							// 找到完整的chunks信息，更新当前文件
+							file.Chunks = lazyFile.Chunks
+							logging.LogInfof("[Lazy Load] restored [%d] chunks for file [%s] from LazyIndexManager", len(file.Chunks), file.Path)
+							break
+						}
+					}
+				}
+				if 0 == len(file.Chunks) {
+					logging.LogWarnf("[Lazy Load] file [%s] has no chunks and cannot be restored, may be incomplete", file.Path)
+				}
 			}
 			logging.LogInfof("[Lazy Load] file [%s] not locally available, skipping chunk creation", file.Path)
 			return
