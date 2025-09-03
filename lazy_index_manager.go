@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"github.com/88250/gulu"
+	"github.com/sabhiram/go-gitignore"
 	"github.com/siyuan-note/dejavu/entity"
 	"github.com/siyuan-note/logging"
 )
@@ -34,6 +35,7 @@ type LazyIndexManager struct {
 	repoPath    string                  // 仓库路径
 	dataPath    string                  // 数据文件夹路径
 	patterns    []string                // 懒加载模式
+	matcher     *ignore.GitIgnore       // 懒加载匹配器
 	lazyFiles   map[string]*entity.File // 懒加载文件映射 path -> file
 	mutex       sync.RWMutex            // 读写锁
 	lastCloudID string                  // 最后同步的云端索引ID
@@ -41,10 +43,28 @@ type LazyIndexManager struct {
 
 // NewLazyIndexManager 创建懒加载索引管理器
 func NewLazyIndexManager(repoPath, dataPath string, patterns []string) *LazyIndexManager {
+	// 创建匹配器，使用与repo相同的逻辑
+	var matcher *ignore.GitIgnore
+	if len(patterns) == 0 {
+		matcher = ignore.CompileIgnoreLines() // 返回空匹配器
+	} else {
+		// 统一移除前导 '/'，以消除路径格式差异
+		var normalized []string
+		for _, p := range patterns {
+			if strings.HasPrefix(p, "/") {
+				normalized = append(normalized, p[1:])
+			} else {
+				normalized = append(normalized, p)
+			}
+		}
+		matcher = ignore.CompileIgnoreLines(normalized...)
+	}
+
 	manager := &LazyIndexManager{
 		repoPath:  repoPath,
 		dataPath:  dataPath,
 		patterns:  patterns,
+		matcher:   matcher,
 		lazyFiles: make(map[string]*entity.File),
 	}
 
@@ -209,31 +229,17 @@ func (m *LazyIndexManager) MergeWithLocalFiles(localFiles []*entity.File) []*ent
 	return mergedFiles
 }
 
-// isLazyLoadingFile 检查文件是否为懒加载文件
+// isLazyLoadingFile 检查文件是否为懒加载文件，使用与repo.go完全相同的逻辑
 func (m *LazyIndexManager) isLazyLoadingFile(filePath string) bool {
 	if len(m.patterns) == 0 {
 		return false
 	}
-
-	// 使用与repo.go相同的逻辑
-	for _, pattern := range m.patterns {
-		// 简化的匹配逻辑
-		if strings.HasSuffix(pattern, "*") {
-			prefix := strings.TrimSuffix(pattern, "*")
-			if strings.HasPrefix(filePath, "/"+prefix) || strings.Contains(filePath, "/"+prefix) {
-				return true
-			}
-		} else if strings.HasPrefix(pattern, "*.") {
-			suffix := strings.TrimPrefix(pattern, "*")
-			if strings.HasSuffix(filePath, suffix) {
-				return true
-			}
-		} else if filePath == "/"+pattern || strings.HasSuffix(filePath, "/"+pattern) {
-			return true
-		}
+	// 去除被检测路径的前导 '/'
+	normalized := filePath
+	if strings.HasPrefix(normalized, "/") {
+		normalized = normalized[1:]
 	}
-
-	return false
+	return m.matcher.MatchesPath(normalized)
 }
 
 // save 保存懒加载索引到磁盘
