@@ -1288,18 +1288,37 @@ func (repo *Repo) checkoutFile(file *entity.File, checkoutDir string, count, tot
 		return
 	}
 
-	for _, c := range file.Chunks {
+	totalWritten := int64(0)
+	logging.LogInfof("[Lazy Load Debug] checkoutFile [%s] with %d chunks, expected size: %d", file.Path, len(file.Chunks), file.Size)
+	
+	for i, c := range file.Chunks {
 		var chunk *entity.Chunk
 		chunk, err = repo.store.GetChunk(c)
 		if nil != err {
+			logging.LogErrorf("[Lazy Load Debug] failed to get chunk %d/%d [%s] for file [%s]: %s", i+1, len(file.Chunks), c, file.Path, err)
 			return
 		}
 
+		if nil == chunk {
+			logging.LogErrorf("[Lazy Load Debug] chunk %d/%d [%s] is nil for file [%s]", i+1, len(file.Chunks), c, file.Path)
+			return fmt.Errorf("chunk %s is nil", c)
+		}
+
+		chunkSize := len(chunk.Data)
+		if chunkSize == 0 {
+			logging.LogWarnf("[Lazy Load Debug] chunk %d/%d [%s] has zero size for file [%s]", i+1, len(file.Chunks), c, file.Path)
+		}
+		
 		if _, err = f.Write(chunk.Data); nil != err {
 			logging.LogErrorf("write file [%s] failed: %s", absPath, err)
 			return
 		}
+		
+		totalWritten += int64(chunkSize)
+		logging.LogInfof("[Lazy Load Debug] wrote chunk %d/%d [%s] size: %d bytes for file [%s], total: %d", i+1, len(file.Chunks), c, chunkSize, file.Path, totalWritten)
 	}
+	
+	logging.LogInfof("[Lazy Load Debug] checkout complete for [%s], total written: %d bytes (expected: %d)", file.Path, totalWritten, file.Size)
 
 	if err = f.Sync(); nil != err {
 		logging.LogErrorf("write file [%s] failed: %s", absPath, err)
@@ -1570,24 +1589,39 @@ func (repo *Repo) lazyLoadFromCloud(file *entity.File, context map[string]interf
 
 // ensureChunksAvailable 确保文件的所有chunks都可用
 func (repo *Repo) ensureChunksAvailable(file *entity.File, context map[string]interface{}) (err error) {
+	logging.LogInfof("[Lazy Load Debug] ensureChunksAvailable for file [%s], expected chunks: %d", file.Path, len(file.Chunks))
+	
 	// 检查本地缺失的chunks
 	missingChunks, err := repo.localNotFoundChunks(file.Chunks)
 	if nil != err {
 		return fmt.Errorf("check local chunks failed: %s", err)
 	}
 
+	logging.LogInfof("[Lazy Load Debug] missing chunks: %d/%d for file [%s]", len(missingChunks), len(file.Chunks), file.Path)
+
 	if len(missingChunks) == 0 {
-		logging.LogInfof("all chunks for file [%s] are already available", file.Path)
+		logging.LogInfof("[Lazy Load Debug] all chunks for file [%s] are already available", file.Path)
 		return nil
 	}
 
 	// 从云端下载缺失的chunks
+	logging.LogInfof("[Lazy Load Debug] downloading %d missing chunks for file [%s]", len(missingChunks), file.Path)
 	length, err := repo.downloadCloudChunksPut(missingChunks, context)
 	if nil != err {
+		logging.LogErrorf("[Lazy Load Debug] download cloud chunks failed for file [%s]: %s", file.Path, err)
 		return fmt.Errorf("download cloud chunks failed: %s", err)
 	}
 
-	logging.LogInfof("[Lazy Load] downloaded [%d] chunks for file [%s], size: %d bytes", len(missingChunks), file.Path, length)
+	logging.LogInfof("[Lazy Load] downloaded [%d] chunks for file [%s], total size: %d bytes", len(missingChunks), file.Path, length)
+	
+	// 验证下载后的chunks
+	stillMissing, checkErr := repo.localNotFoundChunks(file.Chunks)
+	if nil != checkErr {
+		logging.LogWarnf("[Lazy Load Debug] failed to verify chunks after download: %s", checkErr)
+	} else {
+		logging.LogInfof("[Lazy Load Debug] after download, still missing chunks: %d/%d for file [%s]", len(stillMissing), len(file.Chunks), file.Path)
+	}
+	
 	return nil
 }
 
