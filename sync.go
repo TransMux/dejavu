@@ -198,8 +198,28 @@ func (repo *Repo) sync0(context map[string]interface{},
 		return
 	}
 
-	// 从文件列表中得到去重后的分块列表
-	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
+	// 分离普通文件和懒加载文件
+	var normalFiles, lazyFiles []*entity.File
+	for _, file := range cloudLatestFiles {
+		if strings.HasPrefix(file.Path, "/assets/") && repo.lazyLoadEnabled {
+			lazyFiles = append(lazyFiles, file)
+		} else {
+			normalFiles = append(normalFiles, file)
+		}
+	}
+
+	// 只从普通文件中获取需要下载的chunks（不包括懒加载文件的chunks）
+	cloudChunkIDs := repo.getChunks(normalFiles)
+	
+	// 更新懒加载清单（不下载实际数据）
+	if 0 < len(lazyFiles) {
+		err = repo.updateLazyManifest(lazyFiles)
+		if nil != err {
+			logging.LogErrorf("update lazy manifest failed: %s", err)
+			return
+		}
+		logging.LogInfof("updated lazy manifest with %d assets files", len(lazyFiles))
+	}
 
 	waitGroup := sync.WaitGroup{}
 	waitGroup.Add(1)

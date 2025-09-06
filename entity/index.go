@@ -25,16 +25,20 @@ import (
 
 // Index 描述了快照索引。
 type Index struct {
-	ID           string   `json:"id"`           // Hash
-	Memo         string   `json:"memo"`         // 索引备注
-	Created      int64    `json:"created"`      // 索引时间
-	Files        []string `json:"files"`        // 文件列表
-	Count        int      `json:"count"`        // 文件总数
-	Size         int64    `json:"size"`         // 文件总大小
-	SystemID     string   `json:"systemID"`     // 系统 ID
-	SystemName   string   `json:"systemName"`   // 系统名称
-	SystemOS     string   `json:"systemOS"`     // 系统操作系统
-	CheckIndexID string   `json:"checkIndexID"` // Check Index ID
+	ID           string   `json:"id"`                     // Hash
+	Memo         string   `json:"memo"`                   // 索引备注
+	Created      int64    `json:"created"`                // 索引时间
+	Files        []string `json:"files"`                  // 文件列表
+	Count        int      `json:"count"`                  // 文件总数
+	Size         int64    `json:"size"`                   // 文件总大小
+	SystemID     string   `json:"systemID"`               // 系统 ID
+	SystemName   string   `json:"systemName"`             // 系统名称
+	SystemOS     string   `json:"systemOS"`               // 系统操作系统
+	CheckIndexID string   `json:"checkIndexID"`           // Check Index ID
+	
+	// 懒加载支持字段（可选，保证向后兼容）
+	LazyFiles    []string `json:"lazyFiles,omitempty"`    // 懒加载文件ID列表
+	LazyManifest string   `json:"lazyManifest,omitempty"` // 懒加载清单文件ID
 }
 
 func (index *Index) String() string {
