@@ -694,10 +694,8 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			return nil
 		}
 
-		// 跳过assets目录下的文件，这些文件通过懒加载管理
-		if repo.lazyLoadEnabled && (strings.HasPrefix(p, "assets/") || strings.HasPrefix(p, "/assets/")) {
-			return nil
-		}
+		// 注意：不要跳过assets文件，我们需要在索引创建时对它们进行分类处理
+		// assets文件会在索引创建时被分类为懒加载文件
 
 		files = append(files, entity.NewFile(p, info.Size(), info.ModTime().UnixMilli()))
 		eventbus.Publish(eventbus.EvtIndexWalkData, context, p)
@@ -913,13 +911,21 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 
 	// 分离普通文件和懒加载文件
 	var normalFiles, lazyFiles []*entity.File
+	logging.LogInfof("index: processing %d files, lazy load enabled: %v", len(files), repo.lazyLoadEnabled)
+	
 	for _, file := range files {
+		logging.LogInfof("index: checking file [%s] for lazy loading", file.Path)
+		
 		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
+			logging.LogInfof("index: file [%s] classified as lazy file", file.Path)
 			lazyFiles = append(lazyFiles, file)
 		} else {
+			logging.LogInfof("index: file [%s] classified as normal file", file.Path)
 			normalFiles = append(normalFiles, file)
 		}
 	}
+	
+	logging.LogInfof("index: final classification - normal files: %d, lazy files: %d", len(normalFiles), len(lazyFiles))
 
 	// 添加普通文件到索引
 	for _, file := range normalFiles {
@@ -1150,7 +1156,7 @@ func (repo *Repo) getFiles(fileIDs []string) (ret []*entity.File, err error) {
 	return
 }
 
-// getFilesWithCloudFallback 获取文件，本地没有时从云端下载（用于懒加载文件）
+// getFilesWithCloudFallback 获取文件元数据，本地没有时从云端下载（只下载元数据，不下载chunks）
 func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string]interface{}) (ret []*entity.File, err error) {
 	var missingFileIDs []string
 	
@@ -1158,24 +1164,38 @@ func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string
 	for _, fileID := range fileIDs {
 		file, getErr := repo.store.GetFile(fileID)
 		if nil != getErr {
-			logging.LogInfof("getFilesWithCloudFallback: file [%s] not found locally, will download from cloud", fileID)
+			logging.LogInfof("getFilesWithCloudFallback: file [%s] not found locally, will download metadata from cloud", fileID)
 			missingFileIDs = append(missingFileIDs, fileID)
 		} else {
+			logging.LogInfof("getFilesWithCloudFallback: file [%s] found locally with %d chunks", fileID, len(file.Chunks))
 			ret = append(ret, file)
 		}
 	}
 	
-	// 从云端下载缺失的文件元数据
+	// 从云端下载缺失的文件元数据（不下载chunks）
 	if len(missingFileIDs) > 0 {
-		logging.LogInfof("getFilesWithCloudFallback: downloading %d missing files from cloud", len(missingFileIDs))
-		_, cloudFiles, downloadErr := repo.downloadCloudFilesPut(missingFileIDs, context)
-		if downloadErr != nil {
-			logging.LogErrorf("getFilesWithCloudFallback: failed to download files from cloud: %s", downloadErr)
-			err = downloadErr
-			return
+		logging.LogInfof("getFilesWithCloudFallback: downloading metadata for %d missing files from cloud (no chunks)", len(missingFileIDs))
+		
+		for i, fileID := range missingFileIDs {
+			logging.LogInfof("getFilesWithCloudFallback: downloading file metadata %d/%d [%s]", i+1, len(missingFileIDs), fileID)
+			
+			_, cloudFile, downloadErr := repo.downloadCloudFile(fileID, i+1, len(missingFileIDs), context)
+			if downloadErr != nil {
+				logging.LogErrorf("getFilesWithCloudFallback: failed to download file [%s] from cloud: %s", fileID, downloadErr)
+				err = downloadErr
+				return
+			}
+			
+			// 保存到本地存储供下次使用
+			if putErr := repo.store.PutFile(cloudFile); putErr != nil {
+				logging.LogWarnf("getFilesWithCloudFallback: failed to save file [%s] to local store: %s", fileID, putErr)
+			} else {
+				logging.LogInfof("getFilesWithCloudFallback: saved file [%s] metadata to local store, chunks: %d", cloudFile.Path, len(cloudFile.Chunks))
+			}
+			
+			ret = append(ret, cloudFile)
 		}
-		ret = append(ret, cloudFiles...)
-		logging.LogInfof("getFilesWithCloudFallback: successfully downloaded %d files from cloud", len(cloudFiles))
+		logging.LogInfof("getFilesWithCloudFallback: successfully downloaded metadata for %d files from cloud", len(missingFileIDs))
 	}
 	
 	return ret, nil
