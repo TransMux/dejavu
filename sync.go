@@ -191,11 +191,23 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 // trafficStat 待返回的流量统计
 func (repo *Repo) sync0(context map[string]interface{},
 	fetchedFiles []*entity.File, cloudLatest *entity.Index, latest *entity.Index, mergeResult *MergeResult, trafficStat *TrafficStat) (err error) {
-	// 组装还原云端最新文件列表
+	// 组装还原云端最新文件列表（包括普通文件和懒加载文件）
 	cloudLatestFiles, err := repo.getFiles(cloudLatest.Files)
 	if nil != err {
 		logging.LogErrorf("get cloud latest files failed: %s", err)
 		return
+	}
+	
+	// 如果有懒加载文件，也需要获取它们的信息
+	if repo.lazyLoadEnabled && len(cloudLatest.LazyFiles) > 0 {
+		logging.LogInfof("sync0: getting %d lazy files from cloud", len(cloudLatest.LazyFiles))
+		lazyCloudFiles, lazyErr := repo.getFiles(cloudLatest.LazyFiles)
+		if nil != lazyErr {
+			logging.LogErrorf("get cloud lazy files failed: %s", lazyErr)
+			return lazyErr
+		}
+		logging.LogInfof("sync0: got %d lazy files from cloud", len(lazyCloudFiles))
+		cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
 	}
 
 	// 分离普通文件和懒加载文件
