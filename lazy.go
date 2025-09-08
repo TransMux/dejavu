@@ -324,12 +324,33 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		return fmt.Errorf("get manifest failed: %w", err)
 	}
 
+	logging.LogInfof("updateLazyManifest: updating manifest with %d lazy files", len(lazyFiles))
+	
 	// 更新资源信息
 	for _, file := range lazyFiles {
+		logging.LogInfof("updateLazyManifest: processing file [%s] with %d chunks", file.Path, len(file.Chunks))
+		
+		// 尝试两种路径格式查找现有资源
 		asset := manifest.Assets[file.Path]
+		if asset == nil && !strings.HasPrefix(file.Path, "/") {
+			// 尝试加前导斜杠查找
+			altPath := "/" + file.Path
+			asset = manifest.Assets[altPath]
+			logging.LogInfof("updateLazyManifest: trying alternative path [%s] for [%s]", altPath, file.Path)
+		}
+		if asset == nil && strings.HasPrefix(file.Path, "/") {
+			// 尝试去掉前导斜杠查找  
+			altPath := strings.TrimPrefix(file.Path, "/")
+			asset = manifest.Assets[altPath]
+			logging.LogInfof("updateLazyManifest: trying alternative path [%s] for [%s]", altPath, file.Path)
+		}
+		
 		if asset == nil {
+			logging.LogInfof("updateLazyManifest: creating new asset for [%s]", file.Path)
 			asset = &LazyAsset{}
 			manifest.Assets[file.Path] = asset
+		} else {
+			logging.LogInfof("updateLazyManifest: updating existing asset for [%s]", file.Path)
 		}
 
 		asset.Path = file.Path
@@ -338,9 +359,14 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		asset.Modified = file.Updated
 		asset.Chunks = file.Chunks
 
-		// 检查本地是否存在，更新状态
-		localPath := filepath.Join(repo.DataPath, file.Path)
+		// 检查本地是否存在，更新状态  
+		// 注意：这里需要去掉前导斜杠来构建本地路径
+		cleanPath := strings.TrimPrefix(file.Path, "/")
+		localPath := filepath.Join(repo.DataPath, cleanPath)
+		logging.LogInfof("updateLazyManifest: checking local path [%s] for file [%s]", localPath, file.Path)
+		
 		if gulu.File.IsExist(localPath) {
+			logging.LogInfof("updateLazyManifest: file [%s] exists locally, status = cached", file.Path)
 			asset.Status = LazyStatusCached
 		} else {
 			asset.Status = LazyStatusPending

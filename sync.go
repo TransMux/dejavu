@@ -219,8 +219,12 @@ func (repo *Repo) sync0(context map[string]interface{},
 		}
 	}
 
-	// 只从普通文件中获取需要下载的chunks（不包括懒加载文件的chunks）
-	cloudChunkIDs := repo.getChunks(normalFiles)
+	// 获取需要下载的chunks（包括懒加载文件的chunks，但懒加载文件不会被checkout）
+	// 懒加载文件的chunks也需要下载到本地存储，这样才能按需组装文件
+	allFiles := append(normalFiles, lazyFiles...)
+	cloudChunkIDs := repo.getChunks(allFiles)
+	logging.LogInfof("sync0: total chunks to download: normal files %d, lazy files %d, total chunks %d", 
+		len(repo.getChunks(normalFiles)), len(repo.getChunks(lazyFiles)), len(cloudChunkIDs))
 	
 	// 更新懒加载清单（不下载实际数据）
 	if 0 < len(lazyFiles) {
