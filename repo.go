@@ -999,6 +999,16 @@ func (repo *Repo) relPath(absPath string) string {
 func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{}, count, total int) (err error) {
 	absPath := repo.absPath(file.Path)
 
+	// 如果是懒加载文件且本地不存在，使用已有的chunks信息
+	if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets"+string(os.PathSeparator)) {
+		if !gulu.File.IsExist(absPath) {
+			logging.LogInfof("lazy file [%s] does not exist locally, using existing chunks [%d]", file.Path, len(file.Chunks))
+			// 懒加载文件保持现有的chunks信息，不重新创建
+			// 这些chunks应该已经在云端存在，无需重新上传
+			return nil
+		}
+	}
+
 	if chunker.MinSize > file.Size {
 		var data []byte
 		data, err = filelock.ReadFile(absPath)
