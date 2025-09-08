@@ -22,6 +22,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -1377,11 +1378,21 @@ func (repo *Repo) LoadAssetOnDemand(assetPath string) error {
 		return err
 	}
 	
-	// 规范化路径（统一移除前导斜杠）
+	// 规范化路径（统一移除前导斜杠并URL解码）
 	normalizedPath := assetPath
 	if strings.HasPrefix(assetPath, "/") {
 		normalizedPath = assetPath[1:]
 		logging.LogInfof("LoadAssetOnDemand: normalized path from [%s] to [%s]", assetPath, normalizedPath)
+	}
+	
+	// URL解码处理（处理%2F等编码）
+	if strings.Contains(normalizedPath, "%") {
+		if decodedPath, decodeErr := url.QueryUnescape(normalizedPath); decodeErr == nil {
+			logging.LogInfof("LoadAssetOnDemand: URL decoded path from [%s] to [%s]", normalizedPath, decodedPath)
+			normalizedPath = decodedPath
+		} else {
+			logging.LogWarnf("LoadAssetOnDemand: URL decode failed for [%s]: %s", normalizedPath, decodeErr)
+		}
 	}
 	
 	logging.LogInfof("LoadAssetOnDemand: calling lazy loader with path [%s]", normalizedPath)

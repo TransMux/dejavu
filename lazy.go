@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,7 +119,22 @@ func (ll *LazyLoader) LoadAsset(path string) error {
 	}
 
 	logging.LogInfof("LazyLoader.LoadAsset: manifest has %d assets", len(manifest.Assets))
+	
+	// 尝试查找资源，支持两种路径格式
 	asset, exists := manifest.Assets[path]
+	if !exists && !strings.HasPrefix(path, "/") {
+		// 如果没找到且路径不以/开头，尝试加上/查找
+		altPath := "/" + path
+		logging.LogInfof("LazyLoader.LoadAsset: trying alternative path [%s]", altPath)
+		asset, exists = manifest.Assets[altPath]
+	}
+	if !exists && strings.HasPrefix(path, "/") {
+		// 如果没找到且路径以/开头，尝试去掉/查找
+		altPath := strings.TrimPrefix(path, "/")
+		logging.LogInfof("LazyLoader.LoadAsset: trying alternative path [%s]", altPath)
+		asset, exists = manifest.Assets[altPath]
+	}
+	
 	if !exists {
 		logging.LogErrorf("LazyLoader.LoadAsset: asset [%s] not found in manifest", path)
 		// 列出manifest中所有assets用于调试
