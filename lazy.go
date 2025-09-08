@@ -77,41 +77,64 @@ func NewLazyLoader(repo *Repo) *LazyLoader {
 
 // LoadAsset 加载资源文件
 func (ll *LazyLoader) LoadAsset(path string) error {
+	logging.LogInfof("LazyLoader.LoadAsset: starting load for path [%s]", path)
+	
 	ll.mutex.Lock()
 	defer ll.mutex.Unlock()
 
 	// 检查是否已经在下载中
 	if ch, exists := ll.downloading[path]; exists {
+		logging.LogInfof("LazyLoader.LoadAsset: asset [%s] is already downloading, waiting...", path)
 		ll.mutex.Unlock()
 		err := <-ch
 		ll.mutex.Lock()
+		if err != nil {
+			logging.LogErrorf("LazyLoader.LoadAsset: concurrent download failed for [%s]: %s", path, err.Error())
+		} else {
+			logging.LogInfof("LazyLoader.LoadAsset: concurrent download succeeded for [%s]", path)
+		}
 		return err
 	}
 
 	// 检查本地是否存在
 	localPath := filepath.Join(ll.repo.DataPath, path)
+	logging.LogInfof("LazyLoader.LoadAsset: checking local path [%s]", localPath)
+	
 	if gulu.File.IsExist(localPath) {
+		logging.LogInfof("LazyLoader.LoadAsset: asset [%s] already exists locally", path)
 		if asset := ll.cache[path]; asset != nil {
 			asset.Status = LazyStatusCached
+			logging.LogInfof("LazyLoader.LoadAsset: updated cache status for [%s] to cached", path)
 		}
 		return nil
 	}
 
 	// 获取资源信息
+	logging.LogInfof("LazyLoader.LoadAsset: getting manifest for [%s]", path)
 	manifest, err := ll.getManifest()
 	if err != nil {
+		logging.LogErrorf("LazyLoader.LoadAsset: get manifest failed: %s", err.Error())
 		return fmt.Errorf("get manifest failed: %w", err)
 	}
 
+	logging.LogInfof("LazyLoader.LoadAsset: manifest has %d assets", len(manifest.Assets))
 	asset, exists := manifest.Assets[path]
 	if !exists {
+		logging.LogErrorf("LazyLoader.LoadAsset: asset [%s] not found in manifest", path)
+		// 列出manifest中所有assets用于调试
+		for assetPath := range manifest.Assets {
+			logging.LogInfof("LazyLoader.LoadAsset: manifest contains asset [%s]", assetPath)
+		}
 		return fmt.Errorf("asset not found in manifest: %s", path)
 	}
+
+	logging.LogInfof("LazyLoader.LoadAsset: found asset [%s] in manifest with %d chunks", path, len(asset.Chunks))
 
 	// 创建下载通道
 	ch := make(chan error, 1)
 	ll.downloading[path] = ch
 	asset.Status = LazyStatusDownloading
+	logging.LogInfof("LazyLoader.LoadAsset: starting async download for [%s]", path)
 
 	// 异步下载
 	go func() {
@@ -121,10 +144,11 @@ func (ll *LazyLoader) LoadAsset(path string) error {
 			ll.mutex.Unlock()
 		}()
 
+		logging.LogInfof("LazyLoader.LoadAsset: goroutine starting download for [%s]", path)
 		err := ll.downloadAsset(asset)
 		if err != nil {
 			asset.Status = LazyStatusError
-			logging.LogErrorf("download asset [%s] failed: %s", path, err)
+			logging.LogErrorf("LazyLoader.LoadAsset: download asset [%s] failed: %s", path, err)
 		} else {
 			asset.Status = LazyStatusCached
 			logging.LogInfof("downloaded asset [%s] successfully", path)

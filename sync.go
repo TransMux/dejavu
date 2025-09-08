@@ -200,10 +200,21 @@ func (repo *Repo) sync0(context map[string]interface{},
 
 	// 分离普通文件和懒加载文件
 	var normalFiles, lazyFiles []*entity.File
+	logging.LogInfof("sync0: processing %d cloud latest files, lazy load enabled: %v", len(cloudLatestFiles), repo.lazyLoadEnabled)
+	
 	for _, file := range cloudLatestFiles {
-		if strings.HasPrefix(file.Path, "/assets/") && repo.lazyLoadEnabled {
+		logging.LogInfof("sync0: checking file path [%s] for lazy loading", file.Path)
+		
+		// 统一使用assets/作为前缀检查（不带前导斜杠）
+		if strings.HasPrefix(file.Path, "assets/") && repo.lazyLoadEnabled {
+			logging.LogInfof("sync0: file [%s] classified as lazy file", file.Path)
+			lazyFiles = append(lazyFiles, file)
+		} else if strings.HasPrefix(file.Path, "/assets/") && repo.lazyLoadEnabled {
+			// 兼容处理带前导斜杠的情况
+			logging.LogInfof("sync0: file [%s] classified as lazy file (with leading slash)", file.Path)
 			lazyFiles = append(lazyFiles, file)
 		} else {
+			logging.LogInfof("sync0: file [%s] classified as normal file", file.Path)
 			normalFiles = append(normalFiles, file)
 		}
 	}

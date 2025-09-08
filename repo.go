@@ -664,7 +664,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		}
 
 		// 跳过assets目录下的文件，这些文件通过懒加载管理
-		if repo.lazyLoadEnabled && strings.HasPrefix(p, "assets"+string(os.PathSeparator)) {
+		if repo.lazyLoadEnabled && strings.HasPrefix(p, "assets/") {
 			return nil
 		}
 
@@ -883,7 +883,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	// 分离普通文件和懒加载文件
 	var normalFiles, lazyFiles []*entity.File
 	for _, file := range files {
-		if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets"+string(os.PathSeparator)) {
+		if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets/") {
 			lazyFiles = append(lazyFiles, file)
 		} else {
 			normalFiles = append(normalFiles, file)
@@ -1000,7 +1000,7 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 	absPath := repo.absPath(file.Path)
 
 	// 如果是懒加载文件且本地不存在，使用已有的chunks信息
-	if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets"+string(os.PathSeparator)) {
+	if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets/") {
 		if !gulu.File.IsExist(absPath) {
 			logging.LogInfof("lazy file [%s] does not exist locally, using existing chunks [%d]", file.Path, len(file.Chunks))
 			// 懒加载文件保持现有的chunks信息，不重新创建
@@ -1156,15 +1156,22 @@ func (repo *Repo) checkoutFiles(files []*entity.File, context map[string]interfa
 	//now := time.Now()
 
 	var dotSiYuans, assets, emojis, storage, plugins, widgets, templates, public, others, all []*entity.File
+	logging.LogInfof("checkoutFiles: processing %d files, lazy load enabled: %v", len(files), repo.lazyLoadEnabled)
+	
 	for _, file := range files {
+		logging.LogInfof("checkoutFiles: processing file [%s]", file.Path)
+		
 		// 跳过懒加载文件，这些文件按需下载
-		if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets"+string(os.PathSeparator)) {
+		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
+			logging.LogInfof("checkoutFiles: skipping lazy file [%s]", file.Path)
 			continue
 		}
 		
 		if strings.Contains(file.Path, ".siyuan") {
+			logging.LogInfof("checkoutFiles: file [%s] classified as dotSiYuan", file.Path)
 			dotSiYuans = append(dotSiYuans, file)
-		} else if strings.HasPrefix(file.Path, "/assets/") {
+		} else if strings.HasPrefix(file.Path, "/assets/") || strings.HasPrefix(file.Path, "assets/") {
+			logging.LogInfof("checkoutFiles: file [%s] classified as assets", file.Path)
 			assets = append(assets, file)
 		} else if strings.HasPrefix(file.Path, "/emojis/") {
 			emojis = append(emojis, file)
@@ -1351,15 +1358,41 @@ func (repo *Repo) isCloudSiYuan() bool {
 
 // LoadAssetOnDemand 按需加载指定的资源文件
 func (repo *Repo) LoadAssetOnDemand(assetPath string) error {
+	logging.LogInfof("LoadAssetOnDemand: request to load asset [%s]", assetPath)
+	logging.LogInfof("LoadAssetOnDemand: lazy load enabled: %v, lazy loader nil: %v", repo.lazyLoadEnabled, repo.lazyLoader == nil)
+	
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
-		return fmt.Errorf("lazy loading not enabled")
+		err := fmt.Errorf("lazy loading not enabled")
+		logging.LogErrorf("LoadAssetOnDemand: %s", err.Error())
+		return err
 	}
 	
-	if !strings.HasPrefix(assetPath, "assets"+string(os.PathSeparator)) {
-		return fmt.Errorf("not a lazy-loadable asset path: %s", assetPath)
+	// 兼容处理两种路径格式
+	isAssetPath := strings.HasPrefix(assetPath, "assets/") || strings.HasPrefix(assetPath, "/assets/")
+	logging.LogInfof("LoadAssetOnDemand: path [%s] is asset path: %v", assetPath, isAssetPath)
+	
+	if !isAssetPath {
+		err := fmt.Errorf("not a lazy-loadable asset path: %s", assetPath)
+		logging.LogErrorf("LoadAssetOnDemand: %s", err.Error())
+		return err
 	}
 	
-	return repo.lazyLoader.LoadAsset(assetPath)
+	// 规范化路径（统一移除前导斜杠）
+	normalizedPath := assetPath
+	if strings.HasPrefix(assetPath, "/") {
+		normalizedPath = assetPath[1:]
+		logging.LogInfof("LoadAssetOnDemand: normalized path from [%s] to [%s]", assetPath, normalizedPath)
+	}
+	
+	logging.LogInfof("LoadAssetOnDemand: calling lazy loader with path [%s]", normalizedPath)
+	err := repo.lazyLoader.LoadAsset(normalizedPath)
+	if err != nil {
+		logging.LogErrorf("LoadAssetOnDemand: lazy loader failed: %s", err.Error())
+	} else {
+		logging.LogInfof("LoadAssetOnDemand: lazy loader succeeded for [%s]", normalizedPath)
+	}
+	
+	return err
 }
 
 // IsAssetCached 检查资源是否已缓存
