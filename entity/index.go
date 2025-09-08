@@ -42,8 +42,9 @@ type Index struct {
 }
 
 func (index *Index) String() string {
-	return fmt.Sprintf("device=%s/%s, id=%s, files=%d, size=%s, created=%s",
-		index.SystemID, index.SystemOS, index.ID, len(index.Files), humanize.BytesCustomCeil(uint64(index.Size), 2), time.UnixMilli(index.Created).Format("2006-01-02 15:04:05"))
+	totalFiles := len(index.Files) + len(index.LazyFiles)
+	return fmt.Sprintf("device=%s/%s, id=%s, files=%d, lazyFiles=%d, total=%d, size=%s, created=%s",
+		index.SystemID, index.SystemOS, index.ID, len(index.Files), len(index.LazyFiles), totalFiles, humanize.BytesCustomCeil(uint64(index.Size), 2), time.UnixMilli(index.Created).Format("2006-01-02 15:04:05"))
 }
 
 // CheckIndex 描述了一个 Index 对应的数据 ID，包括 File ID 和 Chunk ID。

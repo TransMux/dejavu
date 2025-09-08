@@ -62,14 +62,32 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 	downloadBytes += length
 	apiGet := 1
 
-	// 计算本地缺失的文件
-	fetchFileIDs, err := repo.localNotFoundFiles(index.Files)
+	// 处理普通文件和懒加载文件
+	var normalFiles, lazyFiles []string
+	allFiles, err := repo.getFiles(index.Files)
+	if nil != err {
+		logging.LogErrorf("get files for index failed: %s", err)
+		return
+	}
+
+	// 分离普通文件和懒加载文件
+	for _, file := range allFiles {
+		if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets/") {
+			logging.LogInfof("downloadIndex: file [%s] classified as lazy file", file.Path)
+			lazyFiles = append(lazyFiles, file.ID)
+		} else {
+			normalFiles = append(normalFiles, file.ID)
+		}
+	}
+
+	// 只计算普通文件的缺失
+	fetchFileIDs, err := repo.localNotFoundFiles(normalFiles)
 	if nil != err {
 		logging.LogErrorf("get local not found files failed: %s", err)
 		return
 	}
 
-	// 从云端下载缺失文件并入库
+	// 从云端下载缺失的普通文件并入库
 	length, fetchedFiles, err := repo.downloadCloudFilesPut(fetchFileIDs, context)
 	if nil != err {
 		logging.LogErrorf("download cloud files put failed: %s", err)
@@ -79,21 +97,37 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 	downloadFileCount = len(fetchFileIDs)
 	apiGet += downloadFileCount
 
-	// 从文件列表中得到去重后的分块列表
+	// 只从普通文件列表中得到去重后的分块列表
 	cloudChunkIDs := repo.getChunks(fetchedFiles)
 
-	// 计算本地缺失的分块
+	// 计算本地缺失的分块（只包含普通文件的chunks）
 	fetchChunkIDs, err := repo.localNotFoundChunks(cloudChunkIDs)
 	if nil != err {
 		logging.LogErrorf("get local not found chunks failed: %s", err)
 		return
 	}
 
-	// 从云端获取分块并入库
+	// 从云端获取分块并入库（只下载普通文件的chunks）
 	length, err = repo.downloadCloudChunksPut(fetchChunkIDs, context)
 	downloadBytes += length
 	downloadChunkCount = len(fetchChunkIDs)
 	apiGet += downloadChunkCount
+
+	// 如果有懒加载文件，获取它们的信息但不下载chunks
+	if len(lazyFiles) > 0 {
+		logging.LogInfof("downloadIndex: processing %d lazy files for manifest", len(lazyFiles))
+		lazyFileObjs, lazyErr := repo.getFiles(lazyFiles)
+		if lazyErr != nil {
+			logging.LogErrorf("get lazy files failed: %s", lazyErr)
+			return 0, 0, 0, lazyErr
+		}
+		
+		// 更新懒加载清单
+		if updateErr := repo.updateLazyManifest(lazyFileObjs); updateErr != nil {
+			logging.LogErrorf("update lazy manifest failed: %s", updateErr)
+			return 0, 0, 0, updateErr
+		}
+	}
 
 	// 更新本地索引
 	err = repo.store.PutIndex(index)
@@ -162,8 +196,10 @@ func (repo *Repo) uploadTagIndex(tag, id string, context map[string]interface{})
 	}
 	apiGet := len(refs) + 1
 
-	// 计算云端缺失的文件
+	// 计算云端缺失的文件（包括普通文件和懒加载文件）
 	var uploadFiles []*entity.File
+	
+	// 处理普通文件
 	for _, localFileID := range index.Files {
 		if !gulu.Str.Contains(localFileID, cloudFileIDs) {
 			var uploadFile *entity.File
@@ -172,6 +208,20 @@ func (repo *Repo) uploadTagIndex(tag, id string, context map[string]interface{})
 				logging.LogErrorf("get file failed: %s", err)
 				return
 			}
+			uploadFiles = append(uploadFiles, uploadFile)
+		}
+	}
+	
+	// 处理懒加载文件
+	for _, lazyFileID := range index.LazyFiles {
+		if !gulu.Str.Contains(lazyFileID, cloudFileIDs) {
+			var uploadFile *entity.File
+			uploadFile, err = repo.store.GetFile(lazyFileID)
+			if nil != err {
+				logging.LogErrorf("get lazy file failed: %s", err)
+				return
+			}
+			logging.LogInfof("uploadTagIndex: uploading lazy file [%s]", uploadFile.Path)
 			uploadFiles = append(uploadFiles, uploadFile)
 		}
 	}

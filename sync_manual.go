@@ -19,6 +19,7 @@ package dejavu
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,17 +91,41 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 		return
 	}
 
-	// 从文件列表中得到去重后的分块列表
-	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
+	// 处理懒加载文件
+	if len(cloudLatest.LazyFiles) > 0 {
+		logging.LogInfof("SyncDownload: processing %d lazy files", len(cloudLatest.LazyFiles))
+		lazyCloudFiles, lazyErr := repo.getFiles(cloudLatest.LazyFiles)
+		if lazyErr != nil {
+			logging.LogErrorf("get lazy files failed: %s", lazyErr)
+			return nil, nil, lazyErr
+		}
+		
+		// 更新懒加载清单但不下载chunks
+		if updateErr := repo.updateLazyManifest(lazyCloudFiles); updateErr != nil {
+			logging.LogErrorf("update lazy manifest failed: %s", updateErr)
+			return nil, nil, updateErr
+		}
+	}
 
-	// 计算本地缺失的分块
+	// 分离普通文件（不包含懒加载文件）
+	var normalFiles []*entity.File
+	for _, file := range cloudLatestFiles {
+		if !(repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets/")) {
+			normalFiles = append(normalFiles, file)
+		}
+	}
+
+	// 只从普通文件列表中得到去重后的分块列表
+	cloudChunkIDs := repo.getChunks(normalFiles)
+
+	// 计算本地缺失的分块（只包含普通文件的chunks）
 	fetchChunkIDs, err := repo.localNotFoundChunks(cloudChunkIDs)
 	if nil != err {
 		logging.LogErrorf("get local not found chunks failed: %s", err)
 		return
 	}
 
-	// 从云端下载缺失分块并入库
+	// 从云端下载缺失分块并入库（只下载普通文件的chunks）
 	length, err = repo.downloadCloudChunksPut(fetchChunkIDs, context)
 	trafficStat.DownloadBytes += length
 	trafficStat.DownloadChunkCount += len(fetchChunkIDs)

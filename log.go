@@ -161,7 +161,13 @@ func (repo *Repo) GetIndexLogs(page, pageSize int) (ret []*Log, pageCount, total
 func (repo *Repo) getLog(index *entity.Index, fetchFiles bool) (ret *Log, err error) {
 	var files []*entity.File
 	if fetchFiles {
-		files, _ = repo.getFiles(index.Files)
+		// 获取普通文件
+		normalFiles, _ := repo.getFiles(index.Files)
+		files = append(files, normalFiles...)
+		
+		// 获取懒加载文件
+		lazyFiles, _ := repo.getFiles(index.LazyFiles)
+		files = append(files, lazyFiles...)
 	}
 	ret = &Log{
 		ID:         index.ID,

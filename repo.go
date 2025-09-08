@@ -242,9 +242,16 @@ func (repo *Repo) PurgeCloud() (ret *entity.PurgeStat, err error) {
 			continue
 		}
 
+		// 处理普通文件
 		for _, fileID := range index.Files {
 			referencedObjIDs[fileID] = true
 			referencedFileIDs[fileID] = true
+		}
+		
+		// 处理懒加载文件
+		for _, lazyFileID := range index.LazyFiles {
+			referencedObjIDs[lazyFileID] = true
+			referencedFileIDs[lazyFileID] = true
 		}
 	}
 
@@ -462,10 +469,20 @@ func (repo *Repo) Checkout(id string, context map[string]interface{}) (upserts, 
 
 	defer gulu.File.RemoveEmptyDirs(repo.DataPath, removeEmptyDirExcludes...)
 
-	latestFiles, err := repo.getFiles(index.Files)
+	// 获取所有文件（普通文件和懒加载文件）
+	normalFiles, err := repo.getFiles(index.Files)
 	if nil != err {
 		return
 	}
+	
+	lazyFiles, err := repo.getFiles(index.LazyFiles)
+	if nil != err {
+		return
+	}
+	
+	var latestFiles []*entity.File
+	latestFiles = append(latestFiles, normalFiles...)
+	latestFiles = append(latestFiles, lazyFiles...)
 
 	upserts, removes = repo.diffUpsertRemove(latestFiles, files, false)
 	if 1 > len(upserts) && 1 > len(removes) {
@@ -498,10 +515,23 @@ func (repo *Repo) Index(memo string, checkChunks bool, context map[string]interf
 	return
 }
 
-// GetFiles 返回快照索引 index 中的文件列表。
+// GetFiles 返回快照索引 index 中的文件列表（包括普通文件和懒加载文件）。
 func (repo *Repo) GetFiles(index *entity.Index) (ret []*entity.File, err error) {
-	ret, err = repo.getFiles(index.Files)
-	return
+	// 获取普通文件
+	normalFiles, err := repo.getFiles(index.Files)
+	if err != nil {
+		return nil, err
+	}
+	ret = append(ret, normalFiles...)
+	
+	// 获取懒加载文件
+	lazyFiles, err := repo.getFiles(index.LazyFiles)
+	if err != nil {
+		return nil, err
+	}
+	ret = append(ret, lazyFiles...)
+	
+	return ret, nil
 }
 
 func (repo *Repo) GetFile(fileID string) (ret *entity.File, err error) {

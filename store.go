@@ -141,11 +141,26 @@ func (store *Store) Purge(retentionIndexIDs ...string) (ret *entity.PurgeStat, e
 			continue
 		}
 
+		// 处理普通文件
 		for _, fileID := range index.Files {
 			referencedObjIDs[fileID] = true
 			file, getFileErr := store.GetFile(fileID)
 			if nil != getFileErr {
 				logging.LogWarnf("get file [%s] failed: %s", fileID, getFileErr)
+				continue
+			}
+
+			for _, chunkID := range file.Chunks {
+				referencedObjIDs[chunkID] = true
+			}
+		}
+		
+		// 处理懒加载文件
+		for _, lazyFileID := range index.LazyFiles {
+			referencedObjIDs[lazyFileID] = true
+			file, getFileErr := store.GetFile(lazyFileID)
+			if nil != getFileErr {
+				logging.LogWarnf("get lazy file [%s] failed: %s", lazyFileID, getFileErr)
 				continue
 			}
 
