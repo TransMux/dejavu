@@ -1181,9 +1181,9 @@ func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string
 			
 			_, cloudFile, downloadErr := repo.downloadCloudFile(fileID, i+1, len(missingFileIDs), context)
 			if downloadErr != nil {
-				logging.LogErrorf("getFilesWithCloudFallback: failed to download file [%s] from cloud: %s", fileID, downloadErr)
-				err = downloadErr
-				return
+				logging.LogWarnf("getFilesWithCloudFallback: file [%s] not found in cloud, skipping: %s", fileID, downloadErr)
+				// 云端文件不存在时跳过，不中断整个流程
+				continue
 			}
 			
 			// 保存到本地存储供下次使用

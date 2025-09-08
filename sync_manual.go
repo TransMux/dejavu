@@ -252,8 +252,10 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 		return
 	}
 
-	// 计算云端缺失的文件
+	// 计算云端缺失的文件（包括普通文件和懒加载文件）
 	var uploadFiles []*entity.File
+	
+	// 处理普通文件
 	for _, localFileID := range latest.Files {
 		if !gulu.Str.Contains(localFileID, cloudLatest.Files) {
 			var uploadFile *entity.File
@@ -262,6 +264,21 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 				logging.LogErrorf("get file failed: %s", err)
 				return
 			}
+			logging.LogInfof("SyncUpload: uploading normal file [%s]", uploadFile.Path)
+			uploadFiles = append(uploadFiles, uploadFile)
+		}
+	}
+	
+	// 处理懒加载文件
+	for _, lazyFileID := range latest.LazyFiles {
+		if !gulu.Str.Contains(lazyFileID, cloudLatest.LazyFiles) {
+			var uploadFile *entity.File
+			uploadFile, err = repo.store.GetFile(lazyFileID)
+			if nil != err {
+				logging.LogErrorf("get lazy file failed: %s", err)
+				return
+			}
+			logging.LogInfof("SyncUpload: uploading lazy file [%s]", uploadFile.Path)
 			uploadFiles = append(uploadFiles, uploadFile)
 		}
 	}
