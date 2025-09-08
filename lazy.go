@@ -183,39 +183,59 @@ func (ll *LazyLoader) LoadAsset(path string) error {
 
 // downloadAsset 下载单个资源文件
 func (ll *LazyLoader) downloadAsset(asset *LazyAsset) error {
-	// 创建目标目录
-	localPath := filepath.Join(ll.repo.DataPath, asset.Path)
+	logging.LogInfof("downloadAsset: starting download for [%s] with %d chunks", asset.Path, len(asset.Chunks))
+	
+	// 创建目标目录（确保路径格式正确）
+	cleanPath := strings.TrimPrefix(asset.Path, "/")
+	localPath := filepath.Join(ll.repo.DataPath, cleanPath)
+	logging.LogInfof("downloadAsset: target local path [%s]", localPath)
+	
 	dir := filepath.Dir(localPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
+		logging.LogErrorf("downloadAsset: create dir [%s] failed: %s", dir, err)
 		return fmt.Errorf("create dir failed: %w", err)
 	}
 
 	// 下载所有chunks
 	var data []byte
-	for _, chunkID := range asset.Chunks {
+	for i, chunkID := range asset.Chunks {
+		logging.LogInfof("downloadAsset: processing chunk %d/%d [%s]", i+1, len(asset.Chunks), chunkID)
+		
 		chunk, err := ll.repo.store.GetChunk(chunkID)
 		if err != nil {
 			// 如果本地没有，从云端下载
+			logging.LogInfof("downloadAsset: chunk [%s] not found locally, downloading from cloud", chunkID)
 			_, cloudChunk, downloadErr := ll.repo.downloadCloudChunk(chunkID, 1, 1, 
 				map[string]interface{}{})
 			if downloadErr != nil {
+				logging.LogErrorf("downloadAsset: download chunk [%s] from cloud failed: %s", chunkID, downloadErr)
 				return fmt.Errorf("download chunk [%s] failed: %w", chunkID, downloadErr)
 			}
 			
+			logging.LogInfof("downloadAsset: chunk [%s] downloaded successfully, size: %d bytes", chunkID, len(cloudChunk.Data))
+			
 			// 存储到本地
 			if putErr := ll.repo.store.PutChunk(cloudChunk); putErr != nil {
+				logging.LogErrorf("downloadAsset: store chunk [%s] locally failed: %s", chunkID, putErr)
 				return fmt.Errorf("put chunk [%s] failed: %w", chunkID, putErr)
 			}
 			
+			logging.LogInfof("downloadAsset: chunk [%s] stored locally", chunkID)
 			chunk = cloudChunk
+		} else {
+			logging.LogInfof("downloadAsset: chunk [%s] found locally, size: %d bytes", chunkID, len(chunk.Data))
 		}
 		data = append(data, chunk.Data...)
 	}
 
 	// 写入文件
+	logging.LogInfof("downloadAsset: writing file [%s], total size: %d bytes", localPath, len(data))
 	if err := gulu.File.WriteFileSafer(localPath, data, 0644); err != nil {
+		logging.LogErrorf("downloadAsset: write file [%s] failed: %s", localPath, err)
 		return fmt.Errorf("write file failed: %w", err)
 	}
+	
+	logging.LogInfof("downloadAsset: successfully downloaded and saved [%s]", asset.Path)
 
 	// 设置文件修改时间
 	modTime := time.UnixMilli(asset.Modified)
