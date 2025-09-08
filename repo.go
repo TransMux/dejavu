@@ -695,7 +695,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		}
 
 		// 跳过assets目录下的文件，这些文件通过懒加载管理
-		if repo.lazyLoadEnabled && strings.HasPrefix(p, "assets/") {
+		if repo.lazyLoadEnabled && (strings.HasPrefix(p, "assets/") || strings.HasPrefix(p, "/assets/")) {
 			return nil
 		}
 
@@ -1031,7 +1031,7 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 	absPath := repo.absPath(file.Path)
 
 	// 如果是懒加载文件且本地不存在，使用已有的chunks信息
-	if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets/") {
+	if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
 		if !gulu.File.IsExist(absPath) {
 			logging.LogInfof("lazy file [%s] does not exist locally, using existing chunks [%d]", file.Path, len(file.Chunks))
 			// 懒加载文件保持现有的chunks信息，不重新创建
@@ -1148,6 +1148,37 @@ func (repo *Repo) getFiles(fileIDs []string) (ret []*entity.File, err error) {
 		ret = append(ret, file)
 	}
 	return
+}
+
+// getFilesWithCloudFallback 获取文件，本地没有时从云端下载（用于懒加载文件）
+func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string]interface{}) (ret []*entity.File, err error) {
+	var missingFileIDs []string
+	
+	// 先尝试从本地获取
+	for _, fileID := range fileIDs {
+		file, getErr := repo.store.GetFile(fileID)
+		if nil != getErr {
+			logging.LogInfof("getFilesWithCloudFallback: file [%s] not found locally, will download from cloud", fileID)
+			missingFileIDs = append(missingFileIDs, fileID)
+		} else {
+			ret = append(ret, file)
+		}
+	}
+	
+	// 从云端下载缺失的文件元数据
+	if len(missingFileIDs) > 0 {
+		logging.LogInfof("getFilesWithCloudFallback: downloading %d missing files from cloud", len(missingFileIDs))
+		_, cloudFiles, downloadErr := repo.downloadCloudFilesPut(missingFileIDs, context)
+		if downloadErr != nil {
+			logging.LogErrorf("getFilesWithCloudFallback: failed to download files from cloud: %s", downloadErr)
+			err = downloadErr
+			return
+		}
+		ret = append(ret, cloudFiles...)
+		logging.LogInfof("getFilesWithCloudFallback: successfully downloaded %d files from cloud", len(cloudFiles))
+	}
+	
+	return ret, nil
 }
 
 func (repo *Repo) openFile(file *entity.File) (ret []byte, err error) {

@@ -60,7 +60,7 @@ func (repo *Repo) diffUpsertRemove(left, right []*entity.File, log bool) (upsert
 		lFile := l[rPath]
 		if nil == lFile {
 			// 防止删除懒加载文件
-			if repo.lazyLoadEnabled && strings.HasPrefix(rPath, "assets/") {
+			if repo.lazyLoadEnabled && (strings.HasPrefix(rPath, "assets/") || strings.HasPrefix(rPath, "/assets/")) {
 				if log {
 					logging.LogInfof("skip removing lazy file [%s, %s, %s]", r[rPath].ID, r[rPath].Path, time.UnixMilli(r[rPath].Updated).Format("2006-01-02 15:04:05"))
 				}

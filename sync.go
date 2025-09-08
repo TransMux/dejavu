@@ -201,7 +201,7 @@ func (repo *Repo) sync0(context map[string]interface{},
 	// 如果有懒加载文件，也需要获取它们的信息
 	if repo.lazyLoadEnabled && len(cloudLatest.LazyFiles) > 0 {
 		logging.LogInfof("sync0: getting %d lazy files from cloud", len(cloudLatest.LazyFiles))
-		lazyCloudFiles, lazyErr := repo.getFiles(cloudLatest.LazyFiles)
+		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
 		if nil != lazyErr {
 			logging.LogErrorf("get cloud lazy files failed: %s", lazyErr)
 			return lazyErr

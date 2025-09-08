@@ -94,7 +94,7 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 	// 处理懒加载文件
 	if len(cloudLatest.LazyFiles) > 0 {
 		logging.LogInfof("SyncDownload: processing %d lazy files", len(cloudLatest.LazyFiles))
-		lazyCloudFiles, lazyErr := repo.getFiles(cloudLatest.LazyFiles)
+		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
 		if lazyErr != nil {
 			logging.LogErrorf("get lazy files failed: %s", lazyErr)
 			return nil, nil, lazyErr
@@ -110,7 +110,7 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 	// 分离普通文件（不包含懒加载文件）
 	var normalFiles []*entity.File
 	for _, file := range cloudLatestFiles {
-		if !(repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets/")) {
+		if !(repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/"))) {
 			normalFiles = append(normalFiles, file)
 		}
 	}

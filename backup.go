@@ -72,7 +72,7 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 
 	// 分离普通文件和懒加载文件
 	for _, file := range allFiles {
-		if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets/") {
+		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
 			logging.LogInfof("downloadIndex: file [%s] classified as lazy file", file.Path)
 			lazyFiles = append(lazyFiles, file.ID)
 		} else {
@@ -116,7 +116,7 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 	// 如果有懒加载文件，获取它们的信息但不下载chunks
 	if len(lazyFiles) > 0 {
 		logging.LogInfof("downloadIndex: processing %d lazy files for manifest", len(lazyFiles))
-		lazyFileObjs, lazyErr := repo.getFiles(lazyFiles)
+		lazyFileObjs, lazyErr := repo.getFilesWithCloudFallback(lazyFiles, context)
 		if lazyErr != nil {
 			logging.LogErrorf("get lazy files failed: %s", lazyErr)
 			return 0, 0, 0, lazyErr

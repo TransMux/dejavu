@@ -348,7 +348,46 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 	
 	// 更新资源信息
 	for _, file := range lazyFiles {
-		logging.LogInfof("updateLazyManifest: processing file [%s] with %d chunks", file.Path, len(file.Chunks))
+		logging.LogInfof("updateLazyManifest: processing file [%s] with %d chunks, size %d bytes", file.Path, len(file.Chunks), file.Size)
+		
+		// 检查文件是否有chunks
+		if len(file.Chunks) == 0 && file.Size > 0 {
+			logging.LogWarnf("updateLazyManifest: file [%s] has no chunks but size is %d bytes! Attempting to repair...", file.Path, file.Size)
+			
+			// 尝试从本地文件重新生成chunks
+			cleanPath := strings.TrimPrefix(file.Path, "/")
+			localPath := filepath.Join(repo.DataPath, cleanPath)
+			
+			if gulu.File.IsExist(localPath) {
+				logging.LogInfof("updateLazyManifest: found local file [%s], attempting to regenerate chunks", localPath)
+				
+				// 创建临时文件对象并计算chunks
+				info, statErr := os.Stat(localPath)
+				if statErr == nil {
+					tempFile := entity.NewFile(file.Path, info.Size(), info.ModTime().UnixMilli())
+					tempFile.ID = file.ID // 保持相同的FileID
+					
+					// 重新计算chunks
+					if putErr := repo.putFileChunks(tempFile, map[string]interface{}{}, 0, 1); putErr == nil {
+						logging.LogInfof("updateLazyManifest: successfully regenerated %d chunks for [%s]", len(tempFile.Chunks), file.Path)
+						file.Chunks = tempFile.Chunks
+						file.Size = tempFile.Size
+						file.Updated = tempFile.Updated
+						
+						// 更新本地存储
+						if updateErr := repo.store.PutFile(tempFile); updateErr != nil {
+							logging.LogWarnf("updateLazyManifest: failed to update file in store: %s", updateErr)
+						} else {
+							logging.LogInfof("updateLazyManifest: successfully updated file [%s] in local store", file.Path)
+						}
+					} else {
+						logging.LogErrorf("updateLazyManifest: failed to regenerate chunks for [%s]: %s", file.Path, putErr)
+					}
+				}
+			} else {
+				logging.LogWarnf("updateLazyManifest: local file [%s] does not exist, cannot regenerate chunks", localPath)
+			}
+		}
 		
 		// 尝试两种路径格式查找现有资源
 		asset := manifest.Assets[file.Path]
@@ -370,7 +409,7 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 			asset = &LazyAsset{}
 			manifest.Assets[file.Path] = asset
 		} else {
-			logging.LogInfof("updateLazyManifest: updating existing asset for [%s]", file.Path)
+			logging.LogInfof("updateLazyManifest: updating existing asset for [%s], old chunks: %d, new chunks: %d", file.Path, len(asset.Chunks), len(file.Chunks))
 		}
 
 		asset.Path = file.Path
