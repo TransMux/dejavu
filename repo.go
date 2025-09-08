@@ -914,7 +914,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	// 分离普通文件和懒加载文件
 	var normalFiles, lazyFiles []*entity.File
 	for _, file := range files {
-		if repo.lazyLoadEnabled && strings.HasPrefix(file.Path, "assets/") {
+		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
 			lazyFiles = append(lazyFiles, file)
 		} else {
 			normalFiles = append(normalFiles, file)
