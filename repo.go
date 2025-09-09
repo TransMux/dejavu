@@ -935,24 +935,35 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 
 	// 添加懒加载文件ID到索引
 	if repo.lazyLoadEnabled && len(lazyFiles) > 0 {
-		// 首先确保懒加载文件的chunks被正确计算和存储
-		logging.LogInfof("index: computing chunks for %d lazy files", len(lazyFiles))
-		lazyContext := map[string]interface{}{
-			eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone, // 禁用事件推送
-		}
-		
-		for i, file := range lazyFiles {
-			// 检查文件是否已经有chunks，如果没有就计算
-			if len(file.Chunks) == 0 {
-				logging.LogInfof("index: computing chunks for lazy file [%s]", file.Path)
-				if putErr := repo.putFileChunks(file, lazyContext, i+1, len(lazyFiles)); putErr != nil {
+		// 处理懒加载文件的chunks
+		// 只有在文件变化时才重新计算chunks，否则从存储中获取现有的chunks信息
+		for _, file := range lazyFiles {
+			// 尝试从存储中获取现有文件对象
+			if existingFile, getErr := repo.store.GetFile(file.ID); getErr == nil && len(existingFile.Chunks) > 0 {
+				// 文件在存储中存在且有chunks，检查是否需要更新
+				if existingFile.Updated == file.Updated && existingFile.Size == file.Size {
+					logging.LogInfof("index: lazy file [%s] unchanged, reusing %d chunks", file.Path, len(existingFile.Chunks))
+					file.Chunks = existingFile.Chunks
+				} else {
+					logging.LogInfof("index: lazy file [%s] changed, recalculating chunks", file.Path)
+					lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
+					if putErr := repo.putFileChunks(file, lazyContext, 1, 1); putErr != nil {
+						logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
+						err = putErr
+						return
+					}
+					logging.LogInfof("index: lazy file [%s] recalculated %d chunks", file.Path, len(file.Chunks))
+				}
+			} else {
+				// 新文件或chunks丢失，计算chunks
+				logging.LogInfof("index: new lazy file [%s], computing chunks", file.Path)
+				lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
+				if putErr := repo.putFileChunks(file, lazyContext, 1, 1); putErr != nil {
 					logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
 					err = putErr
 					return
 				}
-				logging.LogInfof("index: lazy file [%s] now has %d chunks", file.Path, len(file.Chunks))
-			} else {
-				logging.LogInfof("index: lazy file [%s] already has %d chunks", file.Path, len(file.Chunks))
+				logging.LogInfof("index: lazy file [%s] computed %d chunks", file.Path, len(file.Chunks))
 			}
 			ret.LazyFiles = append(ret.LazyFiles, file.ID)
 		}
