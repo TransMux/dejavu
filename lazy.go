@@ -27,6 +27,7 @@ import (
 
 	"github.com/88250/gulu"
 	"github.com/siyuan-note/dejavu/entity"
+	"github.com/siyuan-note/eventbus"
 	"github.com/siyuan-note/logging"
 )
 
@@ -368,7 +369,11 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 					tempFile.ID = file.ID // 保持相同的FileID
 					
 					// 重新计算chunks
-					if putErr := repo.putFileChunks(tempFile, map[string]interface{}{}, 0, 1); putErr == nil {
+					// 创建合适的context避免panic
+					lazyContext := map[string]interface{}{
+						eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone, // 禁用事件推送避免panic
+					}
+					if putErr := repo.putFileChunks(tempFile, lazyContext, 1, 1); putErr == nil {
 						logging.LogInfof("updateLazyManifest: successfully regenerated %d chunks for [%s]", len(tempFile.Chunks), file.Path)
 						file.Chunks = tempFile.Chunks
 						file.Size = tempFile.Size
