@@ -351,47 +351,12 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 	for _, file := range lazyFiles {
 		logging.LogInfof("updateLazyManifest: processing file [%s] with %d chunks, size %d bytes", file.Path, len(file.Chunks), file.Size)
 		
-		// 检查文件是否有chunks
+		// 检查chunks是否有效 - 现在这应该很少发生，因为chunks在索引阶段就被正确计算了
 		if len(file.Chunks) == 0 && file.Size > 0 {
-			logging.LogWarnf("updateLazyManifest: file [%s] has no chunks but size is %d bytes! Attempting to repair...", file.Path, file.Size)
-			
-			// 尝试从本地文件重新生成chunks
-			cleanPath := strings.TrimPrefix(file.Path, "/")
-			localPath := filepath.Join(repo.DataPath, cleanPath)
-			
-			if gulu.File.IsExist(localPath) {
-				logging.LogInfof("updateLazyManifest: found local file [%s], attempting to regenerate chunks", localPath)
-				
-				// 创建临时文件对象并计算chunks
-				info, statErr := os.Stat(localPath)
-				if statErr == nil {
-					tempFile := entity.NewFile(file.Path, info.Size(), info.ModTime().UnixMilli())
-					tempFile.ID = file.ID // 保持相同的FileID
-					
-					// 重新计算chunks
-					// 创建合适的context避免panic
-					lazyContext := map[string]interface{}{
-						eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone, // 禁用事件推送避免panic
-					}
-					if putErr := repo.putFileChunks(tempFile, lazyContext, 1, 1); putErr == nil {
-						logging.LogInfof("updateLazyManifest: successfully regenerated %d chunks for [%s]", len(tempFile.Chunks), file.Path)
-						file.Chunks = tempFile.Chunks
-						file.Size = tempFile.Size
-						file.Updated = tempFile.Updated
-						
-						// 更新本地存储
-						if updateErr := repo.store.PutFile(tempFile); updateErr != nil {
-							logging.LogWarnf("updateLazyManifest: failed to update file in store: %s", updateErr)
-						} else {
-							logging.LogInfof("updateLazyManifest: successfully updated file [%s] in local store", file.Path)
-						}
-					} else {
-						logging.LogErrorf("updateLazyManifest: failed to regenerate chunks for [%s]: %s", file.Path, putErr)
-					}
-				}
-			} else {
-				logging.LogWarnf("updateLazyManifest: local file [%s] does not exist, cannot regenerate chunks", localPath)
-			}
+			logging.LogWarnf("updateLazyManifest: file [%s] has no chunks but size is %d bytes!", file.Path, file.Size)
+			logging.LogWarnf("updateLazyManifest: this indicates an invalid file object, likely from failed putFileChunks or incomplete sync")
+			logging.LogInfof("updateLazyManifest: skipping invalid file object [%s] from lazy manifest", file.Path)
+			continue
 		}
 		
 		// 尝试两种路径格式查找现有资源

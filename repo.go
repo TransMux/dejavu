@@ -935,7 +935,25 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 
 	// 添加懒加载文件ID到索引
 	if repo.lazyLoadEnabled && len(lazyFiles) > 0 {
-		for _, file := range lazyFiles {
+		// 首先确保懒加载文件的chunks被正确计算和存储
+		logging.LogInfof("index: computing chunks for %d lazy files", len(lazyFiles))
+		lazyContext := map[string]interface{}{
+			eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone, // 禁用事件推送
+		}
+		
+		for i, file := range lazyFiles {
+			// 检查文件是否已经有chunks，如果没有就计算
+			if len(file.Chunks) == 0 {
+				logging.LogInfof("index: computing chunks for lazy file [%s]", file.Path)
+				if putErr := repo.putFileChunks(file, lazyContext, i+1, len(lazyFiles)); putErr != nil {
+					logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
+					err = putErr
+					return
+				}
+				logging.LogInfof("index: lazy file [%s] now has %d chunks", file.Path, len(file.Chunks))
+			} else {
+				logging.LogInfof("index: lazy file [%s] already has %d chunks", file.Path, len(file.Chunks))
+			}
 			ret.LazyFiles = append(ret.LazyFiles, file.ID)
 		}
 		
