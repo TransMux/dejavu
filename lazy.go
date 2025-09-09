@@ -27,7 +27,6 @@ import (
 
 	"github.com/88250/gulu"
 	"github.com/siyuan-note/dejavu/entity"
-	"github.com/siyuan-note/eventbus"
 	"github.com/siyuan-note/logging"
 )
 
@@ -80,7 +79,7 @@ func NewLazyLoader(repo *Repo) *LazyLoader {
 // LoadAsset 加载资源文件
 func (ll *LazyLoader) LoadAsset(path string) error {
 	logging.LogInfof("LazyLoader.LoadAsset: starting load for path [%s]", path)
-	
+
 	ll.mutex.Lock()
 	defer ll.mutex.Unlock()
 
@@ -101,7 +100,7 @@ func (ll *LazyLoader) LoadAsset(path string) error {
 	// 检查本地是否存在
 	localPath := filepath.Join(ll.repo.DataPath, path)
 	logging.LogInfof("LazyLoader.LoadAsset: checking local path [%s]", localPath)
-	
+
 	if gulu.File.IsExist(localPath) {
 		logging.LogInfof("LazyLoader.LoadAsset: asset [%s] already exists locally", path)
 		if asset := ll.cache[path]; asset != nil {
@@ -120,7 +119,7 @@ func (ll *LazyLoader) LoadAsset(path string) error {
 	}
 
 	logging.LogInfof("LazyLoader.LoadAsset: manifest has %d assets", len(manifest.Assets))
-	
+
 	// 尝试查找资源，支持两种路径格式
 	asset, exists := manifest.Assets[path]
 	if !exists && !strings.HasPrefix(path, "/") {
@@ -135,7 +134,7 @@ func (ll *LazyLoader) LoadAsset(path string) error {
 		logging.LogInfof("LazyLoader.LoadAsset: trying alternative path [%s]", altPath)
 		asset, exists = manifest.Assets[altPath]
 	}
-	
+
 	if !exists {
 		logging.LogErrorf("LazyLoader.LoadAsset: asset [%s] not found in manifest", path)
 		// 列出manifest中所有assets用于调试
@@ -185,12 +184,12 @@ func (ll *LazyLoader) LoadAsset(path string) error {
 // downloadAsset 下载单个资源文件
 func (ll *LazyLoader) downloadAsset(asset *LazyAsset) error {
 	logging.LogInfof("downloadAsset: starting download for [%s] with %d chunks", asset.Path, len(asset.Chunks))
-	
+
 	// 创建目标目录（确保路径格式正确）
 	cleanPath := strings.TrimPrefix(asset.Path, "/")
 	localPath := filepath.Join(ll.repo.DataPath, cleanPath)
 	logging.LogInfof("downloadAsset: target local path [%s]", localPath)
-	
+
 	dir := filepath.Dir(localPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		logging.LogErrorf("downloadAsset: create dir [%s] failed: %s", dir, err)
@@ -201,26 +200,26 @@ func (ll *LazyLoader) downloadAsset(asset *LazyAsset) error {
 	var data []byte
 	for i, chunkID := range asset.Chunks {
 		logging.LogInfof("downloadAsset: processing chunk %d/%d [%s]", i+1, len(asset.Chunks), chunkID)
-		
+
 		chunk, err := ll.repo.store.GetChunk(chunkID)
 		if err != nil {
 			// 如果本地没有，从云端下载
 			logging.LogInfof("downloadAsset: chunk [%s] not found locally, downloading from cloud", chunkID)
-			_, cloudChunk, downloadErr := ll.repo.downloadCloudChunk(chunkID, 1, 1, 
+			_, cloudChunk, downloadErr := ll.repo.downloadCloudChunk(chunkID, 1, 1,
 				map[string]interface{}{})
 			if downloadErr != nil {
 				logging.LogErrorf("downloadAsset: download chunk [%s] from cloud failed: %s", chunkID, downloadErr)
 				return fmt.Errorf("download chunk [%s] failed: %w", chunkID, downloadErr)
 			}
-			
+
 			logging.LogInfof("downloadAsset: chunk [%s] downloaded successfully, size: %d bytes", chunkID, len(cloudChunk.Data))
-			
+
 			// 存储到本地
 			if putErr := ll.repo.store.PutChunk(cloudChunk); putErr != nil {
 				logging.LogErrorf("downloadAsset: store chunk [%s] locally failed: %s", chunkID, putErr)
 				return fmt.Errorf("put chunk [%s] failed: %w", chunkID, putErr)
 			}
-			
+
 			logging.LogInfof("downloadAsset: chunk [%s] stored locally", chunkID)
 			chunk = cloudChunk
 		} else {
@@ -235,7 +234,7 @@ func (ll *LazyLoader) downloadAsset(asset *LazyAsset) error {
 		logging.LogErrorf("downloadAsset: write file [%s] failed: %s", localPath, err)
 		return fmt.Errorf("write file failed: %w", err)
 	}
-	
+
 	logging.LogInfof("downloadAsset: successfully downloaded and saved [%s]", asset.Path)
 
 	// 设置文件修改时间
@@ -346,11 +345,11 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 	}
 
 	logging.LogInfof("updateLazyManifest: updating manifest with %d lazy files", len(lazyFiles))
-	
+
 	// 更新资源信息
 	for _, file := range lazyFiles {
 		logging.LogInfof("updateLazyManifest: processing file [%s] with %d chunks, size %d bytes", file.Path, len(file.Chunks), file.Size)
-		
+
 		// 检查chunks是否有效 - 现在这应该很少发生，因为chunks在索引阶段就被正确计算了
 		if len(file.Chunks) == 0 && file.Size > 0 {
 			logging.LogWarnf("updateLazyManifest: file [%s] has no chunks but size is %d bytes!", file.Path, file.Size)
@@ -358,7 +357,7 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 			logging.LogInfof("updateLazyManifest: skipping invalid file object [%s] from lazy manifest", file.Path)
 			continue
 		}
-		
+
 		// 尝试两种路径格式查找现有资源
 		asset := manifest.Assets[file.Path]
 		if asset == nil && !strings.HasPrefix(file.Path, "/") {
@@ -368,12 +367,12 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 			logging.LogInfof("updateLazyManifest: trying alternative path [%s] for [%s]", altPath, file.Path)
 		}
 		if asset == nil && strings.HasPrefix(file.Path, "/") {
-			// 尝试去掉前导斜杠查找  
+			// 尝试去掉前导斜杠查找
 			altPath := strings.TrimPrefix(file.Path, "/")
 			asset = manifest.Assets[altPath]
 			logging.LogInfof("updateLazyManifest: trying alternative path [%s] for [%s]", altPath, file.Path)
 		}
-		
+
 		if asset == nil {
 			logging.LogInfof("updateLazyManifest: creating new asset for [%s]", file.Path)
 			asset = &LazyAsset{}
@@ -388,12 +387,12 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		asset.Modified = file.Updated
 		asset.Chunks = file.Chunks
 
-		// 检查本地是否存在，更新状态  
+		// 检查本地是否存在，更新状态
 		// 注意：这里需要去掉前导斜杠来构建本地路径
 		cleanPath := strings.TrimPrefix(file.Path, "/")
 		localPath := filepath.Join(repo.DataPath, cleanPath)
 		logging.LogInfof("updateLazyManifest: checking local path [%s] for file [%s]", localPath, file.Path)
-		
+
 		if gulu.File.IsExist(localPath) {
 			logging.LogInfof("updateLazyManifest: file [%s] exists locally, status = cached", file.Path)
 			asset.Status = LazyStatusCached
