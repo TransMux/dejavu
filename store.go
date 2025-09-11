@@ -454,6 +454,11 @@ func (store *Store) GetChunkPath(id string) string {
 	return file
 }
 
+// DecodeData 解码数据（解压缩和解密）
+func (store *Store) DecodeData(data []byte) ([]byte, error) {
+	return store.decodeData(data)
+}
+
 func (store *Store) Remove(id string) (err error) {
 	_, file := store.AbsPath(id)
 	err = os.RemoveAll(file)

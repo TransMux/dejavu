@@ -213,14 +213,23 @@ func (ll *LazyLoader) downloadAsset(asset *LazyAsset) error {
 				return fmt.Errorf("download chunk [%s] failed: %w", chunkID, downloadErr)
 			}
 
+			logging.LogInfof("downloadAsset: downloaded raw chunk [%s], size: %d bytes", chunkID, len(cloudData))
+
+			// 解码云端数据（解压缩和解密）
+			decodedData, decodeErr := ll.repo.store.DecodeData(cloudData)
+			if decodeErr != nil {
+				logging.LogErrorf("downloadAsset: decode chunk [%s] failed: %s", chunkID, decodeErr)
+				return fmt.Errorf("decode chunk [%s] failed: %w", chunkID, decodeErr)
+			}
+
 			cloudChunk := &entity.Chunk{
 				ID:   chunkID,
-				Data: cloudData,
+				Data: decodedData,
 			}
 			
-			logging.LogInfof("downloadAsset: chunk [%s] downloaded successfully, size: %d bytes", chunkID, len(cloudChunk.Data))
+			logging.LogInfof("downloadAsset: chunk [%s] decoded successfully, original size: %d bytes, decoded size: %d bytes", chunkID, len(cloudData), len(decodedData))
 
-			// 存储到本地
+			// 存储解码后的chunk到本地（PutChunk会重新编码）
 			if putErr := ll.repo.store.PutChunk(cloudChunk); putErr != nil {
 				logging.LogErrorf("downloadAsset: store chunk [%s] locally failed: %s", chunkID, putErr)
 				return fmt.Errorf("put chunk [%s] failed: %w", chunkID, putErr)
