@@ -205,13 +205,19 @@ func (ll *LazyLoader) downloadAsset(asset *LazyAsset) error {
 		if err != nil {
 			// 如果本地没有，从云端下载
 			logging.LogInfof("downloadAsset: chunk [%s] not found locally, downloading from cloud", chunkID)
-			_, cloudChunk, downloadErr := ll.repo.downloadCloudChunk(chunkID, 1, 1,
-				map[string]interface{}{})
+			
+			chunkPath := fmt.Sprintf("objects/%s/%s", chunkID[:2], chunkID[2:])
+			cloudData, downloadErr := ll.repo.cloud.DownloadObject(chunkPath)
 			if downloadErr != nil {
 				logging.LogErrorf("downloadAsset: download chunk [%s] from cloud failed: %s", chunkID, downloadErr)
 				return fmt.Errorf("download chunk [%s] failed: %w", chunkID, downloadErr)
 			}
 
+			cloudChunk := &entity.Chunk{
+				ID:   chunkID,
+				Data: cloudData,
+			}
+			
 			logging.LogInfof("downloadAsset: chunk [%s] downloaded successfully, size: %d bytes", chunkID, len(cloudChunk.Data))
 
 			// 存储到本地
@@ -345,6 +351,9 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 	}
 
 	logging.LogInfof("updateLazyManifest: updating manifest with %d lazy files", len(lazyFiles))
+	
+	// 记录冲突处理统计
+	var conflictCount, mergedCount, newCount int
 
 	// 更新资源信息
 	for _, file := range lazyFiles {
@@ -377,8 +386,36 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 			logging.LogInfof("updateLazyManifest: creating new asset for [%s]", file.Path)
 			asset = &LazyAsset{}
 			manifest.Assets[file.Path] = asset
+			newCount++
 		} else {
-			logging.LogInfof("updateLazyManifest: updating existing asset for [%s], old chunks: %d, new chunks: %d", file.Path, len(asset.Chunks), len(file.Chunks))
+			logging.LogInfof("updateLazyManifest: found existing asset for [%s], old chunks: %d, new chunks: %d", file.Path, len(asset.Chunks), len(file.Chunks))
+			
+			// 检测并处理冲突
+			if repo.hasLazyFileConflict(asset, file) {
+				conflictCount++
+				logging.LogWarnf("updateLazyManifest: detected conflict for [%s], resolving...", file.Path)
+				
+				// 冲突解决策略：优先使用更新的版本
+				if file.Updated > asset.Modified {
+					logging.LogInfof("updateLazyManifest: using newer file version for [%s] (file: %d > asset: %d)", file.Path, file.Updated, asset.Modified)
+					mergedCount++
+				} else if file.Updated < asset.Modified {
+					logging.LogInfof("updateLazyManifest: keeping existing asset version for [%s] (asset: %d > file: %d)", file.Path, asset.Modified, file.Updated)
+					// 保留现有asset，不更新
+					continue
+				} else {
+					// 时间相同，比较大小和chunks
+					if file.Size != asset.Size || len(file.Chunks) != len(asset.Chunks) {
+						logging.LogInfof("updateLazyManifest: same timestamp but different content for [%s], using file version", file.Path)
+						mergedCount++
+					} else {
+						logging.LogInfof("updateLazyManifest: identical file [%s], no update needed", file.Path)
+						continue
+					}
+				}
+			} else {
+				logging.LogInfof("updateLazyManifest: no conflict for [%s], updating normally", file.Path)
+			}
 		}
 
 		asset.Path = file.Path
@@ -386,6 +423,17 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		asset.Size = file.Size
 		asset.Modified = file.Updated
 		asset.Chunks = file.Chunks
+		
+		// 确保chunks已上传到云端
+		if len(file.Chunks) > 0 {
+			logging.LogInfof("updateLazyManifest: uploading %d chunks for [%s] to cloud", len(file.Chunks), file.Path)
+			if uploadErr := repo.uploadLazyFileChunks(file); uploadErr != nil {
+				logging.LogErrorf("updateLazyManifest: failed to upload chunks for [%s]: %s", file.Path, uploadErr)
+				// 不中断流程，只记录错误
+			} else {
+				logging.LogInfof("updateLazyManifest: successfully uploaded chunks for [%s]", file.Path)
+			}
+		}
 
 		// 检查本地是否存在，更新状态
 		// 注意：这里需要去掉前导斜杠来构建本地路径
@@ -401,7 +449,63 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		}
 	}
 
+	// 记录冲突处理结果
+	logging.LogInfof("updateLazyManifest: manifest update complete - new: %d, conflicts: %d, merged: %d", newCount, conflictCount, mergedCount)
+
 	return repo.lazyLoader.saveManifest(manifest)
+}
+
+// hasLazyFileConflict 检测懒加载文件是否有冲突
+func (repo *Repo) hasLazyFileConflict(asset *LazyAsset, file *entity.File) bool {
+	// 检查是否为有意义的冲突
+	if asset.Modified != file.Updated {
+		return true // 修改时间不同
+	}
+	
+	if asset.Size != file.Size {
+		return true // 文件大小不同
+	}
+	
+	if len(asset.Chunks) != len(file.Chunks) {
+		return true // chunks数量不同
+	}
+	
+	// 深度比较chunks
+	for i, chunkID := range file.Chunks {
+		if i >= len(asset.Chunks) || asset.Chunks[i] != chunkID {
+			return true // chunks内容不同
+		}
+	}
+	
+	return false // 没有冲突
+}
+
+// uploadLazyFileChunks 上传懒加载文件的chunks到云端
+func (repo *Repo) uploadLazyFileChunks(file *entity.File) error {
+	if repo.cloud == nil {
+		return fmt.Errorf("cloud storage not configured")
+	}
+	
+	logging.LogInfof("uploadLazyFileChunks: uploading %d chunks for [%s]", len(file.Chunks), file.Path)
+	
+	for i, chunkID := range file.Chunks {
+		logging.LogInfof("uploadLazyFileChunks: processing chunk %d/%d [%s]", i+1, len(file.Chunks), chunkID)
+		
+		// 构建chunk的云端路径
+		chunkPath := fmt.Sprintf("objects/%s/%s", chunkID[:2], chunkID[2:])
+		
+		// UploadObject 方法会自动从仓库路径读取文件，所以chunk应该已经在正确位置
+		// 上传到云端
+		if _, uploadErr := repo.cloud.UploadObject(chunkPath, false); uploadErr != nil {
+			logging.LogErrorf("uploadLazyFileChunks: failed to upload chunk [%s]: %s", chunkID, uploadErr)
+			return fmt.Errorf("upload chunk %s failed: %w", chunkID, uploadErr)
+		}
+		
+		logging.LogInfof("uploadLazyFileChunks: successfully uploaded chunk [%s]", chunkID)
+	}
+	
+	logging.LogInfof("uploadLazyFileChunks: all chunks uploaded for [%s]", file.Path)
+	return nil
 }
 
 // getLazyFilesForIndex 获取懒加载文件的索引条目
@@ -417,15 +521,44 @@ func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
 
 	var files []*entity.File
 	for _, asset := range manifest.Assets {
-		// 创建虚拟文件条目，包含必要的元数据但不包含实际数据
-		file := &entity.File{
-			ID:      asset.FileID,
-			Path:    asset.Path,
-			Size:    asset.Size,
-			Updated: asset.Modified,
-			Chunks:  asset.Chunks,
+		// 检查本地文件是否存在
+		cleanPath := strings.TrimPrefix(asset.Path, "/")
+		localPath := filepath.Join(repo.DataPath, cleanPath)
+		
+		if gulu.File.IsExist(localPath) {
+			// 本地文件存在，使用实际文件信息
+			logging.LogInfof("getLazyFilesForIndex: local lazy file exists [%s]", asset.Path)
+			info, statErr := os.Stat(localPath)
+			if statErr == nil {
+				// 使用本地文件的实际信息
+				file := &entity.File{
+					ID:      asset.FileID,
+					Path:    asset.Path,
+					Size:    info.Size(),
+					Updated: info.ModTime().UnixMilli(),
+					Chunks:  asset.Chunks, // 保留现有的chunks信息
+				}
+				files = append(files, file)
+			}
+		} else {
+			// 本地文件不存在，使用清单中的元数据创建虚拟条目
+			logging.LogInfof("getLazyFilesForIndex: local lazy file missing [%s], using manifest metadata", asset.Path)
+			
+			// 只有当chunks存在时才添加虚拟条目
+			if len(asset.Chunks) > 0 {
+				file := &entity.File{
+					ID:      asset.FileID,
+					Path:    asset.Path,
+					Size:    asset.Size,
+					Updated: asset.Modified,
+					Chunks:  asset.Chunks,
+				}
+				files = append(files, file)
+				logging.LogInfof("getLazyFilesForIndex: added virtual lazy file [%s] with %d chunks", asset.Path, len(asset.Chunks))
+			} else {
+				logging.LogWarnf("getLazyFilesForIndex: skipping lazy file [%s] - no chunks available", asset.Path)
+			}
 		}
-		files = append(files, file)
 	}
 
 	return files, nil

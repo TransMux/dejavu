@@ -448,6 +448,12 @@ func (store *Store) GetChunk(id string) (ret *entity.Chunk, err error) {
 	return
 }
 
+// GetChunkPath 获取chunk的本地文件路径
+func (store *Store) GetChunkPath(id string) string {
+	_, file := store.AbsPath(id)
+	return file
+}
+
 func (store *Store) Remove(id string) (err error) {
 	_, file := store.AbsPath(id)
 	err = os.RemoveAll(file)
