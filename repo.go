@@ -1090,13 +1090,20 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 			return
 		}
 
+		logging.LogInfof("putFileChunks: read file [%s], expected size: %d, actual read size: %d", file.Path, file.Size, len(data))
+
 		chunkHash := util.Hash(data)
 		file.Chunks = append(file.Chunks, chunkHash)
 		chunk := &entity.Chunk{ID: chunkHash, Data: data}
+		
+		logging.LogInfof("putFileChunks: created chunk [%s] with %d bytes for file [%s]", chunkHash, len(data), file.Path)
+		
 		if err = repo.store.PutChunk(chunk); nil != err {
 			logging.LogErrorf("put chunk [%s] failed: %s", chunkHash, err)
 			return
 		}
+		
+		logging.LogInfof("putFileChunks: successfully stored chunk [%s] for file [%s]", chunkHash, file.Path)
 
 		newInfo, statErr := os.Stat(absPath)
 		if nil != statErr {
