@@ -950,8 +950,8 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			ret.LazyFiles = append(ret.LazyFiles, file.ID)
 		}
 		
-		// 更新懒加载清单 - 这会自动上传chunks
-		if updateErr := repo.updateLazyManifest(lazyFiles); updateErr != nil {
+		// 更新懒加载清单并上传chunks（本地索引阶段）
+		if updateErr := repo.updateLazyManifestWithUpload(lazyFiles, true); updateErr != nil {
 			logging.LogWarnf("update lazy manifest failed: %s", updateErr)
 		}
 		

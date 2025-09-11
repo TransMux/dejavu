@@ -298,6 +298,11 @@ func (ll *LazyLoader) getManifestPath() string {
 
 // updateLazyManifest 更新懒加载清单
 func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
+	return repo.updateLazyManifestWithUpload(lazyFiles, false)
+}
+
+// updateLazyManifestWithUpload 更新懒加载清单，可选择是否上传chunks
+func (repo *Repo) updateLazyManifestWithUpload(lazyFiles []*entity.File, shouldUpload bool) error {
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
 		return nil
 	}
@@ -363,8 +368,8 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		asset.Modified = file.Updated
 		asset.Chunks = file.Chunks
 		
-		// 确保chunks已上传到云端
-		if len(file.Chunks) > 0 {
+		// 仅在需要上传时才上传chunks（通常是本地索引阶段）
+		if shouldUpload && len(file.Chunks) > 0 {
 			if uploadErr := repo.uploadLazyFileChunks(file); uploadErr != nil {
 				logging.LogErrorf("updateLazyManifest: failed to upload chunks for [%s]: %s", file.Path, uploadErr)
 			}
@@ -416,6 +421,13 @@ func (repo *Repo) uploadLazyFileChunks(file *entity.File) error {
 	}
 	
 	for _, chunkID := range file.Chunks {
+		// 检查chunk是否在本地存储中存在
+		if _, err := repo.store.GetChunk(chunkID); err != nil {
+			// chunk不存在于本地，跳过上传
+			logging.LogInfof("uploadLazyFileChunks: chunk [%s] not found locally, skipping upload", chunkID)
+			continue
+		}
+		
 		// 构建chunk的云端路径
 		chunkPath := fmt.Sprintf("objects/%s/%s", chunkID[:2], chunkID[2:])
 		
