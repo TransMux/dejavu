@@ -668,7 +668,13 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	ignoreMatcher := repo.ignoreMatcher()
 	eventbus.Publish(eventbus.EvtIndexBeforeWalkData, context, repo.DataPath)
 	start := time.Now()
+	logging.LogInfof("[DEBUG] Starting file walk in directory: %s", repo.DataPath)
+	var walkCount int
 	err = filelock.Walk(repo.DataPath, func(path string, d fs.DirEntry, err error) error {
+		walkCount++
+		if walkCount%1000 == 0 {
+			logging.LogInfof("[DEBUG] File walk progress: processed %d files, current: %s", walkCount, path)
+		}
 		if nil != err {
 			if isNoSuchFileOrDirErr(err) {
 				// An error `Failed to create data snapshot` is occasionally reported during automatic data sync https://github.com/siyuan-note/siyuan/issues/8998
@@ -700,18 +706,26 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		eventbus.Publish(eventbus.EvtIndexWalkData, context, p)
 		return nil
 	})
+	walkDuration := time.Since(start)
+	logging.LogInfof("[DEBUG] File walk completed: processed %d files in %.2fs", walkCount, walkDuration.Seconds())
 	if nil != err {
 		logging.LogErrorf("walk data failed: %s", err)
 		return
 	}
 	// 添加懒加载文件的虚拟索引条目
 	if repo.lazyLoadEnabled && repo.lazyLoader != nil {
+		logging.LogInfof("[DEBUG] Getting lazy files for index...")
 		lazyFiles, lazyErr := repo.getLazyFilesForIndex()
 		if lazyErr != nil {
-			logging.LogWarnf("get lazy files for index failed: %s", lazyErr)
+			logging.LogWarnf("[DEBUG] get lazy files for index failed: %s", lazyErr)
 		} else if len(lazyFiles) > 0 {
 			files = append(files, lazyFiles...)
+			logging.LogInfof("[DEBUG] Added %d lazy files to index", len(lazyFiles))
+		} else {
+			logging.LogInfof("[DEBUG] No lazy files found to add to index")
 		}
+	} else {
+		logging.LogInfof("[DEBUG] Lazy loading disabled or not initialized")
 	}
 
 	logging.LogInfof("walk data [files=%d] cost [%s]", len(files), time.Since(start))
@@ -757,6 +771,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			start = time.Now()
 			count := atomic.Int32{}
 			total := len(files)
+			logging.LogInfof("[DEBUG] Starting to get latest files from store, total: %d", total)
 			eventbus.Publish(eventbus.EvtIndexBeforeGetLatestFiles, context, total)
 			lock := &sync.Mutex{}
 			waitGroup := &sync.WaitGroup{}
@@ -764,7 +779,11 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 				defer waitGroup.Done()
 
 				count.Add(1)
-				eventbus.Publish(eventbus.EvtIndexGetLatestFile, context, int(count.Load()), total)
+				currentCount := int(count.Load())
+				if currentCount%100 == 0 || currentCount == 1 {
+					logging.LogInfof("[DEBUG] Getting latest files progress: %d/%d", currentCount, total)
+				}
+				eventbus.Publish(eventbus.EvtIndexGetLatestFile, context, currentCount, total)
 
 				fileID := arg.(string)
 				file, getErr := repo.store.GetFile(fileID)
@@ -857,6 +876,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 
 	count := atomic.Int32{}
 	total := len(upserts)
+	logging.LogInfof("[DEBUG] Starting to upsert files, total: %d", total)
 	var workerErrs []error
 	workerErrLock := sync.Mutex{}
 	eventbus.Publish(eventbus.EvtIndexUpsertFiles, context, total)
@@ -865,8 +885,12 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		defer waitGroup.Done()
 
 		count.Add(1)
+		currentCount := int(count.Load())
 		file := arg.(*entity.File)
-		putErr := repo.putFileChunks(file, context, int(count.Load()), total)
+		if currentCount%50 == 0 || currentCount == 1 {
+			logging.LogInfof("[DEBUG] Upsert files progress: %d/%d, current file: %s", currentCount, total, file.Path)
+		}
+		putErr := repo.putFileChunks(file, context, currentCount, total)
 		if nil != putErr {
 			workerErrLock.Lock()
 			workerErrs = append(workerErrs, putErr)
@@ -1044,6 +1068,9 @@ func (repo *Repo) relPath(absPath string) string {
 }
 
 func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{}, count, total int) (err error) {
+	if count == 1 {
+		logging.LogInfof("[DEBUG] Starting putFileChunks for first file: %s", file.Path)
+	}
 	absPath := repo.absPath(file.Path)
 
 	// 如果是懒加载文件且本地不存在，使用已有的chunks信息

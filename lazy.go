@@ -443,14 +443,18 @@ func (repo *Repo) uploadLazyFileChunks(file *entity.File) error {
 // getLazyFilesForIndex 获取懒加载文件的索引条目
 func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		logging.LogInfof("[DEBUG] getLazyFilesForIndex: lazy loading not enabled or loader is nil")
 		return nil, nil
 	}
 
+	logging.LogInfof("[DEBUG] getLazyFilesForIndex: getting manifest...")
 	manifest, err := repo.lazyLoader.getManifest()
 	if err != nil {
+		logging.LogErrorf("[DEBUG] getLazyFilesForIndex: get manifest failed: %s", err)
 		return nil, fmt.Errorf("get manifest failed: %w", err)
 	}
 
+	logging.LogInfof("[DEBUG] getLazyFilesForIndex: manifest has %d assets", len(manifest.Assets))
 	var files []*entity.File
 	for _, asset := range manifest.Assets {
 		// 检查本地文件是否存在
