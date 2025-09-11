@@ -711,7 +711,6 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			logging.LogWarnf("get lazy files for index failed: %s", lazyErr)
 		} else if len(lazyFiles) > 0 {
 			files = append(files, lazyFiles...)
-			logging.LogInfof("added [%d] lazy files to index", len(lazyFiles))
 		}
 	}
 
@@ -910,21 +909,13 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 
 	// 分离普通文件和懒加载文件
 	var normalFiles, lazyFiles []*entity.File
-	logging.LogInfof("index: processing %d files, lazy load enabled: %v", len(files), repo.lazyLoadEnabled)
-	
 	for _, file := range files {
-		logging.LogInfof("index: checking file [%s] for lazy loading", file.Path)
-		
 		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
-			logging.LogInfof("index: file [%s] classified as lazy file", file.Path)
 			lazyFiles = append(lazyFiles, file)
 		} else {
-			logging.LogInfof("index: file [%s] classified as normal file", file.Path)
 			normalFiles = append(normalFiles, file)
 		}
 	}
-	
-	logging.LogInfof("index: final classification - normal files: %d, lazy files: %d", len(normalFiles), len(lazyFiles))
 
 	// 添加普通文件到索引
 	for _, file := range normalFiles {
@@ -942,21 +933,18 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			if existingFile, getErr := repo.store.GetFile(file.ID); getErr == nil && len(existingFile.Chunks) > 0 {
 				// 文件在存储中存在且有chunks，检查是否需要更新
 				if existingFile.Updated == file.Updated && existingFile.Size == file.Size {
-					logging.LogInfof("index: lazy file [%s] unchanged, reusing %d chunks", file.Path, len(existingFile.Chunks))
 					file.Chunks = existingFile.Chunks
 					needsProcessing = false
 				}
 			}
 			
 			if needsProcessing {
-				logging.LogInfof("index: lazy file [%s] needs processing - computing chunks", file.Path)
 				lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
 				if putErr := repo.putFileChunks(file, lazyContext, 1, 1); putErr != nil {
 					logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
 					err = putErr
 					return
 				}
-				logging.LogInfof("index: lazy file [%s] computed %d chunks", file.Path, len(file.Chunks))
 			}
 			
 			ret.LazyFiles = append(ret.LazyFiles, file.ID)
@@ -984,7 +972,6 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			}
 		}
 		
-		logging.LogInfof("indexed [%d] lazy files with manifest", len(lazyFiles))
 	}
 
 	ret.Count = len(ret.Files)
@@ -1062,11 +1049,8 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 	// 如果是懒加载文件且本地不存在，使用已有的chunks信息
 	if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
 		if !gulu.File.IsExist(absPath) {
-			logging.LogInfof("putFileChunks: lazy file [%s] does not exist locally, using existing chunks [%d]", file.Path, len(file.Chunks))
-			
 			// 检查是否有有效的chunks信息
 			if len(file.Chunks) > 0 {
-				logging.LogInfof("putFileChunks: lazy file [%s] has valid chunks, preserving metadata", file.Path)
 				// 保存文件元数据（不包含实际数据）
 				if err := repo.store.PutFile(file); err != nil {
 					logging.LogErrorf("putFileChunks: failed to save lazy file metadata [%s]: %s", file.Path, err)
@@ -1074,11 +1058,8 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 				}
 				return nil
 			} else {
-				logging.LogWarnf("putFileChunks: lazy file [%s] has no chunks and doesn't exist locally, skipping", file.Path)
 				return fmt.Errorf("lazy file [%s] has no chunks and doesn't exist locally", file.Path)
 			}
-		} else {
-			logging.LogInfof("putFileChunks: lazy file [%s] exists locally, processing normally", file.Path)
 		}
 	}
 
@@ -1090,20 +1071,13 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 			return
 		}
 
-		logging.LogInfof("putFileChunks: read file [%s], expected size: %d, actual read size: %d", file.Path, file.Size, len(data))
-
 		chunkHash := util.Hash(data)
 		file.Chunks = append(file.Chunks, chunkHash)
 		chunk := &entity.Chunk{ID: chunkHash, Data: data}
-		
-		logging.LogInfof("putFileChunks: created chunk [%s] with %d bytes for file [%s]", chunkHash, len(data), file.Path)
-		
 		if err = repo.store.PutChunk(chunk); nil != err {
 			logging.LogErrorf("put chunk [%s] failed: %s", chunkHash, err)
 			return
 		}
-		
-		logging.LogInfof("putFileChunks: successfully stored chunk [%s] for file [%s]", chunkHash, file.Path)
 
 		newInfo, statErr := os.Stat(absPath)
 		if nil != statErr {
@@ -1281,14 +1255,9 @@ func (repo *Repo) checkoutFiles(files []*entity.File, context map[string]interfa
 	//now := time.Now()
 
 	var dotSiYuans, assets, emojis, storage, plugins, widgets, templates, public, others, all []*entity.File
-	logging.LogInfof("checkoutFiles: processing %d files, lazy load enabled: %v", len(files), repo.lazyLoadEnabled)
-	
 	for _, file := range files {
-		logging.LogInfof("checkoutFiles: processing file [%s]", file.Path)
-		
 		// 跳过懒加载文件，这些文件按需下载
 		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
-			logging.LogInfof("checkoutFiles: skipping lazy file [%s]", file.Path)
 			continue
 		}
 		
@@ -1483,8 +1452,6 @@ func (repo *Repo) isCloudSiYuan() bool {
 
 // LoadAssetOnDemand 按需加载指定的资源文件
 func (repo *Repo) LoadAssetOnDemand(assetPath string) error {
-	logging.LogInfof("LoadAssetOnDemand: request to load asset [%s]", assetPath)
-	logging.LogInfof("LoadAssetOnDemand: lazy load enabled: %v, lazy loader nil: %v", repo.lazyLoadEnabled, repo.lazyLoader == nil)
 	
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
 		err := fmt.Errorf("lazy loading not enabled")
@@ -1506,18 +1473,9 @@ func (repo *Repo) LoadAssetOnDemand(assetPath string) error {
 	normalizedPath := assetPath
 	if strings.HasPrefix(assetPath, "/") {
 		normalizedPath = assetPath[1:]
-		logging.LogInfof("LoadAssetOnDemand: normalized path from [%s] to [%s]", assetPath, normalizedPath)
 	}
 	
-	logging.LogInfof("LoadAssetOnDemand: calling lazy loader with path [%s]", normalizedPath)
-	err := repo.lazyLoader.LoadAsset(normalizedPath)
-	if err != nil {
-		logging.LogErrorf("LoadAssetOnDemand: lazy loader failed: %s", err.Error())
-	} else {
-		logging.LogInfof("LoadAssetOnDemand: lazy loader succeeded for [%s]", normalizedPath)
-	}
-	
-	return err
+	return repo.lazyLoader.LoadAsset(normalizedPath)
 }
 
 // IsAssetCached 检查资源是否已缓存
