@@ -141,11 +141,26 @@ func (store *Store) Purge(retentionIndexIDs ...string) (ret *entity.PurgeStat, e
 			continue
 		}
 
+		// 处理普通文件
 		for _, fileID := range index.Files {
 			referencedObjIDs[fileID] = true
 			file, getFileErr := store.GetFile(fileID)
 			if nil != getFileErr {
 				logging.LogWarnf("get file [%s] failed: %s", fileID, getFileErr)
+				continue
+			}
+
+			for _, chunkID := range file.Chunks {
+				referencedObjIDs[chunkID] = true
+			}
+		}
+		
+		// 处理懒加载文件
+		for _, lazyFileID := range index.LazyFiles {
+			referencedObjIDs[lazyFileID] = true
+			file, getFileErr := store.GetFile(lazyFileID)
+			if nil != getFileErr {
+				logging.LogWarnf("get lazy file [%s] failed: %s", lazyFileID, getFileErr)
 				continue
 			}
 
@@ -431,6 +446,17 @@ func (store *Store) GetChunk(id string) (ret *entity.Chunk, err error) {
 	}
 	ret = &entity.Chunk{ID: id, Data: data}
 	return
+}
+
+// GetChunkPath 获取chunk的本地文件路径
+func (store *Store) GetChunkPath(id string) string {
+	_, file := store.AbsPath(id)
+	return file
+}
+
+// DecodeData 解码数据（解压缩和解密）
+func (store *Store) DecodeData(data []byte) ([]byte, error) {
+	return store.decodeData(data)
 }
 
 func (store *Store) Remove(id string) (err error) {

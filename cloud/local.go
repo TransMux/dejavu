@@ -232,6 +232,7 @@ func (local *Local) GetRefsFiles() (fileIDs []string, refs []*Ref, err error) {
 		}
 
 		files = append(files, index.Files...)
+		files = append(files, index.LazyFiles...)
 	}
 
 	fileIDs = gulu.Str.RemoveDuplicatedElem(files)

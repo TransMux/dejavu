@@ -191,15 +191,47 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 // trafficStat 待返回的流量统计
 func (repo *Repo) sync0(context map[string]interface{},
 	fetchedFiles []*entity.File, cloudLatest *entity.Index, latest *entity.Index, mergeResult *MergeResult, trafficStat *TrafficStat) (err error) {
-	// 组装还原云端最新文件列表
+	// 组装还原云端最新文件列表（包括普通文件和懒加载文件）
 	cloudLatestFiles, err := repo.getFiles(cloudLatest.Files)
 	if nil != err {
 		logging.LogErrorf("get cloud latest files failed: %s", err)
 		return
 	}
+	
+	// 如果有懒加载文件，也需要获取它们的信息（无论本地是否启用懒加载）
+	if len(cloudLatest.LazyFiles) > 0 {
+		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
+		if nil != lazyErr {
+			logging.LogErrorf("get cloud lazy files failed: %s", lazyErr)
+			return lazyErr
+		}
+		cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
+	}
 
-	// 从文件列表中得到去重后的分块列表
-	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
+	// 分离普通文件和懒加载文件
+	var normalFiles, lazyFiles []*entity.File
+	
+	for _, file := range cloudLatestFiles {
+		// 如果本地启用懒加载且文件是assets文件，分类为懒加载文件
+		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
+			lazyFiles = append(lazyFiles, file)
+		} else {
+			// 否则分类为普通文件（包括本地未启用懒加载时的assets文件）
+			normalFiles = append(normalFiles, file)
+		}
+	}
+
+	// 只下载普通文件的chunks，懒加载文件的chunks按需从云端下载
+	cloudChunkIDs := repo.getChunks(normalFiles)
+	
+	// 更新懒加载清单（只有本地启用懒加载时才需要）
+	if repo.lazyLoadEnabled && 0 < len(lazyFiles) {
+		err = repo.updateLazyManifest(lazyFiles)
+		if nil != err {
+			logging.LogErrorf("update lazy manifest failed: %s", err)
+			return
+		}
+	}
 
 	waitGroup := sync.WaitGroup{}
 	waitGroup.Add(1)

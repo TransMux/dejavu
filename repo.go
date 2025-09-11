@@ -57,23 +57,33 @@ type Repo struct {
 	store    *Store      // 仓库的存储
 	chunkPol chunker.Pol // 文件分块多项式值
 	cloud    cloud.Cloud // 云端存储服务
+	
+	// 懒加载支持
+	lazyLoadEnabled bool        // 是否启用懒加载
+	lazyLoader      *LazyLoader // 懒加载管理器
 }
 
 // NewRepo 创建一个新的仓库。
 func NewRepo(dataPath, repoPath, historyPath, tempPath, deviceID, deviceName, deviceOS string, aesKey []byte, ignoreLines []string, cloud cloud.Cloud) (ret *Repo, err error) {
+	return NewRepoWithLazyLoad(dataPath, repoPath, historyPath, tempPath, deviceID, deviceName, deviceOS, aesKey, ignoreLines, cloud, false)
+}
+
+// NewRepoWithLazyLoad 创建一个支持懒加载的新仓库。
+func NewRepoWithLazyLoad(dataPath, repoPath, historyPath, tempPath, deviceID, deviceName, deviceOS string, aesKey []byte, ignoreLines []string, cloud cloud.Cloud, lazyLoadEnabled bool) (ret *Repo, err error) {
 	if nil != cloud {
 		cloud.GetConf().RepoPath = repoPath
 	}
 	ret = &Repo{
-		DataPath:    filepath.Clean(dataPath),
-		Path:        filepath.Clean(repoPath),
-		HistoryPath: filepath.Clean(historyPath),
-		TempPath:    filepath.Clean(tempPath),
-		DeviceID:    deviceID,
-		DeviceName:  deviceName,
-		DeviceOS:    deviceOS,
-		cloud:       cloud,
-		chunkPol:    chunker.Pol(0x3DA3358B4DC173), // 固定分块多项式值
+		DataPath:        filepath.Clean(dataPath),
+		Path:            filepath.Clean(repoPath),
+		HistoryPath:     filepath.Clean(historyPath),
+		TempPath:        filepath.Clean(tempPath),
+		DeviceID:        deviceID,
+		DeviceName:      deviceName,
+		DeviceOS:        deviceOS,
+		cloud:           cloud,
+		chunkPol:        chunker.Pol(0x3DA3358B4DC173), // 固定分块多项式值
+		lazyLoadEnabled: lazyLoadEnabled,
 	}
 	if !strings.HasSuffix(ret.DataPath, string(os.PathSeparator)) {
 		ret.DataPath += string(os.PathSeparator)
@@ -87,6 +97,15 @@ func NewRepo(dataPath, repoPath, historyPath, tempPath, deviceID, deviceName, de
 	ignoreLines = gulu.Str.RemoveDuplicatedElem(ignoreLines)
 	ret.IgnoreLines = ignoreLines
 	ret.store, err = NewStore(ret.Path, aesKey)
+	if err != nil {
+		return
+	}
+	
+	// 初始化懒加载管理器
+	if ret.lazyLoadEnabled {
+		ret.lazyLoader = NewLazyLoader(ret)
+	}
+	
 	return
 }
 
@@ -222,9 +241,16 @@ func (repo *Repo) PurgeCloud() (ret *entity.PurgeStat, err error) {
 			continue
 		}
 
+		// 处理普通文件
 		for _, fileID := range index.Files {
 			referencedObjIDs[fileID] = true
 			referencedFileIDs[fileID] = true
+		}
+		
+		// 处理懒加载文件
+		for _, lazyFileID := range index.LazyFiles {
+			referencedObjIDs[lazyFileID] = true
+			referencedFileIDs[lazyFileID] = true
 		}
 	}
 
@@ -442,10 +468,20 @@ func (repo *Repo) Checkout(id string, context map[string]interface{}) (upserts, 
 
 	defer gulu.File.RemoveEmptyDirs(repo.DataPath, removeEmptyDirExcludes...)
 
-	latestFiles, err := repo.getFiles(index.Files)
+	// 获取所有文件（普通文件和懒加载文件）
+	normalFiles, err := repo.getFiles(index.Files)
 	if nil != err {
 		return
 	}
+	
+	lazyFiles, err := repo.getFiles(index.LazyFiles)
+	if nil != err {
+		return
+	}
+	
+	var latestFiles []*entity.File
+	latestFiles = append(latestFiles, normalFiles...)
+	latestFiles = append(latestFiles, lazyFiles...)
 
 	upserts, removes = repo.diffUpsertRemove(latestFiles, files, false)
 	if 1 > len(upserts) && 1 > len(removes) {
@@ -478,10 +514,23 @@ func (repo *Repo) Index(memo string, checkChunks bool, context map[string]interf
 	return
 }
 
-// GetFiles 返回快照索引 index 中的文件列表。
+// GetFiles 返回快照索引 index 中的文件列表（包括普通文件和懒加载文件）。
 func (repo *Repo) GetFiles(index *entity.Index) (ret []*entity.File, err error) {
-	ret, err = repo.getFiles(index.Files)
-	return
+	// 获取普通文件
+	normalFiles, err := repo.getFiles(index.Files)
+	if err != nil {
+		return nil, err
+	}
+	ret = append(ret, normalFiles...)
+	
+	// 获取懒加载文件
+	lazyFiles, err := repo.getFiles(index.LazyFiles)
+	if err != nil {
+		return nil, err
+	}
+	ret = append(ret, lazyFiles...)
+	
+	return ret, nil
 }
 
 func (repo *Repo) GetFile(fileID string) (ret *entity.File, err error) {
@@ -644,6 +693,9 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			return nil
 		}
 
+		// 注意：不要跳过assets文件，我们需要在索引创建时对它们进行分类处理
+		// assets文件会在索引创建时被分类为懒加载文件
+
 		files = append(files, entity.NewFile(p, info.Size(), info.ModTime().UnixMilli()))
 		eventbus.Publish(eventbus.EvtIndexWalkData, context, p)
 		return nil
@@ -652,6 +704,16 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		logging.LogErrorf("walk data failed: %s", err)
 		return
 	}
+	// 添加懒加载文件的虚拟索引条目
+	if repo.lazyLoadEnabled && repo.lazyLoader != nil {
+		lazyFiles, lazyErr := repo.getLazyFilesForIndex()
+		if lazyErr != nil {
+			logging.LogWarnf("get lazy files for index failed: %s", lazyErr)
+		} else if len(lazyFiles) > 0 {
+			files = append(files, lazyFiles...)
+		}
+	}
+
 	logging.LogInfof("walk data [files=%d] cost [%s]", len(files), time.Since(start))
 	//sort.Slice(files, func(i, j int) bool { return files[i].Updated > files[j].Updated })
 	//for _, f := range files {
@@ -845,10 +907,73 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		return
 	}
 
+	// 分离普通文件和懒加载文件
+	var normalFiles, lazyFiles []*entity.File
 	for _, file := range files {
+		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
+			lazyFiles = append(lazyFiles, file)
+		} else {
+			normalFiles = append(normalFiles, file)
+		}
+	}
+
+	// 添加普通文件到索引
+	for _, file := range normalFiles {
 		ret.Files = append(ret.Files, file.ID)
 		ret.Size += file.Size
 	}
+
+	// 添加懒加载文件ID到索引
+	if repo.lazyLoadEnabled && len(lazyFiles) > 0 {
+		// 处理懒加载文件的chunks - 只处理本地变化或更新的文件
+		for _, file := range lazyFiles {
+			needsProcessing := true
+			
+			// 检查是否需要重新处理
+			if existingFile, getErr := repo.store.GetFile(file.ID); getErr == nil && len(existingFile.Chunks) > 0 {
+				// 文件在存储中存在且有chunks，检查是否需要更新
+				if existingFile.Updated == file.Updated && existingFile.Size == file.Size {
+					file.Chunks = existingFile.Chunks
+					needsProcessing = false
+				}
+			}
+			
+			if needsProcessing {
+				lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
+				if putErr := repo.putFileChunks(file, lazyContext, 1, 1); putErr != nil {
+					logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
+					err = putErr
+					return
+				}
+			}
+			
+			ret.LazyFiles = append(ret.LazyFiles, file.ID)
+		}
+		
+		// 更新懒加载清单 - 这会自动上传chunks
+		if updateErr := repo.updateLazyManifest(lazyFiles); updateErr != nil {
+			logging.LogWarnf("update lazy manifest failed: %s", updateErr)
+		}
+		
+		// 保存清单文件并添加到索引
+		if repo.lazyLoader != nil {
+			manifestPath := repo.lazyLoader.getManifestPath()
+			relManifestPath := repo.relPath(manifestPath)
+			if gulu.File.IsExist(manifestPath) {
+				info, statErr := os.Stat(manifestPath)
+				if statErr == nil {
+					manifestFile := entity.NewFile(relManifestPath, info.Size(), info.ModTime().UnixMilli())
+					if putErr := repo.putFileChunks(manifestFile, context, 0, 1); putErr == nil {
+						ret.LazyManifest = manifestFile.ID
+						ret.Files = append(ret.Files, manifestFile.ID)
+						ret.Size += manifestFile.Size
+					}
+				}
+			}
+		}
+		
+	}
+
 	ret.Count = len(ret.Files)
 
 	err = repo.store.PutIndex(ret)
@@ -920,6 +1045,23 @@ func (repo *Repo) relPath(absPath string) string {
 
 func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{}, count, total int) (err error) {
 	absPath := repo.absPath(file.Path)
+
+	// 如果是懒加载文件且本地不存在，使用已有的chunks信息
+	if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
+		if !gulu.File.IsExist(absPath) {
+			// 检查是否有有效的chunks信息
+			if len(file.Chunks) > 0 {
+				// 保存文件元数据（不包含实际数据）
+				if err := repo.store.PutFile(file); err != nil {
+					logging.LogErrorf("putFileChunks: failed to save lazy file metadata [%s]: %s", file.Path, err)
+					return fmt.Errorf("save lazy file metadata failed: %w", err)
+				}
+				return nil
+			} else {
+				return fmt.Errorf("lazy file [%s] has no chunks and doesn't exist locally", file.Path)
+			}
+		}
+	}
 
 	if chunker.MinSize > file.Size {
 		var data []byte
@@ -1031,6 +1173,51 @@ func (repo *Repo) getFiles(fileIDs []string) (ret []*entity.File, err error) {
 	return
 }
 
+// getFilesWithCloudFallback 获取文件元数据，本地没有时从云端下载（只下载元数据，不下载chunks）
+func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string]interface{}) (ret []*entity.File, err error) {
+	var missingFileIDs []string
+	
+	// 先尝试从本地获取
+	for _, fileID := range fileIDs {
+		file, getErr := repo.store.GetFile(fileID)
+		if nil != getErr {
+			logging.LogInfof("getFilesWithCloudFallback: file [%s] not found locally, will download metadata from cloud", fileID)
+			missingFileIDs = append(missingFileIDs, fileID)
+		} else {
+			logging.LogInfof("getFilesWithCloudFallback: file [%s] found locally with %d chunks", fileID, len(file.Chunks))
+			ret = append(ret, file)
+		}
+	}
+	
+	// 从云端下载缺失的文件元数据（不下载chunks）
+	if len(missingFileIDs) > 0 {
+		logging.LogInfof("getFilesWithCloudFallback: downloading metadata for %d missing files from cloud (no chunks)", len(missingFileIDs))
+		
+		for i, fileID := range missingFileIDs {
+			logging.LogInfof("getFilesWithCloudFallback: downloading file metadata %d/%d [%s]", i+1, len(missingFileIDs), fileID)
+			
+			_, cloudFile, downloadErr := repo.downloadCloudFile(fileID, i+1, len(missingFileIDs), context)
+			if downloadErr != nil {
+				logging.LogWarnf("getFilesWithCloudFallback: file [%s] not found in cloud, skipping: %s", fileID, downloadErr)
+				// 云端文件不存在时跳过，不中断整个流程
+				continue
+			}
+			
+			// 保存到本地存储供下次使用
+			if putErr := repo.store.PutFile(cloudFile); putErr != nil {
+				logging.LogWarnf("getFilesWithCloudFallback: failed to save file [%s] to local store: %s", fileID, putErr)
+			} else {
+				logging.LogInfof("getFilesWithCloudFallback: saved file [%s] metadata to local store, chunks: %d", cloudFile.Path, len(cloudFile.Chunks))
+			}
+			
+			ret = append(ret, cloudFile)
+		}
+		logging.LogInfof("getFilesWithCloudFallback: successfully downloaded metadata for %d files from cloud", len(missingFileIDs))
+	}
+	
+	return ret, nil
+}
+
 func (repo *Repo) openFile(file *entity.File) (ret []byte, err error) {
 	for _, c := range file.Chunks {
 		var chunk *entity.Chunk
@@ -1069,9 +1256,16 @@ func (repo *Repo) checkoutFiles(files []*entity.File, context map[string]interfa
 
 	var dotSiYuans, assets, emojis, storage, plugins, widgets, templates, public, others, all []*entity.File
 	for _, file := range files {
+		// 跳过懒加载文件，这些文件按需下载
+		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
+			continue
+		}
+		
 		if strings.Contains(file.Path, ".siyuan") {
+			logging.LogInfof("checkoutFiles: file [%s] classified as dotSiYuan", file.Path)
 			dotSiYuans = append(dotSiYuans, file)
-		} else if strings.HasPrefix(file.Path, "/assets/") {
+		} else if strings.HasPrefix(file.Path, "/assets/") || strings.HasPrefix(file.Path, "assets/") {
+			logging.LogInfof("checkoutFiles: file [%s] classified as assets", file.Path)
 			assets = append(assets, file)
 		} else if strings.HasPrefix(file.Path, "/emojis/") {
 			emojis = append(emojis, file)
@@ -1254,4 +1448,50 @@ func (repo *Repo) isCloudSiYuan() bool {
 	default:
 		return false
 	}
+}
+
+// LoadAssetOnDemand 按需加载指定的资源文件
+func (repo *Repo) LoadAssetOnDemand(assetPath string) error {
+	
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		err := fmt.Errorf("lazy loading not enabled")
+		logging.LogErrorf("LoadAssetOnDemand: %s", err.Error())
+		return err
+	}
+	
+	// 兼容处理两种路径格式
+	isAssetPath := strings.HasPrefix(assetPath, "assets/") || strings.HasPrefix(assetPath, "/assets/")
+	logging.LogInfof("LoadAssetOnDemand: path [%s] is asset path: %v", assetPath, isAssetPath)
+	
+	if !isAssetPath {
+		err := fmt.Errorf("not a lazy-loadable asset path: %s", assetPath)
+		logging.LogErrorf("LoadAssetOnDemand: %s", err.Error())
+		return err
+	}
+	
+	// 规范化路径（统一移除前导斜杠）
+	normalizedPath := assetPath
+	if strings.HasPrefix(assetPath, "/") {
+		normalizedPath = assetPath[1:]
+	}
+	
+	return repo.lazyLoader.LoadAsset(normalizedPath)
+}
+
+// IsAssetCached 检查资源是否已缓存
+func (repo *Repo) IsAssetCached(assetPath string) bool {
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		return false
+	}
+	
+	return repo.lazyLoader.IsAssetCached(assetPath)
+}
+
+// ClearLazyCache 清理懒加载缓存
+func (repo *Repo) ClearLazyCache() error {
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		return fmt.Errorf("lazy loading not enabled")
+	}
+	
+	return repo.lazyLoader.ClearCache()
 }

@@ -19,6 +19,7 @@ package dejavu
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,17 +91,45 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 		return
 	}
 
-	// 从文件列表中得到去重后的分块列表
-	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
+	// 处理懒加载文件（无论本地是否启用懒加载）
+	if len(cloudLatest.LazyFiles) > 0 {
+		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
+		if lazyErr != nil {
+			logging.LogErrorf("get lazy files failed: %s", lazyErr)
+			return nil, nil, lazyErr
+		}
+		
+		if repo.lazyLoadEnabled {
+			// 本地启用懒加载时，更新懒加载清单但不下载chunks
+			if updateErr := repo.updateLazyManifest(lazyCloudFiles); updateErr != nil {
+				logging.LogErrorf("update lazy manifest failed: %s", updateErr)
+				return nil, nil, updateErr
+			}
+		} else {
+			// 本地未启用懒加载时，将懒加载文件当作普通文件处理
+			cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
+		}
+	}
 
-	// 计算本地缺失的分块
+	// 分离普通文件（不包含懒加载文件）
+	var normalFiles []*entity.File
+	for _, file := range cloudLatestFiles {
+		if !(repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/"))) {
+			normalFiles = append(normalFiles, file)
+		}
+	}
+
+	// 只从普通文件列表中得到去重后的分块列表
+	cloudChunkIDs := repo.getChunks(normalFiles)
+
+	// 计算本地缺失的分块（只包含普通文件的chunks）
 	fetchChunkIDs, err := repo.localNotFoundChunks(cloudChunkIDs)
 	if nil != err {
 		logging.LogErrorf("get local not found chunks failed: %s", err)
 		return
 	}
 
-	// 从云端下载缺失分块并入库
+	// 从云端下载缺失分块并入库（只下载普通文件的chunks）
 	length, err = repo.downloadCloudChunksPut(fetchChunkIDs, context)
 	trafficStat.DownloadBytes += length
 	trafficStat.DownloadChunkCount += len(fetchChunkIDs)
@@ -227,8 +256,10 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 		return
 	}
 
-	// 计算云端缺失的文件
+	// 计算云端缺失的文件（包括普通文件和懒加载文件）
 	var uploadFiles []*entity.File
+	
+	// 处理普通文件
 	for _, localFileID := range latest.Files {
 		if !gulu.Str.Contains(localFileID, cloudLatest.Files) {
 			var uploadFile *entity.File
@@ -237,6 +268,21 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 				logging.LogErrorf("get file failed: %s", err)
 				return
 			}
+			logging.LogInfof("SyncUpload: uploading normal file [%s]", uploadFile.Path)
+			uploadFiles = append(uploadFiles, uploadFile)
+		}
+	}
+	
+	// 处理懒加载文件
+	for _, lazyFileID := range latest.LazyFiles {
+		if !gulu.Str.Contains(lazyFileID, cloudLatest.LazyFiles) {
+			var uploadFile *entity.File
+			uploadFile, err = repo.store.GetFile(lazyFileID)
+			if nil != err {
+				logging.LogErrorf("get lazy file failed: %s", err)
+				return
+			}
+			logging.LogInfof("SyncUpload: uploading lazy file [%s]", uploadFile.Path)
 			uploadFiles = append(uploadFiles, uploadFile)
 		}
 	}
