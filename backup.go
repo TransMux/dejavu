@@ -64,19 +64,31 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 
 	// 处理普通文件和懒加载文件
 	var normalFiles, lazyFiles []string
+	
+	// 处理index.Files中的普通文件
 	allFiles, err := repo.getFiles(index.Files)
 	if nil != err {
 		logging.LogErrorf("get files for index failed: %s", err)
 		return
 	}
 
-	// 分离普通文件和懒加载文件
+	// 分离普通文件和懒加载文件（index.Files中的文件可能包含assets文件）
 	for _, file := range allFiles {
 		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
-			logging.LogInfof("downloadIndex: file [%s] classified as lazy file", file.Path)
 			lazyFiles = append(lazyFiles, file.ID)
 		} else {
 			normalFiles = append(normalFiles, file.ID)
+		}
+	}
+	
+	// 处理index.LazyFiles（无论本地是否启用懒加载都需要处理）
+	if len(index.LazyFiles) > 0 {
+		if repo.lazyLoadEnabled {
+			// 本地启用懒加载时，添加到懒加载文件列表
+			lazyFiles = append(lazyFiles, index.LazyFiles...)
+		} else {
+			// 本地未启用懒加载时，当作普通文件处理
+			normalFiles = append(normalFiles, index.LazyFiles...)
 		}
 	}
 
@@ -113,16 +125,15 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 	downloadChunkCount = len(fetchChunkIDs)
 	apiGet += downloadChunkCount
 
-	// 如果有懒加载文件，获取它们的信息但不下载chunks
-	if len(lazyFiles) > 0 {
-		logging.LogInfof("downloadIndex: processing %d lazy files for manifest", len(lazyFiles))
+	// 如果有懒加载文件，获取它们的信息
+	if len(lazyFiles) > 0 && repo.lazyLoadEnabled {
 		lazyFileObjs, lazyErr := repo.getFilesWithCloudFallback(lazyFiles, context)
 		if lazyErr != nil {
 			logging.LogErrorf("get lazy files failed: %s", lazyErr)
 			return 0, 0, 0, lazyErr
 		}
 		
-		// 更新懒加载清单
+		// 更新懒加载清单但不下载chunks
 		if updateErr := repo.updateLazyManifest(lazyFileObjs); updateErr != nil {
 			logging.LogErrorf("update lazy manifest failed: %s", updateErr)
 			return 0, 0, 0, updateErr

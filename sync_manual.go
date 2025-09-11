@@ -91,19 +91,23 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 		return
 	}
 
-	// 处理懒加载文件
+	// 处理懒加载文件（无论本地是否启用懒加载）
 	if len(cloudLatest.LazyFiles) > 0 {
-		logging.LogInfof("SyncDownload: processing %d lazy files", len(cloudLatest.LazyFiles))
 		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
 		if lazyErr != nil {
 			logging.LogErrorf("get lazy files failed: %s", lazyErr)
 			return nil, nil, lazyErr
 		}
 		
-		// 更新懒加载清单但不下载chunks
-		if updateErr := repo.updateLazyManifest(lazyCloudFiles); updateErr != nil {
-			logging.LogErrorf("update lazy manifest failed: %s", updateErr)
-			return nil, nil, updateErr
+		if repo.lazyLoadEnabled {
+			// 本地启用懒加载时，更新懒加载清单但不下载chunks
+			if updateErr := repo.updateLazyManifest(lazyCloudFiles); updateErr != nil {
+				logging.LogErrorf("update lazy manifest failed: %s", updateErr)
+				return nil, nil, updateErr
+			}
+		} else {
+			// 本地未启用懒加载时，将懒加载文件当作普通文件处理
+			cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
 		}
 	}
 

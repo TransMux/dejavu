@@ -198,52 +198,39 @@ func (repo *Repo) sync0(context map[string]interface{},
 		return
 	}
 	
-	// 如果有懒加载文件，也需要获取它们的信息
-	if repo.lazyLoadEnabled && len(cloudLatest.LazyFiles) > 0 {
-		logging.LogInfof("sync0: getting %d lazy files from cloud", len(cloudLatest.LazyFiles))
+	// 如果有懒加载文件，也需要获取它们的信息（无论本地是否启用懒加载）
+	if len(cloudLatest.LazyFiles) > 0 {
 		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
 		if nil != lazyErr {
 			logging.LogErrorf("get cloud lazy files failed: %s", lazyErr)
 			return lazyErr
 		}
-		logging.LogInfof("sync0: got %d lazy files from cloud", len(lazyCloudFiles))
 		cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
 	}
 
 	// 分离普通文件和懒加载文件
 	var normalFiles, lazyFiles []*entity.File
-	logging.LogInfof("sync0: processing %d cloud latest files, lazy load enabled: %v", len(cloudLatestFiles), repo.lazyLoadEnabled)
 	
 	for _, file := range cloudLatestFiles {
-		logging.LogInfof("sync0: checking file path [%s] for lazy loading", file.Path)
-		
-		// 统一使用assets/作为前缀检查（不带前导斜杠）
-		if strings.HasPrefix(file.Path, "assets/") && repo.lazyLoadEnabled {
-			logging.LogInfof("sync0: file [%s] classified as lazy file", file.Path)
-			lazyFiles = append(lazyFiles, file)
-		} else if strings.HasPrefix(file.Path, "/assets/") && repo.lazyLoadEnabled {
-			// 兼容处理带前导斜杠的情况
-			logging.LogInfof("sync0: file [%s] classified as lazy file (with leading slash)", file.Path)
+		// 如果本地启用懒加载且文件是assets文件，分类为懒加载文件
+		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
 			lazyFiles = append(lazyFiles, file)
 		} else {
-			logging.LogInfof("sync0: file [%s] classified as normal file", file.Path)
+			// 否则分类为普通文件（包括本地未启用懒加载时的assets文件）
 			normalFiles = append(normalFiles, file)
 		}
 	}
 
 	// 只下载普通文件的chunks，懒加载文件的chunks按需从云端下载
 	cloudChunkIDs := repo.getChunks(normalFiles)
-	logging.LogInfof("sync0: downloading chunks only for normal files: %d chunks, skipping %d lazy files", 
-		len(cloudChunkIDs), len(lazyFiles))
 	
-	// 更新懒加载清单（不下载实际数据）
-	if 0 < len(lazyFiles) {
+	// 更新懒加载清单（只有本地启用懒加载时才需要）
+	if repo.lazyLoadEnabled && 0 < len(lazyFiles) {
 		err = repo.updateLazyManifest(lazyFiles)
 		if nil != err {
 			logging.LogErrorf("update lazy manifest failed: %s", err)
 			return
 		}
-		logging.LogInfof("updated lazy manifest with %d assets files", len(lazyFiles))
 	}
 
 	waitGroup := sync.WaitGroup{}
