@@ -298,11 +298,6 @@ func (ll *LazyLoader) getManifestPath() string {
 
 // updateLazyManifest 更新懒加载清单
 func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
-	return repo.updateLazyManifestWithUpload(lazyFiles, false)
-}
-
-// updateLazyManifestWithUpload 更新懒加载清单，可选择是否上传chunks
-func (repo *Repo) updateLazyManifestWithUpload(lazyFiles []*entity.File, shouldUpload bool) error {
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
 		return nil
 	}
@@ -312,7 +307,6 @@ func (repo *Repo) updateLazyManifestWithUpload(lazyFiles []*entity.File, shouldU
 		return fmt.Errorf("get manifest failed: %w", err)
 	}
 
-	
 	// 记录冲突处理统计
 	var conflictCount, mergedCount, newCount int
 
@@ -367,13 +361,6 @@ func (repo *Repo) updateLazyManifestWithUpload(lazyFiles []*entity.File, shouldU
 		asset.Size = file.Size
 		asset.Modified = file.Updated
 		asset.Chunks = file.Chunks
-		
-		// 仅在需要上传时才上传chunks（通常是本地索引阶段）
-		if shouldUpload && len(file.Chunks) > 0 {
-			if uploadErr := repo.uploadLazyFileChunks(file); uploadErr != nil {
-				logging.LogErrorf("updateLazyManifest: failed to upload chunks for [%s]: %s", file.Path, uploadErr)
-			}
-		}
 
 		// 检查本地是否存在，更新状态
 		cleanPath := strings.TrimPrefix(file.Path, "/")
@@ -386,6 +373,9 @@ func (repo *Repo) updateLazyManifestWithUpload(lazyFiles []*entity.File, shouldU
 		}
 	}
 
+	logging.LogInfof("updateLazyManifest: updated %d assets (new: %d, conflicts: %d, merged: %d)", 
+		len(lazyFiles), newCount, conflictCount, mergedCount)
+
 	return repo.lazyLoader.saveManifest(manifest)
 }
 
@@ -395,50 +385,26 @@ func (repo *Repo) hasLazyFileConflict(asset *LazyAsset, file *entity.File) bool 
 	if asset.Modified != file.Updated {
 		return true // 修改时间不同
 	}
-	
+
 	if asset.Size != file.Size {
 		return true // 文件大小不同
 	}
-	
+
 	if len(asset.Chunks) != len(file.Chunks) {
 		return true // chunks数量不同
 	}
-	
+
 	// 深度比较chunks
 	for i, chunkID := range file.Chunks {
 		if i >= len(asset.Chunks) || asset.Chunks[i] != chunkID {
 			return true // chunks内容不同
 		}
 	}
-	
+
 	return false // 没有冲突
 }
 
-// uploadLazyFileChunks 上传懒加载文件的chunks到云端
-func (repo *Repo) uploadLazyFileChunks(file *entity.File) error {
-	if repo.cloud == nil {
-		return fmt.Errorf("cloud storage not configured")
-	}
-	
-	for _, chunkID := range file.Chunks {
-		// 检查chunk是否在本地存储中存在
-		if _, err := repo.store.GetChunk(chunkID); err != nil {
-			// chunk不存在于本地，跳过上传
-			logging.LogInfof("uploadLazyFileChunks: chunk [%s] not found locally, skipping upload", chunkID)
-			continue
-		}
-		
-		// 构建chunk的云端路径
-		chunkPath := fmt.Sprintf("objects/%s/%s", chunkID[:2], chunkID[2:])
-		
-		// 上传到云端
-		if _, uploadErr := repo.cloud.UploadObject(chunkPath, false); uploadErr != nil {
-			logging.LogErrorf("uploadLazyFileChunks: failed to upload chunk [%s]: %s", chunkID, uploadErr)
-			return fmt.Errorf("upload chunk %s failed: %w", chunkID, uploadErr)
-		}
-	}
-	return nil
-}
+
 
 // getLazyFilesForIndex 获取懒加载文件的索引条目
 func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
@@ -460,7 +426,7 @@ func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
 		// 检查本地文件是否存在
 		cleanPath := strings.TrimPrefix(asset.Path, "/")
 		localPath := filepath.Join(repo.DataPath, cleanPath)
-		
+
 		if gulu.File.IsExist(localPath) {
 			// 本地文件存在，使用实际文件信息
 			info, statErr := os.Stat(localPath)

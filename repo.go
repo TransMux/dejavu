@@ -57,7 +57,7 @@ type Repo struct {
 	store    *Store      // 仓库的存储
 	chunkPol chunker.Pol // 文件分块多项式值
 	cloud    cloud.Cloud // 云端存储服务
-	
+
 	// 懒加载支持
 	lazyLoadEnabled bool        // 是否启用懒加载
 	lazyLoader      *LazyLoader // 懒加载管理器
@@ -100,12 +100,12 @@ func NewRepoWithLazyLoad(dataPath, repoPath, historyPath, tempPath, deviceID, de
 	if err != nil {
 		return
 	}
-	
+
 	// 初始化懒加载管理器
 	if ret.lazyLoadEnabled {
 		ret.lazyLoader = NewLazyLoader(ret)
 	}
-	
+
 	return
 }
 
@@ -246,7 +246,7 @@ func (repo *Repo) PurgeCloud() (ret *entity.PurgeStat, err error) {
 			referencedObjIDs[fileID] = true
 			referencedFileIDs[fileID] = true
 		}
-		
+
 		// 处理懒加载文件
 		for _, lazyFileID := range index.LazyFiles {
 			referencedObjIDs[lazyFileID] = true
@@ -473,12 +473,12 @@ func (repo *Repo) Checkout(id string, context map[string]interface{}) (upserts, 
 	if nil != err {
 		return
 	}
-	
+
 	lazyFiles, err := repo.getFiles(index.LazyFiles)
 	if nil != err {
 		return
 	}
-	
+
 	var latestFiles []*entity.File
 	latestFiles = append(latestFiles, normalFiles...)
 	latestFiles = append(latestFiles, lazyFiles...)
@@ -522,14 +522,14 @@ func (repo *Repo) GetFiles(index *entity.Index) (ret []*entity.File, err error) 
 		return nil, err
 	}
 	ret = append(ret, normalFiles...)
-	
+
 	// 获取懒加载文件
 	lazyFiles, err := repo.getFiles(index.LazyFiles)
 	if err != nil {
 		return nil, err
 	}
 	ret = append(ret, lazyFiles...)
-	
+
 	return ret, nil
 }
 
@@ -664,11 +664,12 @@ func (repo *Repo) index(memo string, checkChunks bool, context map[string]interf
 }
 
 func (repo *Repo) index0(memo string, checkChunks bool, context map[string]interface{}) (ret *entity.Index, err error) {
+	logging.LogInfof("index0: starting index creation process")
+
 	var files []*entity.File
 	ignoreMatcher := repo.ignoreMatcher()
 	eventbus.Publish(eventbus.EvtIndexBeforeWalkData, context, repo.DataPath)
-	start := time.Now()
-	logging.LogInfof("[DEBUG] Starting file walk in directory: %s", repo.DataPath)
+	logging.LogInfof("index0: phase 1/6 - starting file walk in directory: %s", repo.DataPath)
 	var walkCount int
 	err = filelock.Walk(repo.DataPath, func(path string, d fs.DirEntry, err error) error {
 		walkCount++
@@ -706,29 +707,29 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		eventbus.Publish(eventbus.EvtIndexWalkData, context, p)
 		return nil
 	})
-	walkDuration := time.Since(start)
-	logging.LogInfof("[DEBUG] File walk completed: processed %d files in %.2fs", walkCount, walkDuration.Seconds())
+	logging.LogInfof("index0: phase 1/6 completed - file walk: processed %d files", walkCount)
 	if nil != err {
 		logging.LogErrorf("walk data failed: %s", err)
 		return
 	}
-	// 添加懒加载文件的虚拟索引条目
+
+	// Phase 2: Add lazy files
+	logging.LogInfof("index0: phase 2/6 - processing lazy files")
 	if repo.lazyLoadEnabled && repo.lazyLoader != nil {
-		logging.LogInfof("[DEBUG] Getting lazy files for index...")
 		lazyFiles, lazyErr := repo.getLazyFilesForIndex()
 		if lazyErr != nil {
-			logging.LogWarnf("[DEBUG] get lazy files for index failed: %s", lazyErr)
+			logging.LogWarnf("get lazy files for index failed: %s", lazyErr)
 		} else if len(lazyFiles) > 0 {
 			files = append(files, lazyFiles...)
-			logging.LogInfof("[DEBUG] Added %d lazy files to index", len(lazyFiles))
+			logging.LogInfof("index0: phase 2/6 completed - added %d lazy files", len(lazyFiles))
 		} else {
-			logging.LogInfof("[DEBUG] No lazy files found to add to index")
+			logging.LogInfof("index0: phase 2/6 completed - no lazy files found")
 		}
 	} else {
-		logging.LogInfof("[DEBUG] Lazy loading disabled or not initialized")
+		logging.LogInfof("index0: phase 2/6 completed - lazy loading disabled")
 	}
 
-	logging.LogInfof("walk data [files=%d] cost [%s]", len(files), time.Since(start))
+	logging.LogInfof("walk data [files=%d] completed", len(files))
 	//sort.Slice(files, func(i, j int) bool { return files[i].Updated > files[j].Updated })
 	//for _, f := range files {
 	//	logging.LogInfof("walked data [file=%s]", f.Path)
@@ -740,6 +741,8 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		return
 	}
 
+	// Phase 3: Get latest index
+	logging.LogInfof("index0: phase 3/6 - getting latest index")
 	latest, err := repo.Latest()
 	init := false
 	if nil != err {
@@ -758,20 +761,25 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			SystemOS:   repo.DeviceOS,
 		}
 		init = true
+		logging.LogInfof("index0: phase 3/6 completed - first index creation")
+	} else {
+		logging.LogInfof("index0: phase 3/6 completed - got latest index")
 	}
 
+	// Phase 4: Get latest files
+	logging.LogInfof("index0: phase 4/6 - getting latest files")
 	var upserts, removes, latestFiles []*entity.File
 	fullLatest := repo.getFullLatest(latest)
 	if nil != fullLatest {
 		latestFiles = fullLatest.Files
+		logging.LogInfof("index0: phase 4/6 completed - got %d latest files from full latest", len(latestFiles))
 	} else {
 		var workerErrs []error
 		workerErrLock := sync.Mutex{}
 		if !init {
-			start = time.Now()
 			count := atomic.Int32{}
-			total := len(files)
-			logging.LogInfof("[DEBUG] Starting to get latest files from store, total: %d", total)
+			total := len(latest.Files)
+			logging.LogInfof("index0: phase 4/6 - loading %d files from store", total)
 			eventbus.Publish(eventbus.EvtIndexBeforeGetLatestFiles, context, total)
 			lock := &sync.Mutex{}
 			waitGroup := &sync.WaitGroup{}
@@ -846,17 +854,24 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			}
 			waitGroup.Wait()
 			p.Release()
-			logging.LogInfof("get latest files [files=%d] cost [%s]", len(latestFiles), time.Since(start))
+			logging.LogInfof("index0: phase 4/6 completed - loaded %d files from store", len(latestFiles))
 			if 0 < len(workerErrs) {
 				err = workerErrs[0]
 				logging.LogErrorf("get latest files failed: %s", err)
 				return
 			}
+		} else {
+			logging.LogInfof("index0: phase 4/6 completed - init mode, no files to load")
 		}
 	}
 
+	// Phase 5: Calculate diffs
+	logging.LogInfof("index0: phase 5/6 - calculating file differences")
 	upserts, removes = repo.diffUpsertRemove(files, latestFiles, false)
+	logging.LogInfof("index0: phase 5/6 completed - found %d upserts, %d removes", len(upserts), len(removes))
+
 	if 1 > len(upserts) && 1 > len(removes) {
+		logging.LogInfof("index0: no changes detected, returning existing index")
 		ret = latest
 		return
 	}
@@ -874,9 +889,12 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		}
 	}
 
+	// Phase 6: Process upsert files and lazy files
+	logging.LogInfof("index0: phase 6/6 - processing upsert files and lazy files")
+
 	count := atomic.Int32{}
 	total := len(upserts)
-	logging.LogInfof("[DEBUG] Starting to upsert files, total: %d", total)
+	logging.LogInfof("index0: processing %d upsert files", total)
 	var workerErrs []error
 	workerErrLock := sync.Mutex{}
 	eventbus.Publish(eventbus.EvtIndexUpsertFiles, context, total)
@@ -931,54 +949,57 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		return
 	}
 
-	// 分离普通文件和懒加载文件
-	var normalFiles, lazyFiles []*entity.File
-	for _, file := range files {
-		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
-			lazyFiles = append(lazyFiles, file)
-		} else {
-			normalFiles = append(normalFiles, file)
-		}
+	// 创建upserts的映射，提高查找效率
+	upsertMap := make(map[string]*entity.File)
+	for _, file := range upserts {
+		upsertMap[file.Path] = file
 	}
 
-	// 添加普通文件到索引
-	for _, file := range normalFiles {
-		ret.Files = append(ret.Files, file.ID)
-		ret.Size += file.Size
+	// 分离文件并直接添加到索引 - 一次遍历完成所有处理
+	var lazyFiles []*entity.File
+	for _, file := range files {
+		isLazyFile := repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/"))
+
+		if upsertFile, isInUpserts := upsertMap[file.Path]; isInUpserts {
+			// 文件在upserts中，需要重新处理chunks
+			if isLazyFile {
+				lazyFiles = append(lazyFiles, upsertFile)
+			} else {
+				ret.Files = append(ret.Files, upsertFile.ID)
+				ret.Size += upsertFile.Size
+			}
+		} else {
+			// 文件不在upserts中，直接添加到索引
+			if isLazyFile {
+				ret.LazyFiles = append(ret.LazyFiles, file.ID)
+			} else {
+				ret.Files = append(ret.Files, file.ID)
+				ret.Size += file.Size
+			}
+		}
 	}
 
 	// 添加懒加载文件ID到索引
 	if repo.lazyLoadEnabled && len(lazyFiles) > 0 {
-		// 处理懒加载文件的chunks - 只处理本地变化或更新的文件
+		logging.LogInfof("index0: processing %d lazy files for chunk processing", len(lazyFiles))
+
+		// 处理懒加载文件的chunks - 这些都是upserts中的文件，需要重新处理
 		for _, file := range lazyFiles {
-			needsProcessing := true
-			
-			// 检查是否需要重新处理
-			if existingFile, getErr := repo.store.GetFile(file.ID); getErr == nil && len(existingFile.Chunks) > 0 {
-				// 文件在存储中存在且有chunks，检查是否需要更新
-				if existingFile.Updated == file.Updated && existingFile.Size == file.Size {
-					file.Chunks = existingFile.Chunks
-					needsProcessing = false
-				}
+			lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
+			if putErr := repo.putFileChunks(file, lazyContext, 1, 1); putErr != nil {
+				logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
+				err = putErr
+				return
 			}
-			
-			if needsProcessing {
-				lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
-				if putErr := repo.putFileChunks(file, lazyContext, 1, 1); putErr != nil {
-					logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
-					err = putErr
-					return
-				}
-			}
-			
 			ret.LazyFiles = append(ret.LazyFiles, file.ID)
 		}
-		
-		// 更新懒加载清单并上传chunks（本地索引阶段）
-		if updateErr := repo.updateLazyManifestWithUpload(lazyFiles, true); updateErr != nil {
+
+		// 更新懒加载清单
+		updateErr := repo.updateLazyManifest(lazyFiles)
+		if updateErr != nil {
 			logging.LogWarnf("update lazy manifest failed: %s", updateErr)
 		}
-		
+
 		// 保存清单文件并添加到索引
 		if repo.lazyLoader != nil {
 			manifestPath := repo.lazyLoader.getManifestPath()
@@ -995,7 +1016,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 				}
 			}
 		}
-		
+
 	}
 
 	ret.Count = len(ret.Files)
@@ -1011,6 +1032,9 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		logging.LogErrorf("update latest failed: %s", err)
 		return
 	}
+
+	logging.LogInfof("index0: phase 6/6 completed - index creation finished")
+	logging.LogInfof("index0: successfully created index with %d files, %d lazy files", len(ret.Files), len(ret.LazyFiles))
 	return
 }
 
@@ -1203,7 +1227,7 @@ func (repo *Repo) getFiles(fileIDs []string) (ret []*entity.File, err error) {
 // getFilesWithCloudFallback 获取文件元数据，本地没有时从云端下载（只下载元数据，不下载chunks）
 func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string]interface{}) (ret []*entity.File, err error) {
 	var missingFileIDs []string
-	
+
 	// 先尝试从本地获取
 	for _, fileID := range fileIDs {
 		file, getErr := repo.store.GetFile(fileID)
@@ -1215,33 +1239,33 @@ func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string
 			ret = append(ret, file)
 		}
 	}
-	
+
 	// 从云端下载缺失的文件元数据（不下载chunks）
 	if len(missingFileIDs) > 0 {
 		logging.LogInfof("getFilesWithCloudFallback: downloading metadata for %d missing files from cloud (no chunks)", len(missingFileIDs))
-		
+
 		for i, fileID := range missingFileIDs {
 			logging.LogInfof("getFilesWithCloudFallback: downloading file metadata %d/%d [%s]", i+1, len(missingFileIDs), fileID)
-			
+
 			_, cloudFile, downloadErr := repo.downloadCloudFile(fileID, i+1, len(missingFileIDs), context)
 			if downloadErr != nil {
 				logging.LogWarnf("getFilesWithCloudFallback: file [%s] not found in cloud, skipping: %s", fileID, downloadErr)
 				// 云端文件不存在时跳过，不中断整个流程
 				continue
 			}
-			
+
 			// 保存到本地存储供下次使用
 			if putErr := repo.store.PutFile(cloudFile); putErr != nil {
 				logging.LogWarnf("getFilesWithCloudFallback: failed to save file [%s] to local store: %s", fileID, putErr)
 			} else {
 				logging.LogInfof("getFilesWithCloudFallback: saved file [%s] metadata to local store, chunks: %d", cloudFile.Path, len(cloudFile.Chunks))
 			}
-			
+
 			ret = append(ret, cloudFile)
 		}
 		logging.LogInfof("getFilesWithCloudFallback: successfully downloaded metadata for %d files from cloud", len(missingFileIDs))
 	}
-	
+
 	return ret, nil
 }
 
@@ -1287,7 +1311,7 @@ func (repo *Repo) checkoutFiles(files []*entity.File, context map[string]interfa
 		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
 			continue
 		}
-		
+
 		if strings.Contains(file.Path, ".siyuan") {
 			logging.LogInfof("checkoutFiles: file [%s] classified as dotSiYuan", file.Path)
 			dotSiYuans = append(dotSiYuans, file)
@@ -1479,29 +1503,29 @@ func (repo *Repo) isCloudSiYuan() bool {
 
 // LoadAssetOnDemand 按需加载指定的资源文件
 func (repo *Repo) LoadAssetOnDemand(assetPath string) error {
-	
+
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
 		err := fmt.Errorf("lazy loading not enabled")
 		logging.LogErrorf("LoadAssetOnDemand: %s", err.Error())
 		return err
 	}
-	
+
 	// 兼容处理两种路径格式
 	isAssetPath := strings.HasPrefix(assetPath, "assets/") || strings.HasPrefix(assetPath, "/assets/")
 	logging.LogInfof("LoadAssetOnDemand: path [%s] is asset path: %v", assetPath, isAssetPath)
-	
+
 	if !isAssetPath {
 		err := fmt.Errorf("not a lazy-loadable asset path: %s", assetPath)
 		logging.LogErrorf("LoadAssetOnDemand: %s", err.Error())
 		return err
 	}
-	
+
 	// 规范化路径（统一移除前导斜杠）
 	normalizedPath := assetPath
 	if strings.HasPrefix(assetPath, "/") {
 		normalizedPath = assetPath[1:]
 	}
-	
+
 	return repo.lazyLoader.LoadAsset(normalizedPath)
 }
 
@@ -1510,7 +1534,7 @@ func (repo *Repo) IsAssetCached(assetPath string) bool {
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
 		return false
 	}
-	
+
 	return repo.lazyLoader.IsAssetCached(assetPath)
 }
 
@@ -1519,6 +1543,6 @@ func (repo *Repo) ClearLazyCache() error {
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
 		return fmt.Errorf("lazy loading not enabled")
 	}
-	
+
 	return repo.lazyLoader.ClearCache()
 }
