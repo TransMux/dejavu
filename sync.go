@@ -646,11 +646,34 @@ func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncClou
 		}
 	}
 
-	if (localChanged && needSyncCloud) || "" == cloudLatest.ID {
+	// 检查LazyFiles是否需要更新云端索引
+	lazyFilesNeedSync := false
+	if len(latest.LazyFiles) != len(cloudLatest.LazyFiles) {
+		lazyFilesNeedSync = true
+		logging.LogInfof("sync: lazy files count differs (local=%d, cloud=%d), need sync", len(latest.LazyFiles), len(cloudLatest.LazyFiles))
+	} else if len(latest.LazyFiles) > 0 {
+		// 检查LazyFiles内容是否相同
+		cloudLazySet := make(map[string]bool)
+		for _, id := range cloudLatest.LazyFiles {
+			cloudLazySet[id] = true
+		}
+		for _, id := range latest.LazyFiles {
+			if !cloudLazySet[id] {
+				lazyFilesNeedSync = true
+				logging.LogInfof("sync: lazy files content differs, need sync")
+				break
+			}
+		}
+	}
+
+	if (localChanged && needSyncCloud) || "" == cloudLatest.ID || lazyFilesNeedSync {
 		err = repo.updateCloudIndexes(latest, trafficStat, context)
 		if nil != err {
 			logging.LogErrorf("update cloud indexes failed: %s", err)
 			return
+		}
+		if lazyFilesNeedSync {
+			logging.LogInfof("sync: successfully updated cloud indexes with lazy files (count=%d)", len(latest.LazyFiles))
 		}
 	}
 
