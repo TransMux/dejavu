@@ -276,6 +276,21 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 				logging.LogErrorf("get lazy file failed: %s", err)
 				return
 			}
+
+			// 验证懒加载文件的chunks是否存在，如果不存在则跳过
+			missingChunks := false
+			for _, chunkID := range uploadFile.Chunks {
+				_, chunkErr := repo.store.GetChunk(chunkID)
+				if chunkErr != nil {
+					logging.LogWarnf("SyncUpload: lazy file [%s] has missing chunk [%s], skipping upload", uploadFile.Path, chunkID)
+					missingChunks = true
+					break
+				}
+			}
+			if missingChunks {
+				continue
+			}
+
 			logging.LogInfof("SyncUpload: uploading lazy file [%s]", uploadFile.Path)
 			uploadFiles = append(uploadFiles, uploadFile)
 		}

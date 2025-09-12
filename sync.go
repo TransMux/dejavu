@@ -1568,8 +1568,23 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 			err = ErrNotFoundObject
 		}
 
-		logging.LogInfof("localUpsertFiles: including lazy file [%s] in upload", file.Path)
-		ret = append(ret, file)
+		// 验证懒加载文件的chunks是否存在，如果不存在则跳过
+		missingChunks := false
+		for _, chunkID := range file.Chunks {
+			_, chunkErr := repo.store.GetChunk(chunkID)
+			if chunkErr != nil {
+				logging.LogWarnf("localUpsertFiles: lazy file [%s] has missing chunk [%s], skipping upload", file.Path, chunkID)
+				missingChunks = true
+				break
+			}
+		}
+
+		if !missingChunks {
+			logging.LogInfof("localUpsertFiles: including lazy file [%s] in upload", file.Path)
+			ret = append(ret, file)
+		} else {
+			logging.LogWarnf("localUpsertFiles: skipping lazy file [%s] due to missing chunks", file.Path)
+		}
 	}
 	return
 }
