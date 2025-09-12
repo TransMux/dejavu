@@ -1226,44 +1226,56 @@ func (repo *Repo) getFiles(fileIDs []string) (ret []*entity.File, err error) {
 
 // getFilesWithCloudFallback 获取文件元数据，本地没有时从云端下载（只下载元数据，不下载chunks）
 func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string]interface{}) (ret []*entity.File, err error) {
+	if len(fileIDs) == 0 {
+		return ret, nil
+	}
+
+	// 预分配结果数组，使用下标直接填充
+	ret = make([]*entity.File, len(fileIDs))
+	var missingIndices []int
 	var missingFileIDs []string
 
-	// 先尝试从本地获取
-	for _, fileID := range fileIDs {
+	logging.LogInfof("getFilesWithCloudFallback: processing %d files", len(fileIDs))
+
+	// 批量从本地获取，记录缺失文件的索引和ID
+	for i, fileID := range fileIDs {
 		file, getErr := repo.store.GetFile(fileID)
 		if nil != getErr {
-			logging.LogInfof("getFilesWithCloudFallback: file [%s] not found locally, will download metadata from cloud", fileID)
+			missingIndices = append(missingIndices, i)
 			missingFileIDs = append(missingFileIDs, fileID)
 		} else {
-			logging.LogInfof("getFilesWithCloudFallback: file [%s] found locally with %d chunks", fileID, len(file.Chunks))
-			ret = append(ret, file)
+			ret[i] = file
 		}
 	}
 
-	// 从云端下载缺失的文件元数据（不下载chunks）
+	logging.LogInfof("getFilesWithCloudFallback: found %d files locally, %d missing from cloud", 
+		len(fileIDs)-len(missingFileIDs), len(missingFileIDs))
+
+	// 批量从云端下载缺失的文件元数据
 	if len(missingFileIDs) > 0 {
-		logging.LogInfof("getFilesWithCloudFallback: downloading metadata for %d missing files from cloud (no chunks)", len(missingFileIDs))
-
-		for i, fileID := range missingFileIDs {
-			logging.LogInfof("getFilesWithCloudFallback: downloading file metadata %d/%d [%s]", i+1, len(missingFileIDs), fileID)
-
-			_, cloudFile, downloadErr := repo.downloadCloudFile(fileID, i+1, len(missingFileIDs), context)
-			if downloadErr != nil {
-				logging.LogWarnf("getFilesWithCloudFallback: file [%s] not found in cloud, skipping: %s", fileID, downloadErr)
-				// 云端文件不存在时跳过，不中断整个流程
-				continue
-			}
-
-			// 保存到本地存储供下次使用
-			if putErr := repo.store.PutFile(cloudFile); putErr != nil {
-				logging.LogWarnf("getFilesWithCloudFallback: failed to save file [%s] to local store: %s", fileID, putErr)
-			} else {
-				logging.LogInfof("getFilesWithCloudFallback: saved file [%s] metadata to local store, chunks: %d", cloudFile.Path, len(cloudFile.Chunks))
-			}
-
-			ret = append(ret, cloudFile)
+		_, cloudFiles, downloadErr := repo.downloadCloudFilesPut(missingFileIDs, context)
+		if downloadErr != nil {
+			logging.LogErrorf("getFilesWithCloudFallback: failed to download files from cloud: %s", downloadErr)
+			return nil, downloadErr
 		}
-		logging.LogInfof("getFilesWithCloudFallback: successfully downloaded metadata for %d files from cloud", len(missingFileIDs))
+
+		// 创建cloudFiles的ID到文件的映射
+		cloudFileMap := make(map[string]*entity.File, len(cloudFiles))
+		for _, cloudFile := range cloudFiles {
+			cloudFileMap[cloudFile.ID] = cloudFile
+		}
+
+		// 将云端文件按原始顺序填入对应位置
+		for j, missingIdx := range missingIndices {
+			fileID := missingFileIDs[j]
+			if cloudFile, exists := cloudFileMap[fileID]; exists {
+				ret[missingIdx] = cloudFile
+			} else {
+				logging.LogWarnf("getFilesWithCloudFallback: file [%s] not found in cloud", fileID)
+			}
+		}
+
+		logging.LogInfof("getFilesWithCloudFallback: downloaded %d files from cloud", len(cloudFiles))
 	}
 
 	return ret, nil

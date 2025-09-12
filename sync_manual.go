@@ -19,7 +19,6 @@ package dejavu
 import (
 	"errors"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -91,33 +90,28 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 		return
 	}
 
-	// 处理懒加载文件（无论本地是否启用懒加载）
+	// 处理懒加载文件：只更新清单，不参与常规同步流程
 	if len(cloudLatest.LazyFiles) > 0 {
+		err = repo.updateLazyManifestFromCloudIndex(cloudLatest.LazyFiles, context)
+		if nil != err {
+			logging.LogErrorf("update lazy manifest from cloud index failed: %s", err)
+			return nil, nil, err
+		}
+	}
+
+	// 如果本地未启用懒加载，需要将云端的懒加载文件当作普通文件处理
+	if !repo.lazyLoadEnabled && len(cloudLatest.LazyFiles) > 0 {
 		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
 		if lazyErr != nil {
-			logging.LogErrorf("get lazy files failed: %s", lazyErr)
-			return nil, nil, lazyErr
-		}
-		
-		if repo.lazyLoadEnabled {
-			// 本地启用懒加载时，更新懒加载清单但不下载chunks
-			if updateErr := repo.updateLazyManifest(lazyCloudFiles); updateErr != nil {
-				logging.LogErrorf("update lazy manifest failed: %s", updateErr)
-				return nil, nil, updateErr
-			}
+			logging.LogWarnf("get cloud lazy files as normal files failed: %s", lazyErr)
+			// 不中断流程，继续处理普通文件
 		} else {
-			// 本地未启用懒加载时，将懒加载文件当作普通文件处理
 			cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
 		}
 	}
 
-	// 分离普通文件（不包含懒加载文件）
-	var normalFiles []*entity.File
-	for _, file := range cloudLatestFiles {
-		if !(repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/"))) {
-			normalFiles = append(normalFiles, file)
-		}
-	}
+	// 所有文件都是普通文件（懒加载文件已单独处理）
+	normalFiles := cloudLatestFiles
 
 	// 只从普通文件列表中得到去重后的分块列表
 	cloudChunkIDs := repo.getChunks(normalFiles)
@@ -258,7 +252,7 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 
 	// 计算云端缺失的文件（包括普通文件和懒加载文件）
 	var uploadFiles []*entity.File
-	
+
 	// 处理普通文件
 	for _, localFileID := range latest.Files {
 		if !gulu.Str.Contains(localFileID, cloudLatest.Files) {
@@ -272,7 +266,7 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 			uploadFiles = append(uploadFiles, uploadFile)
 		}
 	}
-	
+
 	// 处理懒加载文件
 	for _, lazyFileID := range latest.LazyFiles {
 		if !gulu.Str.Contains(lazyFileID, cloudLatest.LazyFiles) {

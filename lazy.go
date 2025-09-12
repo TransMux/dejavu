@@ -373,8 +373,90 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		}
 	}
 
-	logging.LogInfof("updateLazyManifest: updated %d assets (new: %d, conflicts: %d, merged: %d)", 
+	logging.LogInfof("updateLazyManifest: updated %d assets (new: %d, conflicts: %d, merged: %d)",
 		len(lazyFiles), newCount, conflictCount, mergedCount)
+
+	return repo.lazyLoader.saveManifest(manifest)
+}
+
+// updateLazyManifestFromCloudIndex 从云端索引更新懒加载清单，不下载文件内容
+func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, context map[string]interface{}) error {
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		logging.LogInfof("updateLazyManifestFromCloudIndex: lazy loading disabled, skipping")
+		return nil
+	}
+
+	if len(cloudLazyFileIDs) == 0 {
+		logging.LogInfof("updateLazyManifestFromCloudIndex: no cloud lazy files to process")
+		return nil
+	}
+
+	logging.LogInfof("updateLazyManifestFromCloudIndex: processing %d cloud lazy files", len(cloudLazyFileIDs))
+
+	manifest, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		return fmt.Errorf("get manifest failed: %w", err)
+	}
+
+	// 检查本地是否已有这些文件的元数据
+	var missingFileIDs []string
+	existingCount := 0
+
+	for _, fileID := range cloudLazyFileIDs {
+		file, getErr := repo.store.GetFile(fileID)
+		if nil != getErr {
+			// 本地没有元数据，需要从云端获取
+			missingFileIDs = append(missingFileIDs, fileID)
+		} else {
+			// 本地有元数据，直接更新清单
+			existingCount++
+			asset := &LazyAsset{
+				Path:     file.Path,
+				FileID:   file.ID,
+				Size:     file.Size,
+				Modified: file.Updated,
+				Chunks:   file.Chunks,
+				Status:   LazyStatusPending, // 默认设为待下载状态
+			}
+
+			// 检查本地文件是否存在
+			cleanPath := strings.TrimPrefix(file.Path, "/")
+			localPath := filepath.Join(repo.DataPath, cleanPath)
+			if gulu.File.IsExist(localPath) {
+				asset.Status = LazyStatusCached
+			}
+
+			manifest.Assets[file.Path] = asset
+		}
+	}
+
+	// 只下载缺失的元数据（不下载chunks内容）
+	if len(missingFileIDs) > 0 {
+		logging.LogInfof("updateLazyManifestFromCloudIndex: downloading metadata for %d missing files (no content)", len(missingFileIDs))
+
+		_, cloudFiles, downloadErr := repo.downloadCloudFilesPut(missingFileIDs, context)
+		if downloadErr != nil {
+			logging.LogWarnf("updateLazyManifestFromCloudIndex: failed to download some metadata: %s", downloadErr)
+			// 不中断流程，继续处理已有的
+		} else {
+			// 将下载的元数据添加到清单
+			for _, cloudFile := range cloudFiles {
+				asset := &LazyAsset{
+					Path:     cloudFile.Path,
+					FileID:   cloudFile.ID,
+					Size:     cloudFile.Size,
+					Modified: cloudFile.Updated,
+					Chunks:   cloudFile.Chunks,
+					Status:   LazyStatusPending,
+				}
+				manifest.Assets[cloudFile.Path] = asset
+			}
+			logging.LogInfof("updateLazyManifestFromCloudIndex: downloaded metadata for %d files", len(cloudFiles))
+		}
+	}
+
+	logging.LogInfof("updateLazyManifestFromCloudIndex: updated manifest with %d existing + %d downloaded = %d total files",
+		existingCount, len(missingFileIDs), len(cloudLazyFileIDs))
 
 	return repo.lazyLoader.saveManifest(manifest)
 }
@@ -403,8 +485,6 @@ func (repo *Repo) hasLazyFileConflict(asset *LazyAsset, file *entity.File) bool 
 
 	return false // 没有冲突
 }
-
-
 
 // getLazyFilesForIndex 获取懒加载文件的索引条目
 func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {

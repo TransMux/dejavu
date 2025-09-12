@@ -191,47 +191,36 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 // trafficStat 待返回的流量统计
 func (repo *Repo) sync0(context map[string]interface{},
 	fetchedFiles []*entity.File, cloudLatest *entity.Index, latest *entity.Index, mergeResult *MergeResult, trafficStat *TrafficStat) (err error) {
-	// 组装还原云端最新文件列表（包括普通文件和懒加载文件）
+
+	// 处理懒加载文件：只更新清单，不参与常规同步流程
+	if len(cloudLatest.LazyFiles) > 0 {
+		err = repo.updateLazyManifestFromCloudIndex(cloudLatest.LazyFiles, context)
+		if nil != err {
+			logging.LogErrorf("update lazy manifest from cloud index failed: %s", err)
+			return err
+		}
+	}
+
+	// 获取云端普通文件列表（不包含懒加载文件）
 	cloudLatestFiles, err := repo.getFiles(cloudLatest.Files)
 	if nil != err {
 		logging.LogErrorf("get cloud latest files failed: %s", err)
 		return
 	}
-	
-	// 如果有懒加载文件，也需要获取它们的信息（无论本地是否启用懒加载）
-	if len(cloudLatest.LazyFiles) > 0 {
+
+	// 如果本地未启用懒加载，需要将云端的懒加载文件当作普通文件处理
+	if !repo.lazyLoadEnabled && len(cloudLatest.LazyFiles) > 0 {
 		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
 		if nil != lazyErr {
-			logging.LogErrorf("get cloud lazy files failed: %s", lazyErr)
-			return lazyErr
-		}
-		cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
-	}
-
-	// 分离普通文件和懒加载文件
-	var normalFiles, lazyFiles []*entity.File
-	
-	for _, file := range cloudLatestFiles {
-		// 如果本地启用懒加载且文件是assets文件，分类为懒加载文件
-		if repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
-			lazyFiles = append(lazyFiles, file)
+			logging.LogWarnf("get cloud lazy files as normal files failed: %s", lazyErr)
+			// 不中断流程，继续处理普通文件
 		} else {
-			// 否则分类为普通文件（包括本地未启用懒加载时的assets文件）
-			normalFiles = append(normalFiles, file)
+			cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
 		}
 	}
 
-	// 只下载普通文件的chunks，懒加载文件的chunks按需从云端下载
-	cloudChunkIDs := repo.getChunks(normalFiles)
-	
-	// 更新懒加载清单（只有本地启用懒加载时才需要）
-	if repo.lazyLoadEnabled && 0 < len(lazyFiles) {
-		err = repo.updateLazyManifest(lazyFiles)
-		if nil != err {
-			logging.LogErrorf("update lazy manifest failed: %s", err)
-			return
-		}
-	}
+	// 所有文件都是普通文件（懒加载文件已单独处理）
+	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
 
 	waitGroup := sync.WaitGroup{}
 	waitGroup.Add(1)
@@ -1511,6 +1500,7 @@ func (repo *Repo) localUpsertChunkIDs(localFiles []*entity.File, cloudChunkIDs [
 }
 
 func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Index) (ret []*entity.File, err error) {
+	// 处理普通文件
 	files := map[string]bool{}
 	for _, file := range latest.Files {
 		files[file] = true
@@ -1531,6 +1521,31 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 			err = ErrNotFoundObject
 		}
 
+		ret = append(ret, file)
+	}
+
+	// 处理懒加载文件
+	lazyFiles := map[string]bool{}
+	for _, file := range latest.LazyFiles {
+		lazyFiles[file] = true
+	}
+
+	for _, cloudFileID := range cloudLatest.LazyFiles {
+		delete(lazyFiles, cloudFileID)
+	}
+
+	for fileID := range lazyFiles {
+		file, getErr := repo.store.GetFile(fileID)
+		if nil != getErr {
+			logging.LogErrorf("get lazy file [%s] failed: %s", fileID, getErr)
+			return
+		}
+		if nil == file {
+			logging.LogErrorf("lazy file [%s] not found", fileID)
+			err = ErrNotFoundObject
+		}
+
+		logging.LogInfof("localUpsertFiles: including lazy file [%s] in upload", file.Path)
 		ret = append(ret, file)
 	}
 	return
