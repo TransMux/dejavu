@@ -552,3 +552,105 @@ func (repo *Repo) isLazyFile(filePath string) bool {
 	_, exists := manifest.Assets[filePath]
 	return exists
 }
+
+// repairLazyDataConsistency 修复懒加载数据一致性问题
+// 检查并修复：索引中有但清单中缺失的懒加载文件
+func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		return nil
+	}
+
+	// 获取最新索引
+	latest, err := repo.Latest()
+	if err != nil {
+		if err == ErrNotFoundIndex {
+			// 没有索引，无需修复
+			return nil
+		}
+		return fmt.Errorf("get latest index failed: %w", err)
+	}
+
+	if len(latest.LazyFiles) == 0 {
+		// 索引中没有懒加载文件，无需修复
+		return nil
+	}
+
+	// 获取当前清单
+	manifest, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		return fmt.Errorf("get manifest failed: %w", err)
+	}
+
+	// 构建清单中已有文件的ID映射
+	manifestFileIDs := make(map[string]bool)
+	for _, asset := range manifest.Assets {
+		manifestFileIDs[asset.FileID] = true
+	}
+
+	// 检查索引中的懒加载文件是否在清单中缺失
+	var missingFiles []*entity.File
+	var repairedCount int
+	
+	for _, lazyFileID := range latest.LazyFiles {
+		if !manifestFileIDs[lazyFileID] {
+			// 索引中有但清单中缺失，尝试从存储中恢复
+			file, getErr := repo.store.GetFile(lazyFileID)
+			if getErr != nil {
+				logging.LogWarnf("repairLazyDataConsistency: cannot get file [%s] from store: %s", lazyFileID, getErr)
+				continue
+			}
+
+			// 检查是否是assets文件
+			if strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/") {
+				logging.LogInfof("repairLazyDataConsistency: found missing lazy file in manifest [%s], attempting repair", file.Path)
+				
+				// 检查本地文件是否存在
+				cleanPath := strings.TrimPrefix(file.Path, "/")
+				localPath := filepath.Join(repo.DataPath, cleanPath)
+				
+				if gulu.File.IsExist(localPath) {
+					// 本地文件存在，更新文件信息并添加到files列表
+					info, statErr := os.Stat(localPath)
+					if statErr == nil {
+						file.Size = info.Size()
+						file.Updated = info.ModTime().UnixMilli()
+					}
+				} else {
+					// 本地文件不存在，保持原有的元数据
+					logging.LogWarnf("repairLazyDataConsistency: local file [%s] not found, using stored metadata", file.Path)
+				}
+
+				missingFiles = append(missingFiles, file)
+				*files = append(*files, file)
+				repairedCount++
+			}
+		}
+	}
+
+	// 如果有修复的文件，更新清单
+	if len(missingFiles) > 0 {
+		logging.LogInfof("repairLazyDataConsistency: repairing %d missing files in manifest", len(missingFiles))
+		
+		// 添加到清单中
+		for _, file := range missingFiles {
+			asset := &LazyAsset{
+				Path:     file.Path,
+				FileID:   file.ID,
+				Size:     file.Size,
+				Modified: file.Updated,
+				Chunks:   file.Chunks,
+			}
+			manifest.Assets[file.Path] = asset
+		}
+
+		// 保存清单
+		saveErr := repo.lazyLoader.saveManifest(manifest)
+		if saveErr != nil {
+			return fmt.Errorf("save repaired manifest failed: %w", saveErr)
+		}
+
+		logging.LogInfof("repairLazyDataConsistency: successfully repaired %d files", repairedCount)
+	}
+
+	return nil
+}

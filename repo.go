@@ -1248,7 +1248,7 @@ func (repo *Repo) getFilesWithCloudFallback(fileIDs []string, context map[string
 		}
 	}
 
-	logging.LogInfof("getFilesWithCloudFallback: found %d files locally, %d missing from cloud", 
+	logging.LogInfof("getFilesWithCloudFallback: found %d files locally, %d missing from cloud",
 		len(fileIDs)-len(missingFileIDs), len(missingFileIDs))
 
 	// 批量从云端下载缺失的文件元数据
@@ -1557,4 +1557,19 @@ func (repo *Repo) ClearLazyCache() error {
 	}
 
 	return repo.lazyLoader.ClearCache()
+}
+
+// RepairLazyDataConsistency 修复懒加载数据一致性问题，返回修复的文件数量
+func (repo *Repo) RepairLazyDataConsistency() (int, error) {
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		return 0, fmt.Errorf("lazy loading not enabled")
+	}
+
+	var files []*entity.File
+	err := repo.repairLazyDataConsistency(&files)
+	if err != nil {
+		return 0, err
+	}
+
+	return len(files), nil
 }
