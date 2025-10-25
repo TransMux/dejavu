@@ -110,11 +110,21 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 		}
 	}
 
-	// 所有文件都是普通文件（懒加载文件已单独处理）
+	// 计算云端所有文件的chunks（包含普通文件和懒加载文件）
 	normalFiles := cloudLatestFiles
-
-	// 只从普通文件列表中得到去重后的分块列表
 	cloudChunkIDs := repo.getChunks(normalFiles)
+	
+	// 如果启用懒加载，需要包含云端懒加载文件的chunks以避免重复上传
+	if repo.lazyLoadEnabled && len(cloudLatest.LazyFiles) > 0 {
+		lazyCloudFiles, lazyErr := repo.getFiles(cloudLatest.LazyFiles)
+		if nil == lazyErr {
+			lazyChunkIDs := repo.getChunks(lazyCloudFiles)
+			cloudChunkIDs = append(cloudChunkIDs, lazyChunkIDs...)
+			cloudChunkIDs = gulu.Str.RemoveDuplicatedElem(cloudChunkIDs)
+		} else {
+			logging.LogWarnf("get cloud lazy files for chunk deduplication failed: %s", lazyErr)
+		}
+	}
 
 	// 计算本地缺失的分块（只包含普通文件的chunks）
 	fetchChunkIDs, err := repo.localNotFoundChunks(cloudChunkIDs)
