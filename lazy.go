@@ -558,26 +558,34 @@ func (repo *Repo) isLazyFile(filePath string) bool {
 // 检查并修复：索引中有但清单中缺失的懒加载文件
 // 如果索引中没有懒加载文件，则扫描本地assets文件夹并添加到清单中
 func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
+	logging.LogInfof("repairLazyDataConsistency: starting repair process")
+	
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		logging.LogWarnf("repairLazyDataConsistency: lazy loading not enabled or loader is nil")
 		return nil
 	}
 
 	// 获取最新索引
+	logging.LogInfof("repairLazyDataConsistency: getting latest index")
 	latest, err := repo.Latest()
 	if err != nil {
 		if err == ErrNotFoundIndex {
 			// 没有索引，尝试扫描本地assets文件夹
+			logging.LogInfof("repairLazyDataConsistency: no index found, scanning local assets folder")
 			_, scanErr := repo.scanLocalAssetsForRepair(files)
 			return scanErr
 		}
 		return fmt.Errorf("get latest index failed: %w", err)
 	}
+	logging.LogInfof("repairLazyDataConsistency: latest index ID=%s, LazyFiles count=%d", latest.ID, len(latest.LazyFiles))
 
 	// 获取当前清单
+	logging.LogInfof("repairLazyDataConsistency: getting current manifest")
 	manifest, err := repo.lazyLoader.getManifest()
 	if err != nil {
 		return fmt.Errorf("get manifest failed: %w", err)
 	}
+	logging.LogInfof("repairLazyDataConsistency: manifest has %d assets", len(manifest.Assets))
 
 	// 构建清单中已有文件的ID映射和路径映射
 	manifestFileIDs := make(map[string]bool)
@@ -586,24 +594,34 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 		manifestFileIDs[asset.FileID] = true
 		manifestPaths[asset.Path] = true
 	}
+	logging.LogInfof("repairLazyDataConsistency: built manifest maps (fileIDs=%d, paths=%d)", len(manifestFileIDs), len(manifestPaths))
 
 	var missingFiles []*entity.File
 	var repairedCount int
 
 	// 如果索引中有懒加载文件，检查索引中的文件是否在清单中缺失
 	if len(latest.LazyFiles) > 0 {
+		logging.LogInfof("repairLazyDataConsistency: checking %d lazy files from index", len(latest.LazyFiles))
+		checkedCount := 0
+		missingCount := 0
+		skippedCount := 0
+		
 		for _, lazyFileID := range latest.LazyFiles {
+			checkedCount++
 			if !manifestFileIDs[lazyFileID] {
+				missingCount++
 				// 索引中有但清单中缺失，尝试从存储中恢复
+				logging.LogInfof("repairLazyDataConsistency: file ID [%s] found in index but missing in manifest", lazyFileID)
 				file, getErr := repo.store.GetFile(lazyFileID)
 				if getErr != nil {
 					logging.LogWarnf("repairLazyDataConsistency: cannot get file [%s] from store: %s", lazyFileID, getErr)
+					skippedCount++
 					continue
 				}
 
 				// 检查是否是assets文件
 				if strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/") {
-					logging.LogInfof("repairLazyDataConsistency: found missing lazy file in manifest [%s], attempting repair", file.Path)
+					logging.LogInfof("repairLazyDataConsistency: found missing lazy file in manifest [%s] (ID=%s, Size=%d), attempting repair", file.Path, file.ID, file.Size)
 					
 					// 检查本地文件是否存在
 					cleanPath := strings.TrimPrefix(file.Path, "/")
@@ -613,40 +631,55 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 						// 本地文件存在，更新文件信息并添加到files列表
 						info, statErr := os.Stat(localPath)
 						if statErr == nil {
+							oldSize := file.Size
+							oldUpdated := file.Updated
 							file.Size = info.Size()
 							file.Updated = info.ModTime().UnixMilli()
+							logging.LogInfof("repairLazyDataConsistency: updated file info [%s]: size %d->%d, updated %d->%d", 
+								file.Path, oldSize, file.Size, oldUpdated, file.Updated)
+						} else {
+							logging.LogWarnf("repairLazyDataConsistency: failed to stat local file [%s]: %s", localPath, statErr)
 						}
 					} else {
 						// 本地文件不存在，保持原有的元数据
-						logging.LogWarnf("repairLazyDataConsistency: local file [%s] not found, using stored metadata", file.Path)
+						logging.LogWarnf("repairLazyDataConsistency: local file [%s] not found, using stored metadata (Size=%d, Updated=%d)", 
+							file.Path, file.Size, file.Updated)
 					}
 
 					missingFiles = append(missingFiles, file)
 					*files = append(*files, file)
 					repairedCount++
+					logging.LogInfof("repairLazyDataConsistency: added file [%s] to repair list (total repaired: %d)", file.Path, repairedCount)
+				} else {
+					logging.LogInfof("repairLazyDataConsistency: file [%s] is not an assets file, skipping", file.Path)
+					skippedCount++
 				}
 			}
 		}
-
+		logging.LogInfof("repairLazyDataConsistency: index check completed: checked=%d, missing=%d, repaired=%d, skipped=%d", 
+			checkedCount, missingCount, repairedCount, skippedCount)
+	} else {
+		logging.LogInfof("repairLazyDataConsistency: no lazy files in index, skipping index check")
 	}
 
 	// 总是扫描本地assets文件夹，查找清单中缺失的文件
 	// 这样可以发现手动添加的文件或清单中遗漏的文件
-	logging.LogInfof("repairLazyDataConsistency: scanning local assets folder for missing files")
+	logging.LogInfof("repairLazyDataConsistency: starting to scan local assets folder for missing files")
 	scannedCount, scanErr := repo.scanLocalAssetsForRepair(files)
 	if scanErr != nil {
 		logging.LogWarnf("repairLazyDataConsistency: scan local assets failed: %s", scanErr)
 		// 不返回错误，继续处理已找到的文件
 	} else {
+		logging.LogInfof("repairLazyDataConsistency: scan completed, found %d new files", scannedCount)
 		repairedCount += scannedCount
 	}
 
 	// 如果有修复的文件，更新清单
 	if len(missingFiles) > 0 {
-		logging.LogInfof("repairLazyDataConsistency: repairing %d missing files from index", len(missingFiles))
+		logging.LogInfof("repairLazyDataConsistency: adding %d missing files from index to manifest", len(missingFiles))
 		
 		// 添加到清单中
-		for _, file := range missingFiles {
+		for i, file := range missingFiles {
 			asset := &LazyAsset{
 				Path:     file.Path,
 				FileID:   file.ID,
@@ -655,23 +688,34 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 				Chunks:   file.Chunks,
 			}
 			manifest.Assets[file.Path] = asset
+			logging.LogInfof("repairLazyDataConsistency: added asset [%d/%d] to manifest: %s (ID=%s, Size=%d, Chunks=%d)", 
+				i+1, len(missingFiles), file.Path, file.ID, file.Size, len(file.Chunks))
 		}
 	}
 
 	// 保存更新后的清单（scanLocalAssetsForRepair已经保存了，但这里需要保存索引中缺失的文件）
 	if len(missingFiles) > 0 || repairedCount > 0 {
+		logging.LogInfof("repairLazyDataConsistency: saving updated manifest (total assets: %d)", len(manifest.Assets))
 		saveErr := repo.lazyLoader.saveManifest(manifest)
 		if saveErr != nil {
+			logging.LogErrorf("repairLazyDataConsistency: failed to save manifest: %s", saveErr)
 			return fmt.Errorf("save repaired manifest failed: %w", saveErr)
 		}
-		logging.LogInfof("repairLazyDataConsistency: successfully repaired %d files (index: %d, scanned: %d)", repairedCount, len(missingFiles), scannedCount)
+		logging.LogInfof("repairLazyDataConsistency: manifest saved successfully")
+		logging.LogInfof("repairLazyDataConsistency: repair completed successfully: total repaired=%d (from index=%d, from scan=%d)", 
+			repairedCount, len(missingFiles), scannedCount)
+	} else {
+		logging.LogInfof("repairLazyDataConsistency: no files to repair, manifest unchanged")
 	}
 
+	logging.LogInfof("repairLazyDataConsistency: repair process finished, total files in manifest: %d", len(manifest.Assets))
 	return nil
 }
 
 // scanLocalAssetsForRepair 扫描本地assets文件夹，将找到的文件添加到清单中
 func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
+	logging.LogInfof("scanLocalAssetsForRepair: starting scan process")
+	
 	manifest, err := repo.lazyLoader.getManifest()
 	if err != nil {
 		return 0, fmt.Errorf("get manifest failed: %w", err)
@@ -682,15 +726,18 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 	for _, asset := range manifest.Assets {
 		manifestPaths[asset.Path] = true
 	}
+	logging.LogInfof("scanLocalAssetsForRepair: manifest has %d existing assets", len(manifestPaths))
 
 	assetsDir := filepath.Join(repo.DataPath, "assets")
 	if !gulu.File.IsExist(assetsDir) {
 		logging.LogInfof("scanLocalAssetsForRepair: assets directory not found: %s", assetsDir)
 		return 0, nil
 	}
+	logging.LogInfof("scanLocalAssetsForRepair: scanning assets directory: %s", assetsDir)
 
 	var scannedFiles []*entity.File
 	var repairedCount int
+	var existingCount int
 
 	// 扫描assets文件夹
 	err = filepath.Walk(assetsDir, func(path string, info os.FileInfo, err error) error {
@@ -718,26 +765,35 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 
 		// 检查是否已在清单中
 		if manifestPaths[relPath] {
+			existingCount++
+			if existingCount%100 == 0 {
+				logging.LogInfof("scanLocalAssetsForRepair: scanned %d files, %d already in manifest", existingCount+repairedCount, existingCount)
+			}
 			return nil
 		}
 
 		// 使用和索引创建时相同的方式生成文件ID，确保一致性
 		file := entity.NewFile(relPath, info.Size(), info.ModTime().UnixMilli())
+		logging.LogInfof("scanLocalAssetsForRepair: processing file [%s] (Size=%d, ID=%s)", relPath, file.Size, file.ID)
 
 		// 检查存储中是否已存在这个文件ID（可能之前已经索引过）
 		existingFile, getErr := repo.store.GetFile(file.ID)
 		if getErr == nil && existingFile != nil {
 			// 文件已存在，使用已有的文件信息（包括chunks）
 			file = existingFile
-			logging.LogInfof("scanLocalAssetsForRepair: file [%s] already exists in store with ID [%s], reusing", relPath, file.ID)
+			logging.LogInfof("scanLocalAssetsForRepair: file [%s] already exists in store with ID [%s], reusing (Chunks=%d)", 
+				relPath, file.ID, len(file.Chunks))
 		} else {
 			// 文件不存在，需要处理chunks
+			logging.LogInfof("scanLocalAssetsForRepair: file [%s] not in store, creating new entry", relPath)
 			// 如果文件很小，直接读取并计算chunks
 			if file.Size < 1024*1024 { // 小于1MB的文件
+				logging.LogInfof("scanLocalAssetsForRepair: reading small file [%s] to compute chunks", relPath)
 				data, readErr := os.ReadFile(path)
 				if readErr == nil {
 					fileHash := util.Hash(data)
 					file.Chunks = []string{fileHash}
+					logging.LogInfof("scanLocalAssetsForRepair: computed chunk hash [%s] for file [%s]", fileHash, relPath)
 					// 保存chunk到存储
 					chunk := &entity.Chunk{
 						ID:   fileHash,
@@ -745,13 +801,21 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 					}
 					if putErr := repo.store.PutChunk(chunk); putErr != nil {
 						logging.LogWarnf("scanLocalAssetsForRepair: failed to save chunk for [%s]: %s", relPath, putErr)
+					} else {
+						logging.LogInfof("scanLocalAssetsForRepair: saved chunk [%s] to store", fileHash)
 					}
+				} else {
+					logging.LogWarnf("scanLocalAssetsForRepair: failed to read file [%s]: %s", relPath, readErr)
 				}
+			} else {
+				logging.LogInfof("scanLocalAssetsForRepair: file [%s] is large (%d bytes), skipping chunk computation", relPath, file.Size)
 			}
 
 			// 保存文件元数据到存储
 			if putErr := repo.store.PutFile(file); putErr != nil {
 				logging.LogWarnf("scanLocalAssetsForRepair: failed to save file metadata for [%s]: %s", relPath, putErr)
+			} else {
+				logging.LogInfof("scanLocalAssetsForRepair: saved file metadata [%s] to store", relPath)
 			}
 		}
 
@@ -769,23 +833,38 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 		scannedFiles = append(scannedFiles, file)
 		*files = append(*files, file)
 		repairedCount++
-
-		logging.LogInfof("scanLocalAssetsForRepair: found local asset [%s], size=%d", relPath, file.Size)
+		
+		if repairedCount%10 == 0 {
+			logging.LogInfof("scanLocalAssetsForRepair: progress: repaired=%d, existing=%d", 
+				repairedCount, existingCount)
+		}
+		
+		logging.LogInfof("scanLocalAssetsForRepair: added file [%s] to manifest (ID=%s, Size=%d, Chunks=%d)", 
+			relPath, file.ID, file.Size, len(file.Chunks))
 		return nil
 	})
 
 	if err != nil {
+		logging.LogErrorf("scanLocalAssetsForRepair: walk assets directory failed: %s", err)
 		return repairedCount, fmt.Errorf("walk assets directory failed: %w", err)
 	}
 
+	logging.LogInfof("scanLocalAssetsForRepair: scan completed: total scanned=%d, repaired=%d, existing=%d", 
+		repairedCount+existingCount, repairedCount, existingCount)
+
 	// 保存更新后的清单
 	if repairedCount > 0 {
+		logging.LogInfof("scanLocalAssetsForRepair: saving manifest with %d total assets", len(manifest.Assets))
 		saveErr := repo.lazyLoader.saveManifest(manifest)
 		if saveErr != nil {
+			logging.LogErrorf("scanLocalAssetsForRepair: failed to save manifest: %s", saveErr)
 			return repairedCount, fmt.Errorf("save manifest failed: %w", saveErr)
 		}
-		logging.LogInfof("scanLocalAssetsForRepair: successfully scanned and added %d files to manifest", repairedCount)
+		logging.LogInfof("scanLocalAssetsForRepair: successfully saved manifest with %d new files added", repairedCount)
+	} else {
+		logging.LogInfof("scanLocalAssetsForRepair: no new files found, manifest unchanged")
 	}
 
+	logging.LogInfof("scanLocalAssetsForRepair: scan process finished, returning %d repaired files", repairedCount)
 	return repairedCount, nil
 }
