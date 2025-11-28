@@ -567,7 +567,8 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 	if err != nil {
 		if err == ErrNotFoundIndex {
 			// 没有索引，尝试扫描本地assets文件夹
-			return repo.scanLocalAssetsForRepair(files)
+			_, scanErr := repo.scanLocalAssetsForRepair(files)
+			return scanErr
 		}
 		return fmt.Errorf("get latest index failed: %w", err)
 	}
