@@ -8,11 +8,11 @@
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 //
 // You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 package cloud
 
@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -33,11 +34,14 @@ import (
 
 	"github.com/88250/gulu"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	asSigner "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	as3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	as3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/panjf2000/ants/v2"
 	"github.com/siyuan-note/dejavu/entity"
 	"github.com/siyuan-note/logging"
@@ -47,10 +51,12 @@ import (
 type S3 struct {
 	*BaseCloud
 	HTTPClient *http.Client
+	service    *as3.Client // 用于缓存 S3 客户端
+	mux        sync.Mutex  // 用于保护 service 字段的并发访问
 }
 
 func NewS3(baseCloud *BaseCloud, httpClient *http.Client) *S3 {
-	return &S3{baseCloud, httpClient}
+	return &S3{BaseCloud: baseCloud, HTTPClient: httpClient}
 }
 
 func (s3 *S3) GetRepos() (repos []*Repo, size int64, err error) {
@@ -330,6 +336,11 @@ func (s3 *S3) ListObjects(pathPrefix string) (ret map[string]*entity.ObjectInfo,
 
 		for _, entry := range output.Contents {
 			filePath := strings.TrimPrefix(*entry.Key, pathPrefix)
+			if "" == filePath {
+				logging.LogWarnf("skip empty file path for key [%s]", *entry.Key)
+				continue
+			}
+
 			ret[filePath] = &entity.ObjectInfo{
 				Path: filePath,
 				Size: *entry.Size,
@@ -512,12 +523,19 @@ func (s3 *S3) getNotFound(keys []string) (ret []string, err error) {
 }
 
 func (s3 *S3) getService() *as3.Client {
+	s3.mux.Lock()
+	defer s3.mux.Unlock()
+
+	if nil != s3.service {
+		return s3.service
+	}
+
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		logging.LogErrorf("load default config failed: %s", err)
 	}
 
-	return as3.NewFromConfig(cfg, func(o *as3.Options) {
+	s3.service = as3.NewFromConfig(cfg, func(o *as3.Options) {
 		o.Credentials = aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(s3.Conf.S3.AccessKey, s3.Conf.S3.SecretKey, ""))
 		o.BaseEndpoint = aws.String(s3.Conf.S3.Endpoint)
 		o.Region = s3.Conf.S3.Region
@@ -525,7 +543,24 @@ func (s3 *S3) getService() *as3.Client {
 		o.HTTPClient = s3.HTTPClient
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+
+		// --- START: S3 Compatibility Fix for SigV4 (Cloudflare Tunnel/Proxies) ---
+		// https://github.com/siyuan-note/siyuan/issues/16199
+		// This fix addresses the 'SignatureDoesNotMatch' error encountered when using
+		// S3-compatible endpoints proxied through services like Cloudflare Tunnel.
+		// Proxies may modify headers (like Accept-Encoding), which invalidates the
+		// AWS Signature Version 4 calculation.
+		endpoint := strings.ToLower(s3.Conf.S3.Endpoint)
+
+		// Only apply the compatibility middleware if the endpoint is NOT an official AWS S3 endpoint.
+		if !strings.Contains(endpoint, "amazonaws.com") {
+			// ignoreSigningHeaders and HeadersToIgnore are defined in s3_middleware.go (same package).
+			ignoreSigningHeaders(o, HeadersToIgnore)
+			// logging.LogDebugf("applied S3 compatibility fix for non-AWS endpoint: %s", s3.Conf.S3.Endpoint)
+		}
+		// --- END: S3 Compatibility Fix ---
 	})
+	return s3.service
 }
 
 func (s3 *S3) isErrNotFound(err error) bool {
@@ -545,4 +580,87 @@ func (s3 *S3) isErrNotFound(err error) bool {
 		return strings.Contains(msg, "does not exist") || strings.Contains(msg, "404") || strings.Contains(msg, "no such file or directory")
 	}
 	return false
+}
+
+// HeadersToIgnore lists headers that frequently cause SignatureDoesNotMatch errors
+// when used with S3-compatible providers behind proxies (like Cloudflare Tunnel or GCS).
+// These headers are temporarily removed before the SigV4 signing process and restored afterwards.
+var HeadersToIgnore = []string{
+	"Accept-Encoding", // The primary culprit, often modified by proxies.
+	"Amz-Sdk-Invocation-Id",
+	"Amz-Sdk-Request",
+}
+
+type ignoredHeadersKey struct{}
+
+// ignoreSigningHeaders is a helper to inject middleware that excludes specified headers
+// from the Signature Version 4 calculation by temporarily removing them.
+// This function should be called only for non-AWS S3 endpoints.
+func ignoreSigningHeaders(o *as3.Options, headers []string) {
+	o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+		// 1. Insert ignoreHeaders BEFORE the "Signing" middleware
+		if err := stack.Finalize.Insert(ignoreHeaders(headers), "Signing", middleware.Before); err != nil {
+			return fmt.Errorf("failed to insert S3CompatIgnoreHeaders: %w", err)
+		}
+
+		// 2. Insert restoreIgnored AFTER the "Signing" middleware
+		if err := stack.Finalize.Insert(restoreIgnored(), "Signing", middleware.After); err != nil {
+			return fmt.Errorf("failed to insert S3CompatRestoreHeaders: %w", err)
+		}
+		return nil
+	})
+}
+
+// ignoreHeaders removes specified headers and stores them in context for later restoration.
+func ignoreHeaders(headers []string) middleware.FinalizeMiddleware {
+	return middleware.FinalizeMiddlewareFunc(
+		"S3CompatIgnoreHeaders",
+		func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (out middleware.FinalizeOutput, metadata middleware.Metadata, err error) {
+			req, ok := in.Request.(*smithyhttp.Request)
+			if !ok {
+				return out, metadata, &asSigner.SigningError{Err: errors.New("unexpected request middleware type for ignoreHeaders")}
+			}
+
+			// Store removed headers and their values
+			ignored := make(map[string]string, len(headers))
+			for _, h := range headers {
+				// Use canonical form for map key (e.g., "Accept-Encoding")
+				// strings.Title is necessary for older Go versions to ensure canonicalization.
+				canonicalKey := strings.Title(strings.ToLower(h))
+				ignored[canonicalKey] = req.Header.Get(h)
+				req.Header.Del(h) // Remove header before signing
+			}
+
+			// Store the ignored headers in the context
+			ctx = middleware.WithStackValue(ctx, ignoredHeadersKey{}, ignored)
+			return next.HandleFinalize(ctx, in)
+		},
+	)
+}
+
+// restoreIgnored retrieves headers from context and restores them to the request
+// after the signing (Finalize) and before sending.
+func restoreIgnored() middleware.FinalizeMiddleware {
+	return middleware.FinalizeMiddlewareFunc(
+		"S3CompatRestoreHeaders",
+		func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (out middleware.FinalizeOutput, metadata middleware.Metadata, err error) {
+			req, ok := in.Request.(*smithyhttp.Request)
+			if !ok {
+				return out, metadata, errors.New("unexpected request middleware type for restoreIgnored")
+			}
+
+			// Execute the next Handler (which includes signing and the actual network request)
+			out, metadata, err = next.HandleFinalize(ctx, in)
+
+			// Retrieve ignored headers from the context
+			ignored, _ := middleware.GetStackValue(ctx, ignoredHeadersKey{}).(map[string]string)
+			// Restore the headers to the request
+			for k, v := range ignored {
+				if v != "" {
+					req.Header.Set(k, v)
+				}
+			}
+			return out, metadata, err
+		},
+	)
 }
