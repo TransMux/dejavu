@@ -27,6 +27,7 @@ import (
 
 	"github.com/88250/gulu"
 	"github.com/siyuan-note/dejavu/entity"
+	"github.com/siyuan-note/dejavu/util"
 	"github.com/siyuan-note/logging"
 )
 
@@ -555,6 +556,7 @@ func (repo *Repo) isLazyFile(filePath string) bool {
 
 // repairLazyDataConsistency 修复懒加载数据一致性问题
 // 检查并修复：索引中有但清单中缺失的懒加载文件
+// 如果索引中没有懒加载文件，则扫描本地assets文件夹并添加到清单中
 func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
 		return nil
@@ -564,15 +566,10 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 	latest, err := repo.Latest()
 	if err != nil {
 		if err == ErrNotFoundIndex {
-			// 没有索引，无需修复
-			return nil
+			// 没有索引，尝试扫描本地assets文件夹
+			return repo.scanLocalAssetsForRepair(files)
 		}
 		return fmt.Errorf("get latest index failed: %w", err)
-	}
-
-	if len(latest.LazyFiles) == 0 {
-		// 索引中没有懒加载文件，无需修复
-		return nil
 	}
 
 	// 获取当前清单
@@ -581,55 +578,71 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 		return fmt.Errorf("get manifest failed: %w", err)
 	}
 
-	// 构建清单中已有文件的ID映射
+	// 构建清单中已有文件的ID映射和路径映射
 	manifestFileIDs := make(map[string]bool)
+	manifestPaths := make(map[string]bool)
 	for _, asset := range manifest.Assets {
 		manifestFileIDs[asset.FileID] = true
+		manifestPaths[asset.Path] = true
 	}
 
-	// 检查索引中的懒加载文件是否在清单中缺失
 	var missingFiles []*entity.File
 	var repairedCount int
-	
-	for _, lazyFileID := range latest.LazyFiles {
-		if !manifestFileIDs[lazyFileID] {
-			// 索引中有但清单中缺失，尝试从存储中恢复
-			file, getErr := repo.store.GetFile(lazyFileID)
-			if getErr != nil {
-				logging.LogWarnf("repairLazyDataConsistency: cannot get file [%s] from store: %s", lazyFileID, getErr)
-				continue
-			}
 
-			// 检查是否是assets文件
-			if strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/") {
-				logging.LogInfof("repairLazyDataConsistency: found missing lazy file in manifest [%s], attempting repair", file.Path)
-				
-				// 检查本地文件是否存在
-				cleanPath := strings.TrimPrefix(file.Path, "/")
-				localPath := filepath.Join(repo.DataPath, cleanPath)
-				
-				if gulu.File.IsExist(localPath) {
-					// 本地文件存在，更新文件信息并添加到files列表
-					info, statErr := os.Stat(localPath)
-					if statErr == nil {
-						file.Size = info.Size()
-						file.Updated = info.ModTime().UnixMilli()
-					}
-				} else {
-					// 本地文件不存在，保持原有的元数据
-					logging.LogWarnf("repairLazyDataConsistency: local file [%s] not found, using stored metadata", file.Path)
+	// 如果索引中有懒加载文件，检查索引中的文件是否在清单中缺失
+	if len(latest.LazyFiles) > 0 {
+		for _, lazyFileID := range latest.LazyFiles {
+			if !manifestFileIDs[lazyFileID] {
+				// 索引中有但清单中缺失，尝试从存储中恢复
+				file, getErr := repo.store.GetFile(lazyFileID)
+				if getErr != nil {
+					logging.LogWarnf("repairLazyDataConsistency: cannot get file [%s] from store: %s", lazyFileID, getErr)
+					continue
 				}
 
-				missingFiles = append(missingFiles, file)
-				*files = append(*files, file)
-				repairedCount++
+				// 检查是否是assets文件
+				if strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/") {
+					logging.LogInfof("repairLazyDataConsistency: found missing lazy file in manifest [%s], attempting repair", file.Path)
+					
+					// 检查本地文件是否存在
+					cleanPath := strings.TrimPrefix(file.Path, "/")
+					localPath := filepath.Join(repo.DataPath, cleanPath)
+					
+					if gulu.File.IsExist(localPath) {
+						// 本地文件存在，更新文件信息并添加到files列表
+						info, statErr := os.Stat(localPath)
+						if statErr == nil {
+							file.Size = info.Size()
+							file.Updated = info.ModTime().UnixMilli()
+						}
+					} else {
+						// 本地文件不存在，保持原有的元数据
+						logging.LogWarnf("repairLazyDataConsistency: local file [%s] not found, using stored metadata", file.Path)
+					}
+
+					missingFiles = append(missingFiles, file)
+					*files = append(*files, file)
+					repairedCount++
+				}
 			}
 		}
+
+	}
+
+	// 总是扫描本地assets文件夹，查找清单中缺失的文件
+	// 这样可以发现手动添加的文件或清单中遗漏的文件
+	logging.LogInfof("repairLazyDataConsistency: scanning local assets folder for missing files")
+	scannedCount, scanErr := repo.scanLocalAssetsForRepair(files)
+	if scanErr != nil {
+		logging.LogWarnf("repairLazyDataConsistency: scan local assets failed: %s", scanErr)
+		// 不返回错误，继续处理已找到的文件
+	} else {
+		repairedCount += scannedCount
 	}
 
 	// 如果有修复的文件，更新清单
 	if len(missingFiles) > 0 {
-		logging.LogInfof("repairLazyDataConsistency: repairing %d missing files in manifest", len(missingFiles))
+		logging.LogInfof("repairLazyDataConsistency: repairing %d missing files from index", len(missingFiles))
 		
 		// 添加到清单中
 		for _, file := range missingFiles {
@@ -642,15 +655,136 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 			}
 			manifest.Assets[file.Path] = asset
 		}
+	}
 
-		// 保存清单
+	// 保存更新后的清单（scanLocalAssetsForRepair已经保存了，但这里需要保存索引中缺失的文件）
+	if len(missingFiles) > 0 || repairedCount > 0 {
 		saveErr := repo.lazyLoader.saveManifest(manifest)
 		if saveErr != nil {
 			return fmt.Errorf("save repaired manifest failed: %w", saveErr)
 		}
-
-		logging.LogInfof("repairLazyDataConsistency: successfully repaired %d files", repairedCount)
+		logging.LogInfof("repairLazyDataConsistency: successfully repaired %d files (index: %d, scanned: %d)", repairedCount, len(missingFiles), scannedCount)
 	}
 
 	return nil
+}
+
+// scanLocalAssetsForRepair 扫描本地assets文件夹，将找到的文件添加到清单中
+func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
+	manifest, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		return 0, fmt.Errorf("get manifest failed: %w", err)
+	}
+
+	// 构建清单中已有路径的映射
+	manifestPaths := make(map[string]bool)
+	for _, asset := range manifest.Assets {
+		manifestPaths[asset.Path] = true
+	}
+
+	assetsDir := filepath.Join(repo.DataPath, "assets")
+	if !gulu.File.IsExist(assetsDir) {
+		logging.LogInfof("scanLocalAssetsForRepair: assets directory not found: %s", assetsDir)
+		return 0, nil
+	}
+
+	var scannedFiles []*entity.File
+	var repairedCount int
+
+	// 扫描assets文件夹
+	err = filepath.Walk(assetsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		// 计算相对路径
+		relPath, relErr := filepath.Rel(repo.DataPath, path)
+		if relErr != nil {
+			return relErr
+		}
+
+		// 转换为统一格式（使用斜杠）
+		relPath = filepath.ToSlash(relPath)
+		
+		// 确保路径以assets/开头
+		if !strings.HasPrefix(relPath, "assets/") {
+			return nil
+		}
+
+		// 检查是否已在清单中
+		if manifestPaths[relPath] {
+			return nil
+		}
+
+		// 使用和索引创建时相同的方式生成文件ID，确保一致性
+		file := entity.NewFile(relPath, info.Size(), info.ModTime().UnixMilli())
+
+		// 检查存储中是否已存在这个文件ID（可能之前已经索引过）
+		existingFile, getErr := repo.store.GetFile(file.ID)
+		if getErr == nil && existingFile != nil {
+			// 文件已存在，使用已有的文件信息（包括chunks）
+			file = existingFile
+			logging.LogInfof("scanLocalAssetsForRepair: file [%s] already exists in store with ID [%s], reusing", relPath, file.ID)
+		} else {
+			// 文件不存在，需要处理chunks
+			// 如果文件很小，直接读取并计算chunks
+			if file.Size < 1024*1024 { // 小于1MB的文件
+				data, readErr := os.ReadFile(path)
+				if readErr == nil {
+					fileHash := util.Hash(data)
+					file.Chunks = []string{fileHash}
+					// 保存chunk到存储
+					chunk := &entity.Chunk{
+						ID:   fileHash,
+						Data: data,
+					}
+					if putErr := repo.store.PutChunk(chunk); putErr != nil {
+						logging.LogWarnf("scanLocalAssetsForRepair: failed to save chunk for [%s]: %s", relPath, putErr)
+					}
+				}
+			}
+
+			// 保存文件元数据到存储
+			if putErr := repo.store.PutFile(file); putErr != nil {
+				logging.LogWarnf("scanLocalAssetsForRepair: failed to save file metadata for [%s]: %s", relPath, putErr)
+			}
+		}
+
+		// 添加到清单
+		asset := &LazyAsset{
+			Path:     file.Path,
+			FileID:   file.ID,
+			Size:     file.Size,
+			Modified: file.Updated,
+			Chunks:   file.Chunks,
+			Status:   LazyStatusCached, // 本地文件存在，标记为已缓存
+		}
+		manifest.Assets[file.Path] = asset
+
+		scannedFiles = append(scannedFiles, file)
+		*files = append(*files, file)
+		repairedCount++
+
+		logging.LogInfof("scanLocalAssetsForRepair: found local asset [%s], size=%d", relPath, file.Size)
+		return nil
+	})
+
+	if err != nil {
+		return repairedCount, fmt.Errorf("walk assets directory failed: %w", err)
+	}
+
+	// 保存更新后的清单
+	if repairedCount > 0 {
+		saveErr := repo.lazyLoader.saveManifest(manifest)
+		if saveErr != nil {
+			return repairedCount, fmt.Errorf("save manifest failed: %w", saveErr)
+		}
+		logging.LogInfof("scanLocalAssetsForRepair: successfully scanned and added %d files to manifest", repairedCount)
+	}
+
+	return repairedCount, nil
 }
