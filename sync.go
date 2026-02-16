@@ -1755,6 +1755,12 @@ func (repo *Repo) downloadCloudIndex(id string, context map[string]interface{}) 
 		return
 	}
 	downloadBytes += int64(len(data))
+
+	if !index.VerifyAESKey(repo.store.AesKey) {
+		err = cloud.ErrDecryptFailed
+		logging.LogErrorf("cloud index [%s] verify AES key failed", index.String())
+		return
+	}
 	return
 }
 
@@ -1818,6 +1824,12 @@ func (repo *Repo) downloadCloudLatest(context map[string]interface{}) (downloadB
 				logging.LogWarnf("still use cloud latest [%s] rather than seq num latest [%s]", index, seqNumLatest)
 			}
 		}
+	}
+
+	if !index.VerifyAESKey(repo.store.AesKey) {
+		err = cloud.ErrDecryptFailed
+		logging.LogErrorf("cloud latest [%s] verify AES key failed", index.String())
+		return
 	}
 
 	logging.LogInfof("got cloud latest [%s], cost [%s]", index.String(), time.Since(start))

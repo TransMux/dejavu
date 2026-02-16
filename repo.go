@@ -764,6 +764,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			SystemName: repo.DeviceName,
 			SystemOS:   repo.DeviceOS,
 		}
+		latest.InitAESKeyVerifyVal(repo.store.AesKey)
 		init = true
 		logging.LogInfof("index0: phase 3/6 completed - first index creation")
 	} else {
@@ -891,6 +892,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			SystemName: repo.DeviceName,
 			SystemOS:   repo.DeviceOS,
 		}
+		ret.InitAESKeyVerifyVal(repo.store.AesKey)
 	}
 
 	// Phase 6: Process upsert files and lazy files
