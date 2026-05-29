@@ -27,6 +27,7 @@ import (
 	"github.com/dgraph-io/ristretto"
 	"github.com/klauspost/compress/zstd"
 	"github.com/siyuan-note/dejavu/entity"
+	"github.com/siyuan-note/dejavu/util"
 	"github.com/siyuan-note/encryption"
 	"github.com/siyuan-note/logging"
 )
@@ -152,7 +153,7 @@ func (store *Store) Purge(retentionIndexIDs ...string) (ret *entity.PurgeStat, e
 				referencedObjIDs[chunkID] = true
 			}
 		}
-		
+
 		// 处理懒加载文件
 		for _, lazyFileID := range index.LazyFiles {
 			referencedObjIDs[lazyFileID] = true
@@ -412,9 +413,18 @@ func (store *Store) PutChunk(chunk *entity.Chunk) (err error) {
 	if "" == chunk.ID {
 		return errors.New("invalid id")
 	}
+	if err = validateChunkData(chunk.ID, chunk.Data); nil != err {
+		return errors.New("put chunk failed: " + err.Error())
+	}
 	dir, file := store.AbsPath(chunk.ID)
 	if gulu.File.IsExist(file) {
-		return
+		if _, err = store.GetChunk(chunk.ID); nil == err {
+			return
+		}
+		logging.LogWarnf("existing chunk [%s] is invalid, overwriting: %s", chunk.ID, err)
+		if err = os.Remove(file); nil != err {
+			return errors.New("put chunk failed: " + err.Error())
+		}
 	}
 
 	if err = os.MkdirAll(dir, 0755); nil != err {
@@ -434,12 +444,18 @@ func (store *Store) PutChunk(chunk *entity.Chunk) (err error) {
 }
 
 func (store *Store) GetChunk(id string) (ret *entity.Chunk, err error) {
+	if err = validateChunkID(id); nil != err {
+		return
+	}
 	_, file := store.AbsPath(id)
 	data, err := os.ReadFile(file)
 	if nil != err {
 		return
 	}
 	if data, err = store.decodeData(data); nil != err {
+		return
+	}
+	if err = validateChunkData(id, data); nil != err {
 		return
 	}
 	ret = &entity.Chunk{ID: id, Data: data}
@@ -480,6 +496,23 @@ func (store *Store) AbsPath(id string) (dir, file string) {
 	dir = filepath.Join(store.Path, "objects", dir)
 	file = filepath.Join(dir, file)
 	return
+}
+
+func validateChunkID(id string) error {
+	if 40 != len(id) {
+		return errors.New("invalid chunk id")
+	}
+	return nil
+}
+
+func validateChunkData(id string, data []byte) error {
+	if err := validateChunkID(id); nil != err {
+		return err
+	}
+	if hash := util.Hash(data); hash != id {
+		return errors.New("chunk hash mismatch")
+	}
+	return nil
 }
 
 func (store *Store) encodeData(data []byte) ([]byte, error) {

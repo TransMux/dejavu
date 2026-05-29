@@ -18,6 +18,7 @@ package dejavu
 
 import (
 	"bytes"
+	"os"
 	"testing"
 
 	"github.com/siyuan-note/dejavu/entity"
@@ -68,5 +69,92 @@ func TestPutGet(t *testing.T) {
 	if nil != chunk {
 		t.Fatalf("get should be failed")
 		return
+	}
+}
+
+func TestPutChunkRejectsHashMismatch(t *testing.T) {
+	clearTestdata(t)
+
+	aesKey, err := encryption.KDF(testRepoPassword, testRepoPasswordSalt)
+	if nil != err {
+		t.Fatalf("kdf failed: %s", err)
+	}
+	store, err := NewStore(testRepoPath, aesKey)
+	if nil != err {
+		t.Fatalf("new store failed: %s", err)
+	}
+
+	err = store.PutChunk(&entity.Chunk{ID: util.Hash([]byte("expected")), Data: []byte("actual")})
+	if nil == err {
+		t.Fatal("put chunk should reject hash mismatch")
+	}
+}
+
+func TestGetChunkRejectsStoredHashMismatch(t *testing.T) {
+	clearTestdata(t)
+
+	aesKey, err := encryption.KDF(testRepoPassword, testRepoPasswordSalt)
+	if nil != err {
+		t.Fatalf("kdf failed: %s", err)
+	}
+	store, err := NewStore(testRepoPath, aesKey)
+	if nil != err {
+		t.Fatalf("new store failed: %s", err)
+	}
+
+	chunkID := util.Hash([]byte("expected"))
+	dir, file := store.AbsPath(chunkID)
+	if err = os.MkdirAll(dir, 0755); nil != err {
+		t.Fatalf("mkdir failed: %s", err)
+	}
+	data, err := store.encodeData([]byte("actual"))
+	if nil != err {
+		t.Fatalf("encode failed: %s", err)
+	}
+	if err = os.WriteFile(file, data, 0644); nil != err {
+		t.Fatalf("write object failed: %s", err)
+	}
+
+	chunk, err := store.GetChunk(chunkID)
+	if nil == err {
+		t.Fatalf("get chunk should reject hash mismatch: %#v", chunk)
+	}
+}
+
+func TestPutChunkOverwritesExistingHashMismatch(t *testing.T) {
+	clearTestdata(t)
+
+	aesKey, err := encryption.KDF(testRepoPassword, testRepoPasswordSalt)
+	if nil != err {
+		t.Fatalf("kdf failed: %s", err)
+	}
+	store, err := NewStore(testRepoPath, aesKey)
+	if nil != err {
+		t.Fatalf("new store failed: %s", err)
+	}
+
+	data := []byte("expected")
+	chunkID := util.Hash(data)
+	dir, file := store.AbsPath(chunkID)
+	if err = os.MkdirAll(dir, 0755); nil != err {
+		t.Fatalf("mkdir failed: %s", err)
+	}
+	encoded, err := store.encodeData([]byte("actual"))
+	if nil != err {
+		t.Fatalf("encode failed: %s", err)
+	}
+	if err = os.WriteFile(file, encoded, 0644); nil != err {
+		t.Fatalf("write object failed: %s", err)
+	}
+
+	if err = store.PutChunk(&entity.Chunk{ID: chunkID, Data: data}); nil != err {
+		t.Fatalf("put chunk should overwrite corrupt existing object: %s", err)
+	}
+	chunk, err := store.GetChunk(chunkID)
+	if nil != err {
+		t.Fatalf("get overwritten chunk failed: %s", err)
+	}
+	if !bytes.Equal(chunk.Data, data) {
+		t.Fatalf("unexpected chunk data [%s]", chunk.Data)
 	}
 }

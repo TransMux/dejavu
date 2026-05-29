@@ -1813,10 +1813,17 @@ func (repo *Repo) latestSync() (ret *entity.Index) {
 func (repo *Repo) downloadCloudChunk(id string, count, total int, context map[string]interface{}) (length int64, ret *entity.Chunk, err error) {
 	eventbus.Publish(eventbus.EvtCloudBeforeDownloadChunk, context, count, total)
 
+	if err = validateChunkID(id); nil != err {
+		return
+	}
 	key := path.Join("objects", id[:2], id[2:])
 	data, err := repo.downloadCloudObject(key)
 	if nil != err {
 		logging.LogErrorf("download cloud chunk [%s] failed: %s", id, err)
+		return
+	}
+	if err = validateChunkData(id, data); nil != err {
+		logging.LogErrorf("verify cloud chunk [%s] failed: %s", id, err)
 		return
 	}
 	length = int64(len(data))

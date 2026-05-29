@@ -24,6 +24,7 @@ import (
 
 	"github.com/siyuan-note/dejavu/cloud"
 	"github.com/siyuan-note/dejavu/entity"
+	"github.com/siyuan-note/dejavu/util"
 	"github.com/siyuan-note/encryption"
 )
 
@@ -55,9 +56,9 @@ func TestSync(t *testing.T) {
 func TestLocalUpsertFilesUploadsChangedLazySamePath(t *testing.T) {
 	repo := newLazyTestRepo(t)
 
-	localLazy := &entity.File{ID: "local-lazy-id", Path: "assets/a.png", Size: 1, Updated: 1000, Chunks: []string{"chunk-a"}}
-	cloudLazy := &entity.File{ID: "cloud-lazy-id", Path: "/assets/a.png", Size: 1, Updated: 2000, Chunks: []string{"chunk-b"}}
-	localNormal := &entity.File{ID: "local-normal-id", Path: "20260529200000-a/test.sy", Size: 1, Updated: 1000, Chunks: []string{"chunk-normal"}}
+	localLazy := &entity.File{ID: "local-lazy-id", Path: "assets/a.png", Size: 1, Updated: 1000, Chunks: []string{util.Hash([]byte("a"))}}
+	cloudLazy := &entity.File{ID: "cloud-lazy-id", Path: "/assets/a.png", Size: 1, Updated: 2000, Chunks: []string{util.Hash([]byte("b"))}}
+	localNormal := &entity.File{ID: "local-normal-id", Path: "20260529200000-a/test.sy", Size: 1, Updated: 1000, Chunks: []string{util.Hash([]byte("n"))}}
 	putTestFile(t, repo, localLazy, []byte("a"))
 	putTestFile(t, repo, cloudLazy, nil)
 	putTestFile(t, repo, localNormal, []byte("n"))
@@ -84,8 +85,9 @@ func TestLocalUpsertFilesUploadsChangedLazySamePath(t *testing.T) {
 func TestLocalUpsertFilesUploadsEquivalentLazySamePathWithDifferentID(t *testing.T) {
 	repo := newLazyTestRepo(t)
 
-	localLazy := &entity.File{ID: "local-lazy-id", Path: "assets/a.png", Size: 1, Updated: 1000, Chunks: []string{"chunk-a"}}
-	cloudLazy := &entity.File{ID: "cloud-lazy-id", Path: "/assets/a.png", Size: 1, Updated: 1000, Chunks: []string{"chunk-a"}}
+	chunkID := util.Hash([]byte("a"))
+	localLazy := &entity.File{ID: "local-lazy-id", Path: "assets/a.png", Size: 1, Updated: 1000, Chunks: []string{chunkID}}
+	cloudLazy := &entity.File{ID: "cloud-lazy-id", Path: "/assets/a.png", Size: 1, Updated: 1000, Chunks: []string{chunkID}}
 	putTestFile(t, repo, localLazy, []byte("a"))
 	putTestFile(t, repo, cloudLazy, nil)
 
@@ -205,6 +207,94 @@ func TestLocalUpsertFilesKeepsLazyChunksWhenRebuildFails(t *testing.T) {
 	}
 	if len(stored.Chunks) != len(originalChunks) || stored.Chunks[0] != originalChunks[0] {
 		t.Fatalf("failed rebuild should keep original chunks: %#v", stored.Chunks)
+	}
+}
+
+func TestLazyLoadAssetRestoresChunksFromCloud(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	cloudRoot := t.TempDir()
+	repo.cloud = cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{
+		Dir:      "repo",
+		RepoPath: repo.Path,
+		Local:    &cloud.ConfLocal{Endpoint: cloudRoot},
+	}})
+
+	chunks := [][]byte{[]byte("hello "), []byte("world")}
+	var chunkIDs []string
+	for _, data := range chunks {
+		chunkID := util.Hash(data)
+		chunkIDs = append(chunkIDs, chunkID)
+		if err := repo.store.PutChunk(&entity.Chunk{ID: chunkID, Data: data}); err != nil {
+			t.Fatalf("put chunk failed: %s", err)
+		}
+		objectPath := filepath.Join("objects", chunkID[:2], chunkID[2:])
+		if _, err := repo.cloud.UploadObject(objectPath, false); err != nil {
+			t.Fatalf("upload chunk failed: %s", err)
+		}
+		if err := repo.store.Remove(chunkID); err != nil {
+			t.Fatalf("remove local chunk failed: %s", err)
+		}
+	}
+
+	asset := &LazyAsset{
+		Path:     "assets/restored.txt",
+		FileID:   "file-id",
+		Size:     int64(len("hello world")),
+		Modified: time.Now().UnixMilli(),
+		Chunks:   chunkIDs,
+		Status:   LazyStatusPending,
+	}
+	if err := repo.lazyLoader.saveManifest(&LazyManifest{
+		Version: "1.0",
+		Assets:  map[string]*LazyAsset{asset.Path: asset},
+	}); err != nil {
+		t.Fatalf("save manifest failed: %s", err)
+	}
+
+	if err := repo.LoadAssetOnDemand(asset.Path); err != nil {
+		t.Fatalf("load asset failed: %s", err)
+	}
+	data, err := os.ReadFile(filepath.Join(repo.DataPath, asset.Path))
+	if err != nil {
+		t.Fatalf("read restored asset failed: %s", err)
+	}
+	if string(data) != "hello world" {
+		t.Fatalf("unexpected restored data [%s]", data)
+	}
+	matches, err := filepath.Glob(filepath.Join(repo.DataPath, "assets", "*.tmp"))
+	if err != nil {
+		t.Fatalf("glob temp files failed: %s", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temp files should be cleaned up: %#v", matches)
+	}
+}
+
+func TestDownloadCloudChunkRejectsHashMismatch(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	cloudRoot := t.TempDir()
+	repo.cloud = cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{
+		Dir:      "repo",
+		RepoPath: repo.Path,
+		Local:    &cloud.ConfLocal{Endpoint: cloudRoot},
+	}})
+
+	chunkID := util.Hash([]byte("expected"))
+	encoded, err := repo.store.encodeData([]byte("actual"))
+	if err != nil {
+		t.Fatalf("encode failed: %s", err)
+	}
+	objectPath := filepath.Join(cloudRoot, "repo", "objects", chunkID[:2], chunkID[2:])
+	if err = os.MkdirAll(filepath.Dir(objectPath), 0755); err != nil {
+		t.Fatalf("mkdir cloud object failed: %s", err)
+	}
+	if err = os.WriteFile(objectPath, encoded, 0644); err != nil {
+		t.Fatalf("write cloud object failed: %s", err)
+	}
+
+	_, chunk, err := repo.downloadCloudChunk(chunkID, 1, 1, map[string]interface{}{})
+	if err == nil {
+		t.Fatalf("download cloud chunk should reject hash mismatch: %#v", chunk)
 	}
 }
 

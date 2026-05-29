@@ -163,22 +163,43 @@ func (ll *LazyLoader) downloadAsset(asset *LazyAsset) error {
 	}
 
 	// 下载所有chunks
-	var data []byte
+	tmpPath := localPath + "." + gulu.Rand.String(7) + ".tmp"
+	tmpFile, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create temp file failed: %w", err)
+	}
+	var written int64
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 	for _, chunkID := range asset.Chunks {
 
 		chunk, err := ll.repo.store.GetChunk(chunkID)
 		if err != nil {
 			// 如果本地没有，从云端下载
+			if err = validateChunkID(chunkID); err != nil {
+				_ = tmpFile.Close()
+				return fmt.Errorf("invalid chunk [%s]: %w", chunkID, err)
+			}
 			chunkPath := fmt.Sprintf("objects/%s/%s", chunkID[:2], chunkID[2:])
 			cloudData, downloadErr := ll.repo.cloud.DownloadObject(chunkPath)
 			if downloadErr != nil {
+				_ = tmpFile.Close()
 				return fmt.Errorf("download chunk [%s] failed: %w", chunkID, downloadErr)
 			}
 
 			// 解码云端数据（解压缩和解密）
 			decodedData, decodeErr := ll.repo.store.DecodeData(cloudData)
 			if decodeErr != nil {
+				_ = tmpFile.Close()
 				return fmt.Errorf("decode chunk [%s] failed: %w", chunkID, decodeErr)
+			}
+			if verifyErr := validateChunkData(chunkID, decodedData); verifyErr != nil {
+				_ = tmpFile.Close()
+				return fmt.Errorf("verify chunk [%s] failed: %w", chunkID, verifyErr)
 			}
 
 			cloudChunk := &entity.Chunk{
@@ -188,18 +209,30 @@ func (ll *LazyLoader) downloadAsset(asset *LazyAsset) error {
 
 			// 存储解码后的chunk到本地
 			if putErr := ll.repo.store.PutChunk(cloudChunk); putErr != nil {
+				_ = tmpFile.Close()
 				return fmt.Errorf("put chunk [%s] failed: %w", chunkID, putErr)
 			}
 
 			chunk = cloudChunk
 		}
-		data = append(data, chunk.Data...)
+		n, writeErr := tmpFile.Write(chunk.Data)
+		written += int64(n)
+		if writeErr != nil {
+			_ = tmpFile.Close()
+			return fmt.Errorf("write chunk [%s] failed: %w", chunkID, writeErr)
+		}
 	}
-
-	// 写入文件
-	if err := gulu.File.WriteFileSafer(localPath, data, 0644); err != nil {
-		return fmt.Errorf("write file failed: %w", err)
+	if asset.Size >= 0 && written != asset.Size {
+		_ = tmpFile.Close()
+		return fmt.Errorf("asset size mismatch [%s]: manifest=%d written=%d", asset.Path, asset.Size, written)
 	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp file failed: %w", err)
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return fmt.Errorf("rename temp file failed: %w", err)
+	}
+	cleanupTmp = false
 
 	// 设置文件修改时间
 	modTime := time.UnixMilli(asset.Modified)
