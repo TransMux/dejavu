@@ -697,6 +697,10 @@ func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncClou
 }
 
 func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficStat, context map[string]interface{}) (err error) {
+	start := time.Now()
+	logging.LogInfof("updateCloudIndexes: start latestID=%s files=%d lazyFiles=%d checkIndexID=%s",
+		latest.ID, len(latest.Files), len(latest.LazyFiles), latest.CheckIndexID)
+
 	// 生成校验索引
 	files, getErr := repo.getFiles(latest.Files)
 	if nil != getErr {
@@ -846,7 +850,12 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 
 	if 0 < len(errs) {
 		err = errs[0]
+		logging.LogWarnf("updateCloudIndexes: failed latestID=%s errors=%d cost=%s firstErr=%s",
+			latest.ID, len(errs), time.Since(start), err)
+		return
 	}
+	logging.LogInfof("updateCloudIndexes: completed latestID=%s files=%d lazyFiles=%d checkIndexID=%s cost=%s",
+		latest.ID, len(latest.Files), len(latest.LazyFiles), latest.CheckIndexID, time.Since(start))
 	return
 }
 
@@ -1526,7 +1535,19 @@ func (repo *Repo) localUpsertChunkIDs(localFiles []*entity.File, cloudChunkIDs [
 	return
 }
 
-func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Index) (ret []*entity.File, err error) {
+func normalizeLazyPath(path string) string {
+	return strings.TrimPrefix(filepath.ToSlash(path), "/")
+}
+
+func appendSyncSample(samples *[]string, format string, args ...interface{}) {
+	const limit = 8
+	if len(*samples) >= limit {
+		return
+	}
+	*samples = append(*samples, fmt.Sprintf(format, args...))
+}
+
+func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Index, context map[string]interface{}) (ret []*entity.File, err error) {
 	// 处理普通文件
 	files := map[string]bool{}
 	for _, file := range latest.Files {
@@ -1546,12 +1567,11 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 		if nil == file {
 			logging.LogErrorf("file [%s] not found", fileID)
 			err = ErrNotFoundObject
+			return
 		}
 
 		ret = append(ret, file)
 	}
-
-	// 处理懒加载文件
 	lazyFiles := map[string]bool{}
 	for _, file := range latest.LazyFiles {
 		lazyFiles[file] = true
@@ -1561,6 +1581,31 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 		delete(lazyFiles, cloudFileID)
 	}
 
+	logging.LogInfof("localUpsertFiles: start latestFiles=%d cloudFiles=%d normalCandidates=%d latestLazy=%d cloudLazy=%d lazyCandidatesByID=%d",
+		len(latest.Files), len(cloudLatest.Files), len(files), len(latest.LazyFiles), len(cloudLatest.LazyFiles), len(lazyFiles))
+
+	cloudLazyByPath := map[string]*entity.File{}
+	var cloudLazyLoadErrors int
+	var cloudLazyLoadErrorSamples []string
+	if 0 < len(lazyFiles) {
+		for _, cloudFileID := range cloudLatest.LazyFiles {
+			cloudFile, getErr := repo.store.GetFile(cloudFileID)
+			if nil != getErr || nil == cloudFile {
+				cloudLazyLoadErrors++
+				appendSyncSample(&cloudLazyLoadErrorSamples, "%s:%v", cloudFileID, getErr)
+				continue
+			}
+			cloudLazyByPath[normalizeLazyPath(cloudFile.Path)] = cloudFile
+		}
+		logging.LogInfof("localUpsertFiles: built cloud lazy path map paths=%d loadErrors=%d samples=%v",
+			len(cloudLazyByPath), cloudLazyLoadErrors, cloudLazyLoadErrorSamples)
+	}
+
+	normalUpsertCount := len(ret)
+	var includedLazy, pathMatchedDifferentID, noCloudPathMatch, skippedMissingChunks int
+	var missingChunkCount, emptyChunkCount, rebuiltCount, rebuildFailedCount, rebuiltStillMissingCount int
+	var missingChunkFiles []*entity.File
+	var pathMismatchSamples, noCloudPathSamples, missingChunkSamples, rebuiltSamples, skippedSamples []string
 	for fileID := range lazyFiles {
 		file, getErr := repo.store.GetFile(fileID)
 		if nil != getErr {
@@ -1570,25 +1615,93 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 		if nil == file {
 			logging.LogErrorf("lazy file [%s] not found", fileID)
 			err = ErrNotFoundObject
+			return
 		}
 
-		// 验证懒加载文件的chunks是否存在，如果不存在则跳过
+		normalizedPath := normalizeLazyPath(file.Path)
+		if cloudFile := cloudLazyByPath[normalizedPath]; nil != cloudFile && cloudFile.ID != file.ID {
+			pathMatchedDifferentID++
+			appendSyncSample(&pathMismatchSamples, "%s localID=%s cloudID=%s localUpdated=%d cloudUpdated=%d localChunks=%d cloudChunks=%d",
+				normalizedPath, file.ID, cloudFile.ID, file.Updated, cloudFile.Updated, len(file.Chunks), len(cloudFile.Chunks))
+		} else if nil == cloudFile {
+			noCloudPathMatch++
+			appendSyncSample(&noCloudPathSamples, "%s localID=%s updated=%d chunks=%d", normalizedPath, file.ID, file.Updated, len(file.Chunks))
+		}
+
+		// 验证懒加载文件的chunks是否存在，如果不存在则尝试从本地原始文件重建。
 		missingChunks := false
+		if 0 == len(file.Chunks) && 0 < file.Size {
+			emptyChunkCount++
+			missingChunks = true
+			appendSyncSample(&missingChunkSamples, "%s id=%s size=%d chunks=0", normalizedPath, file.ID, file.Size)
+		}
 		for _, chunkID := range file.Chunks {
 			_, chunkErr := repo.store.GetChunk(chunkID)
 			if chunkErr != nil {
-				logging.LogWarnf("localUpsertFiles: lazy file [%s] has missing chunk [%s], skipping upload", file.Path, chunkID)
+				logging.LogWarnf("localUpsertFiles: lazy file [%s] has missing chunk [%s]", file.Path, chunkID)
+				missingChunkCount++
 				missingChunks = true
+				appendSyncSample(&missingChunkSamples, "%s id=%s missingChunk=%s chunks=%d", normalizedPath, file.ID, chunkID, len(file.Chunks))
 				break
 			}
 		}
 
+		if missingChunks {
+			rebuilt, rebuildErr := repo.rebuildLazyFileChunksIfSourceExists(file, context)
+			if rebuildErr != nil {
+				rebuildFailedCount++
+				logging.LogWarnf("localUpsertFiles: rebuild lazy file chunks [%s] failed: %s", file.Path, rebuildErr)
+				appendSyncSample(&skippedSamples, "%s id=%s rebuildErr=%v", normalizedPath, file.ID, rebuildErr)
+			}
+			if rebuilt {
+				rebuiltCount++
+				missingChunks = false
+				for _, chunkID := range file.Chunks {
+					if _, chunkErr := repo.store.GetChunk(chunkID); chunkErr != nil {
+						rebuiltStillMissingCount++
+						logging.LogWarnf("localUpsertFiles: rebuilt lazy file [%s] still has missing chunk [%s]", file.Path, chunkID)
+						missingChunks = true
+						appendSyncSample(&skippedSamples, "%s id=%s rebuiltMissingChunk=%s", normalizedPath, file.ID, chunkID)
+						break
+					}
+				}
+				if !missingChunks {
+					logging.LogInfof("localUpsertFiles: rebuilt lazy file chunks [%s], allowing upload", file.Path)
+					appendSyncSample(&rebuiltSamples, "%s id=%s chunks=%d", normalizedPath, file.ID, len(file.Chunks))
+				}
+			}
+		}
+
 		if !missingChunks {
-			logging.LogInfof("localUpsertFiles: including lazy file [%s] in upload", file.Path)
+			includedLazy++
 			ret = append(ret, file)
 		} else {
-			logging.LogWarnf("localUpsertFiles: skipping lazy file [%s] due to missing chunks", file.Path)
+			skippedMissingChunks++
+			missingChunkFiles = append(missingChunkFiles, file)
+			appendSyncSample(&skippedSamples, "%s id=%s chunks=%d", normalizedPath, file.ID, len(file.Chunks))
 		}
+	}
+	if 0 < len(missingChunkFiles) {
+		if markErr := repo.markLazyFilesError(missingChunkFiles); nil != markErr {
+			logging.LogWarnf("mark lazy files error failed: %s", markErr)
+		}
+	}
+	logging.LogInfof("localUpsertFiles: summary normalCandidates=%d lazyIncluded=%d lazySkippedMissing=%d pathMatchedDifferentID=%d noCloudPathMatch=%d missingChunk=%d emptyChunks=%d rebuilt=%d rebuildFailed=%d rebuiltStillMissing=%d",
+		normalUpsertCount, includedLazy, skippedMissingChunks, pathMatchedDifferentID, noCloudPathMatch, missingChunkCount, emptyChunkCount, rebuiltCount, rebuildFailedCount, rebuiltStillMissingCount)
+	if 0 < len(pathMismatchSamples) {
+		logging.LogInfof("localUpsertFiles: pathMatchedDifferentID samples=%v", pathMismatchSamples)
+	}
+	if 0 < len(noCloudPathSamples) {
+		logging.LogInfof("localUpsertFiles: noCloudPathMatch samples=%v", noCloudPathSamples)
+	}
+	if 0 < len(missingChunkSamples) {
+		logging.LogInfof("localUpsertFiles: missingChunk samples=%v", missingChunkSamples)
+	}
+	if 0 < len(rebuiltSamples) {
+		logging.LogInfof("localUpsertFiles: rebuilt samples=%v", rebuiltSamples)
+	}
+	if 0 < len(skippedSamples) {
+		logging.LogInfof("localUpsertFiles: skipped samples=%v", skippedSamples)
 	}
 	return
 }
@@ -1609,16 +1722,29 @@ func (repo *Repo) UpdateLatestSync(index *entity.Index) (err error) {
 
 func (repo *Repo) uploadCloud(context map[string]interface{},
 	latest, cloudLatest *entity.Index, cloudChunkIDs []string, trafficStat *TrafficStat) (err error) {
+	start := time.Now()
+	logging.LogInfof("uploadCloud: start latestID=%s cloudLatestID=%s latestFiles=%d latestLazy=%d cloudFiles=%d cloudLazy=%d cloudChunks=%d",
+		latest.ID, cloudLatest.ID, len(latest.Files), len(latest.LazyFiles), len(cloudLatest.Files), len(cloudLatest.LazyFiles), len(cloudChunkIDs))
+
 	// 计算待上传云端的本地变更文件
-	upsertFiles, err := repo.localUpsertFiles(latest, cloudLatest)
+	upsertFiles, err := repo.localUpsertFiles(latest, cloudLatest, context)
 	if nil != err {
 		logging.LogErrorf("get local upsert files failed: %s", err)
 		return
 	}
 
 	if 1 > len(upsertFiles) {
+		logging.LogInfof("uploadCloud: no upsert files latestID=%s cost=%s", latest.ID, time.Since(start))
 		return
 	}
+	var upsertLazyFiles int
+	for _, file := range upsertFiles {
+		if nil != file && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/")) {
+			upsertLazyFiles++
+		}
+	}
+	logging.LogInfof("uploadCloud: upsert files total=%d lazy=%d normal=%d",
+		len(upsertFiles), upsertLazyFiles, len(upsertFiles)-upsertLazyFiles)
 
 	// 计算待上传云端的分块
 	upsertChunkIDs, err := repo.localUpsertChunkIDs(upsertFiles, cloudChunkIDs)
@@ -1626,6 +1752,7 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 		logging.LogErrorf("get local upsert chunk ids failed: %s", err)
 		return
 	}
+	logging.LogInfof("uploadCloud: upsert chunks=%d", len(upsertChunkIDs))
 
 	// 上传分块
 	length, err := repo.uploadChunks(upsertChunkIDs, context)
@@ -1636,6 +1763,7 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 	trafficStat.UploadChunkCount += len(upsertChunkIDs)
 	trafficStat.UploadBytes += length
 	trafficStat.APIPut += trafficStat.UploadChunkCount
+	logging.LogInfof("uploadCloud: uploaded chunks=%d bytes=%d", len(upsertChunkIDs), length)
 
 	// 上传文件
 	length, err = repo.uploadFiles(upsertFiles, context)
@@ -1646,6 +1774,8 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 	trafficStat.UploadFileCount += len(upsertFiles)
 	trafficStat.UploadBytes += length
 	trafficStat.APIPut += trafficStat.UploadFileCount
+	logging.LogInfof("uploadCloud: uploaded files=%d lazy=%d bytes=%d cost=%s",
+		len(upsertFiles), upsertLazyFiles, length, time.Since(start))
 	return
 }
 

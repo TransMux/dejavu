@@ -17,9 +17,14 @@
 package dejavu
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/siyuan-note/dejavu/cloud"
+	"github.com/siyuan-note/dejavu/entity"
+	"github.com/siyuan-note/encryption"
 )
 
 func TestSync(t *testing.T) {
@@ -45,4 +50,196 @@ func TestSync(t *testing.T) {
 	}
 	_ = mergeResult
 	_ = trafficStat
+}
+
+func TestLocalUpsertFilesUploadsChangedLazySamePath(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	localLazy := &entity.File{ID: "local-lazy-id", Path: "assets/a.png", Size: 1, Updated: 1000, Chunks: []string{"chunk-a"}}
+	cloudLazy := &entity.File{ID: "cloud-lazy-id", Path: "/assets/a.png", Size: 1, Updated: 2000, Chunks: []string{"chunk-b"}}
+	localNormal := &entity.File{ID: "local-normal-id", Path: "20260529200000-a/test.sy", Size: 1, Updated: 1000, Chunks: []string{"chunk-normal"}}
+	putTestFile(t, repo, localLazy, []byte("a"))
+	putTestFile(t, repo, cloudLazy, nil)
+	putTestFile(t, repo, localNormal, []byte("n"))
+
+	latest := &entity.Index{Files: []string{localNormal.ID}, LazyFiles: []string{localLazy.ID}}
+	cloudLatest := &entity.Index{LazyFiles: []string{cloudLazy.ID}}
+	upserts, err := repo.localUpsertFiles(latest, cloudLatest, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("local upsert files failed: %s", err)
+	}
+
+	if len(upserts) != 2 {
+		t.Fatalf("unexpected upserts: %#v", upserts)
+	}
+	upsertIDs := map[string]bool{}
+	for _, file := range upserts {
+		upsertIDs[file.ID] = true
+	}
+	if !upsertIDs[localNormal.ID] || !upsertIDs[localLazy.ID] {
+		t.Fatalf("unexpected upserts: %#v", upserts)
+	}
+}
+
+func TestLocalUpsertFilesUploadsEquivalentLazySamePathWithDifferentID(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	localLazy := &entity.File{ID: "local-lazy-id", Path: "assets/a.png", Size: 1, Updated: 1000, Chunks: []string{"chunk-a"}}
+	cloudLazy := &entity.File{ID: "cloud-lazy-id", Path: "/assets/a.png", Size: 1, Updated: 1000, Chunks: []string{"chunk-a"}}
+	putTestFile(t, repo, localLazy, []byte("a"))
+	putTestFile(t, repo, cloudLazy, nil)
+
+	latest := &entity.Index{LazyFiles: []string{localLazy.ID}}
+	cloudLatest := &entity.Index{LazyFiles: []string{cloudLazy.ID}}
+	upserts, err := repo.localUpsertFiles(latest, cloudLatest, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("local upsert files failed: %s", err)
+	}
+
+	if len(upserts) != 1 || upserts[0].ID != localLazy.ID {
+		t.Fatalf("lazy file with different ID should be uploaded: %#v", upserts)
+	}
+}
+
+func TestLocalUpsertFilesMarksLazyMissingChunks(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	localLazy := &entity.File{ID: "local-missing-chunk-id", Path: "assets/missing.png", Size: 1, Updated: 1000, Chunks: []string{"missing-chunk"}}
+	if err := repo.store.PutFile(localLazy); err != nil {
+		t.Fatalf("put file failed: %s", err)
+	}
+
+	latest := &entity.Index{LazyFiles: []string{localLazy.ID}}
+	upserts, err := repo.localUpsertFiles(latest, &entity.Index{}, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("local upsert files failed: %s", err)
+	}
+	if len(upserts) != 0 {
+		t.Fatalf("missing chunk lazy file should not be uploaded: %#v", upserts)
+	}
+
+	manifest, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		t.Fatalf("get manifest failed: %s", err)
+	}
+	asset := manifest.Assets["assets/missing.png"]
+	if asset == nil || asset.Status != LazyStatusError {
+		t.Fatalf("missing chunk asset should be marked error: %#v", asset)
+	}
+}
+
+func TestLocalUpsertFilesRebuildsLazyMissingChunksFromSource(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	sourcePath := filepath.Join(repo.DataPath, "assets", "rebuild.png")
+	sourceData := []byte("rebuilt")
+	if err := os.WriteFile(sourcePath, sourceData, 0644); err != nil {
+		t.Fatalf("write source failed: %s", err)
+	}
+	modTime := time.UnixMilli(1000)
+	if err := os.Chtimes(sourcePath, modTime, modTime); err != nil {
+		t.Fatalf("chtimes source failed: %s", err)
+	}
+
+	localLazy := &entity.File{ID: "local-rebuild-id", Path: "assets/rebuild.png", Size: int64(len(sourceData)), Updated: 1000, Chunks: []string{"missing-chunk"}}
+	if err := repo.store.PutFile(localLazy); err != nil {
+		t.Fatalf("put file failed: %s", err)
+	}
+
+	latest := &entity.Index{LazyFiles: []string{localLazy.ID}}
+	upserts, err := repo.localUpsertFiles(latest, &entity.Index{}, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("local upsert files failed: %s", err)
+	}
+	if len(upserts) != 1 || upserts[0].ID != localLazy.ID {
+		t.Fatalf("rebuilt lazy file should be uploaded: %#v", upserts)
+	}
+	if len(upserts[0].Chunks) == 0 || upserts[0].Chunks[0] == "missing-chunk" {
+		t.Fatalf("lazy file chunks should be rebuilt: %#v", upserts[0].Chunks)
+	}
+	if _, err := repo.store.GetChunk(upserts[0].Chunks[0]); err != nil {
+		t.Fatalf("rebuilt chunk should exist: %s", err)
+	}
+
+	manifest, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		t.Fatalf("get manifest failed: %s", err)
+	}
+	asset := manifest.Assets["assets/rebuild.png"]
+	if asset == nil || asset.Status != LazyStatusCached {
+		t.Fatalf("rebuilt asset should be cached in manifest: %#v", asset)
+	}
+}
+
+func TestLocalUpsertFilesKeepsLazyChunksWhenRebuildFails(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	sourcePath := filepath.Join(repo.DataPath, "assets", "changed.png")
+	sourceData := []byte("changed")
+	if err := os.WriteFile(sourcePath, sourceData, 0644); err != nil {
+		t.Fatalf("write source failed: %s", err)
+	}
+	modTime := time.UnixMilli(2000)
+	if err := os.Chtimes(sourcePath, modTime, modTime); err != nil {
+		t.Fatalf("chtimes source failed: %s", err)
+	}
+
+	originalChunks := []string{"missing-chunk"}
+	localLazy := &entity.File{ID: "local-rebuild-fail-id", Path: "assets/changed.png", Size: int64(len(sourceData)), Updated: 1000, Chunks: originalChunks}
+	if err := repo.store.PutFile(localLazy); err != nil {
+		t.Fatalf("put file failed: %s", err)
+	}
+
+	latest := &entity.Index{LazyFiles: []string{localLazy.ID}}
+	upserts, err := repo.localUpsertFiles(latest, &entity.Index{}, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("local upsert files failed: %s", err)
+	}
+	if len(upserts) != 0 {
+		t.Fatalf("failed rebuild lazy file should not be uploaded: %#v", upserts)
+	}
+
+	stored, err := repo.store.GetFile(localLazy.ID)
+	if err != nil {
+		t.Fatalf("get stored lazy file failed: %s", err)
+	}
+	if len(stored.Chunks) != len(originalChunks) || stored.Chunks[0] != originalChunks[0] {
+		t.Fatalf("failed rebuild should keep original chunks: %#v", stored.Chunks)
+	}
+}
+
+func newLazyTestRepo(t *testing.T) *Repo {
+	t.Helper()
+
+	root := t.TempDir()
+	aesKey, err := encryption.KDF(testRepoPassword, testRepoPasswordSalt)
+	if err != nil {
+		t.Fatalf("kdf failed: %s", err)
+	}
+	repo, err := NewRepoWithLazyLoad(
+		filepath.Join(root, "data"),
+		filepath.Join(root, "repo"),
+		filepath.Join(root, "history"),
+		filepath.Join(root, "temp"),
+		deviceID, deviceName, deviceOS, aesKey, ignoreLines(), nil, true)
+	if err != nil {
+		t.Fatalf("new repo failed: %s", err)
+	}
+	if err = os.MkdirAll(filepath.Join(root, "data", "assets"), 0755); err != nil {
+		t.Fatalf("mkdir assets failed: %s", err)
+	}
+	return repo
+}
+
+func putTestFile(t *testing.T, repo *Repo, file *entity.File, chunkData []byte) {
+	t.Helper()
+	if err := repo.store.PutFile(file); err != nil {
+		t.Fatalf("put file failed: %s", err)
+	}
+	if len(file.Chunks) == 0 || chunkData == nil {
+		return
+	}
+	if err := repo.store.PutChunk(&entity.Chunk{ID: file.Chunks[0], Data: chunkData}); err != nil {
+		t.Fatalf("put chunk failed: %s", err)
+	}
 }

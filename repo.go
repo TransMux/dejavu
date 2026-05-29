@@ -1129,7 +1129,7 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 		}
 
 		chunkHash := util.Hash(data)
-		file.Chunks = append(file.Chunks, chunkHash)
+		chunks := []string{chunkHash}
 		chunk := &entity.Chunk{ID: chunkHash, Data: data}
 		if err = repo.store.PutChunk(chunk); nil != err {
 			logging.LogErrorf("put chunk [%s] failed: %s", chunkHash, err)
@@ -1151,6 +1151,7 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 			return
 		}
 
+		file.Chunks = chunks
 		eventbus.Publish(eventbus.EvtIndexUpsertFile, context, count, total)
 		err = repo.store.PutFile(file)
 		if nil != err {
@@ -1159,6 +1160,7 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 		return
 	}
 
+	chunks := []string{}
 	reader, err := filelock.OpenFile(absPath, os.O_RDONLY, 0644)
 	if nil != err {
 		logging.LogErrorf("open file [%s] failed: %s", absPath, err)
@@ -1182,7 +1184,7 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 		}
 
 		chunkHash := util.Hash(chnk.Data)
-		file.Chunks = append(file.Chunks, chunkHash)
+		chunks = append(chunks, chunkHash)
 		chunk := &entity.Chunk{ID: chunkHash, Data: chnk.Data}
 		if err = repo.store.PutChunk(chunk); nil != err {
 			logging.LogErrorf("put chunk [%s] failed: %s", chunkHash, err)
@@ -1213,6 +1215,7 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 		return
 	}
 
+	file.Chunks = chunks
 	eventbus.Publish(eventbus.EvtIndexUpsertFile, context, count, total)
 	err = repo.store.PutFile(file)
 	return

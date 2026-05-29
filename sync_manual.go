@@ -258,49 +258,10 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 	}
 
 	// 计算云端缺失的文件（包括普通文件和懒加载文件）
-	var uploadFiles []*entity.File
-
-	// 处理普通文件
-	for _, localFileID := range latest.Files {
-		if !gulu.Str.Contains(localFileID, cloudLatest.Files) {
-			var uploadFile *entity.File
-			uploadFile, err = repo.store.GetFile(localFileID)
-			if nil != err {
-				logging.LogErrorf("get file failed: %s", err)
-				return
-			}
-			logging.LogInfof("SyncUpload: uploading normal file [%s]", uploadFile.Path)
-			uploadFiles = append(uploadFiles, uploadFile)
-		}
-	}
-
-	// 处理懒加载文件
-	for _, lazyFileID := range latest.LazyFiles {
-		if !gulu.Str.Contains(lazyFileID, cloudLatest.LazyFiles) {
-			var uploadFile *entity.File
-			uploadFile, err = repo.store.GetFile(lazyFileID)
-			if nil != err {
-				logging.LogErrorf("get lazy file failed: %s", err)
-				return
-			}
-
-			// 验证懒加载文件的chunks是否存在，如果不存在则跳过
-			missingChunks := false
-			for _, chunkID := range uploadFile.Chunks {
-				_, chunkErr := repo.store.GetChunk(chunkID)
-				if chunkErr != nil {
-					logging.LogWarnf("SyncUpload: lazy file [%s] has missing chunk [%s], skipping upload", uploadFile.Path, chunkID)
-					missingChunks = true
-					break
-				}
-			}
-			if missingChunks {
-				continue
-			}
-
-			logging.LogInfof("SyncUpload: uploading lazy file [%s]", uploadFile.Path)
-			uploadFiles = append(uploadFiles, uploadFile)
-		}
+	uploadFiles, err := repo.localUpsertFiles(latest, cloudLatest, context)
+	if nil != err {
+		logging.LogErrorf("get local upsert files failed: %s", err)
+		return
 	}
 
 	// 从文件列表中得到去重后的分块列表

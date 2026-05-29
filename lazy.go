@@ -309,7 +309,8 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 	}
 
 	// 记录冲突处理统计
-	var conflictCount, mergedCount, newCount int
+	var conflictCount, mergedCount, newCount, leadingSlashPathCount int
+	var normalizedPathSamples []string
 
 	// 更新资源信息
 	for _, file := range lazyFiles {
@@ -334,7 +335,6 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 
 		if asset == nil {
 			asset = &LazyAsset{}
-			manifest.Assets[file.Path] = asset
 			newCount++
 		} else {
 			// 检测并处理冲突
@@ -357,7 +357,13 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 			}
 		}
 
-		asset.Path = file.Path
+		normalizedPath := normalizeLazyPath(file.Path)
+		if file.Path != normalizedPath {
+			leadingSlashPathCount++
+			appendSyncSample(&normalizedPathSamples, "%s -> %s", file.Path, normalizedPath)
+		}
+
+		asset.Path = normalizedPath
 		asset.FileID = file.ID
 		asset.Size = file.Size
 		asset.Modified = file.Updated
@@ -372,10 +378,11 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		} else {
 			asset.Status = LazyStatusPending
 		}
+		repo.setLazyManifestAsset(manifest, asset)
 	}
 
-	logging.LogInfof("updateLazyManifest: updated %d assets (new: %d, conflicts: %d, merged: %d)",
-		len(lazyFiles), newCount, conflictCount, mergedCount)
+	logging.LogInfof("updateLazyManifest: updated %d assets (new: %d, conflicts: %d, merged: %d, normalizedLeadingSlash=%d, samples=%v)",
+		len(lazyFiles), newCount, conflictCount, mergedCount, leadingSlashPathCount, normalizedPathSamples)
 
 	return repo.lazyLoader.saveManifest(manifest)
 }
@@ -412,7 +419,7 @@ func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, co
 			// 本地有元数据，直接更新清单
 			existingCount++
 			asset := &LazyAsset{
-				Path:     file.Path,
+				Path:     normalizeLazyPath(file.Path),
 				FileID:   file.ID,
 				Size:     file.Size,
 				Modified: file.Updated,
@@ -427,7 +434,7 @@ func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, co
 				asset.Status = LazyStatusCached
 			}
 
-			manifest.Assets[file.Path] = asset
+			repo.setLazyManifestAsset(manifest, asset)
 		}
 	}
 
@@ -443,14 +450,14 @@ func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, co
 			// 将下载的元数据添加到清单
 			for _, cloudFile := range cloudFiles {
 				asset := &LazyAsset{
-					Path:     cloudFile.Path,
+					Path:     normalizeLazyPath(cloudFile.Path),
 					FileID:   cloudFile.ID,
 					Size:     cloudFile.Size,
 					Modified: cloudFile.Updated,
 					Chunks:   cloudFile.Chunks,
 					Status:   LazyStatusPending,
 				}
-				manifest.Assets[cloudFile.Path] = asset
+				repo.setLazyManifestAsset(manifest, asset)
 			}
 			logging.LogInfof("updateLazyManifestFromCloudIndex: downloaded metadata for %d files", len(cloudFiles))
 		}
@@ -460,6 +467,70 @@ func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, co
 		existingCount, len(missingFileIDs), len(cloudLazyFileIDs))
 
 	return repo.lazyLoader.saveManifest(manifest)
+}
+
+func (repo *Repo) setLazyManifestAsset(manifest *LazyManifest, asset *LazyAsset) {
+	if nil == manifest.Assets {
+		manifest.Assets = map[string]*LazyAsset{}
+	}
+	asset.Path = normalizeLazyPath(asset.Path)
+	delete(manifest.Assets, "/"+asset.Path)
+	manifest.Assets[asset.Path] = asset
+}
+
+func (repo *Repo) markLazyFilesError(files []*entity.File) error {
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil || 1 > len(files) {
+		return nil
+	}
+	manifest, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return fmt.Errorf("get manifest failed: %w", err)
+	}
+	for _, file := range files {
+		if nil == file {
+			continue
+		}
+		path := normalizeLazyPath(file.Path)
+		asset := manifest.Assets[path]
+		if nil == asset {
+			asset = manifest.Assets["/"+path]
+		}
+		if nil == asset {
+			asset = &LazyAsset{
+				Path:     path,
+				FileID:   file.ID,
+				Size:     file.Size,
+				Modified: file.Updated,
+				Chunks:   file.Chunks,
+			}
+		}
+		asset.Status = LazyStatusError
+		repo.setLazyManifestAsset(manifest, asset)
+	}
+	return repo.lazyLoader.saveManifest(manifest)
+}
+
+func (repo *Repo) rebuildLazyFileChunksIfSourceExists(file *entity.File, context map[string]interface{}) (rebuilt bool, err error) {
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil || nil == file {
+		return false, nil
+	}
+	if !strings.HasPrefix(file.Path, "assets/") && !strings.HasPrefix(file.Path, "/assets/") {
+		return false, nil
+	}
+
+	absPath := repo.absPath(file.Path)
+	if !gulu.File.IsExist(absPath) {
+		return false, nil
+	}
+
+	logging.LogInfof("rebuildLazyFileChunksIfSourceExists: rebuilding lazy file chunks [%s]", file.Path)
+	if err = repo.putFileChunks(file, context, 1, 1); nil != err {
+		return false, err
+	}
+	if err = repo.updateLazyManifest([]*entity.File{file}); nil != err {
+		return false, err
+	}
+	return true, nil
 }
 
 // hasLazyFileConflict 检测懒加载文件是否有冲突
@@ -559,7 +630,7 @@ func (repo *Repo) isLazyFile(filePath string) bool {
 // 如果索引中没有懒加载文件，则扫描本地assets文件夹并添加到清单中
 func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 	logging.LogInfof("repairLazyDataConsistency: starting repair process")
-	
+
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
 		logging.LogWarnf("repairLazyDataConsistency: lazy loading not enabled or loader is nil")
 		return nil
@@ -605,7 +676,7 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 		checkedCount := 0
 		missingCount := 0
 		skippedCount := 0
-		
+
 		for _, lazyFileID := range latest.LazyFiles {
 			checkedCount++
 			if !manifestFileIDs[lazyFileID] {
@@ -622,11 +693,11 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 				// 检查是否是assets文件
 				if strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/") {
 					logging.LogInfof("repairLazyDataConsistency: found missing lazy file in manifest [%s] (ID=%s, Size=%d), attempting repair", file.Path, file.ID, file.Size)
-					
+
 					// 检查本地文件是否存在
 					cleanPath := strings.TrimPrefix(file.Path, "/")
 					localPath := filepath.Join(repo.DataPath, cleanPath)
-					
+
 					if gulu.File.IsExist(localPath) {
 						// 本地文件存在，更新文件信息并添加到files列表
 						info, statErr := os.Stat(localPath)
@@ -635,14 +706,14 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 							oldUpdated := file.Updated
 							file.Size = info.Size()
 							file.Updated = info.ModTime().UnixMilli()
-							logging.LogInfof("repairLazyDataConsistency: updated file info [%s]: size %d->%d, updated %d->%d", 
+							logging.LogInfof("repairLazyDataConsistency: updated file info [%s]: size %d->%d, updated %d->%d",
 								file.Path, oldSize, file.Size, oldUpdated, file.Updated)
 						} else {
 							logging.LogWarnf("repairLazyDataConsistency: failed to stat local file [%s]: %s", localPath, statErr)
 						}
 					} else {
 						// 本地文件不存在，保持原有的元数据
-						logging.LogWarnf("repairLazyDataConsistency: local file [%s] not found, using stored metadata (Size=%d, Updated=%d)", 
+						logging.LogWarnf("repairLazyDataConsistency: local file [%s] not found, using stored metadata (Size=%d, Updated=%d)",
 							file.Path, file.Size, file.Updated)
 					}
 
@@ -656,7 +727,7 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 				}
 			}
 		}
-		logging.LogInfof("repairLazyDataConsistency: index check completed: checked=%d, missing=%d, repaired=%d, skipped=%d", 
+		logging.LogInfof("repairLazyDataConsistency: index check completed: checked=%d, missing=%d, repaired=%d, skipped=%d",
 			checkedCount, missingCount, repairedCount, skippedCount)
 	} else {
 		logging.LogInfof("repairLazyDataConsistency: no lazy files in index, skipping index check")
@@ -677,18 +748,18 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 	// 如果有修复的文件，更新清单
 	if len(missingFiles) > 0 {
 		logging.LogInfof("repairLazyDataConsistency: adding %d missing files from index to manifest", len(missingFiles))
-		
+
 		// 添加到清单中
 		for i, file := range missingFiles {
 			asset := &LazyAsset{
-				Path:     file.Path,
+				Path:     normalizeLazyPath(file.Path),
 				FileID:   file.ID,
 				Size:     file.Size,
 				Modified: file.Updated,
 				Chunks:   file.Chunks,
 			}
-			manifest.Assets[file.Path] = asset
-			logging.LogInfof("repairLazyDataConsistency: added asset [%d/%d] to manifest: %s (ID=%s, Size=%d, Chunks=%d)", 
+			repo.setLazyManifestAsset(manifest, asset)
+			logging.LogInfof("repairLazyDataConsistency: added asset [%d/%d] to manifest: %s (ID=%s, Size=%d, Chunks=%d)",
 				i+1, len(missingFiles), file.Path, file.ID, file.Size, len(file.Chunks))
 		}
 	}
@@ -702,7 +773,7 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 			return fmt.Errorf("save repaired manifest failed: %w", saveErr)
 		}
 		logging.LogInfof("repairLazyDataConsistency: manifest saved successfully")
-		logging.LogInfof("repairLazyDataConsistency: repair completed successfully: total repaired=%d (from index=%d, from scan=%d)", 
+		logging.LogInfof("repairLazyDataConsistency: repair completed successfully: total repaired=%d (from index=%d, from scan=%d)",
 			repairedCount, len(missingFiles), scannedCount)
 	} else {
 		logging.LogInfof("repairLazyDataConsistency: no files to repair, manifest unchanged")
@@ -715,7 +786,7 @@ func (repo *Repo) repairLazyDataConsistency(files *[]*entity.File) error {
 // scanLocalAssetsForRepair 扫描本地assets文件夹，将找到的文件添加到清单中
 func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 	logging.LogInfof("scanLocalAssetsForRepair: starting scan process")
-	
+
 	manifest, err := repo.lazyLoader.getManifest()
 	if err != nil {
 		return 0, fmt.Errorf("get manifest failed: %w", err)
@@ -757,7 +828,7 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 
 		// 转换为统一格式（使用斜杠）
 		relPath = filepath.ToSlash(relPath)
-		
+
 		// 确保路径以assets/开头
 		if !strings.HasPrefix(relPath, "assets/") {
 			return nil
@@ -781,7 +852,7 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 		if getErr == nil && existingFile != nil {
 			// 文件已存在，使用已有的文件信息（包括chunks）
 			file = existingFile
-			logging.LogInfof("scanLocalAssetsForRepair: file [%s] already exists in store with ID [%s], reusing (Chunks=%d)", 
+			logging.LogInfof("scanLocalAssetsForRepair: file [%s] already exists in store with ID [%s], reusing (Chunks=%d)",
 				relPath, file.ID, len(file.Chunks))
 		} else {
 			// 文件不存在，需要处理chunks
@@ -821,25 +892,25 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 
 		// 添加到清单
 		asset := &LazyAsset{
-			Path:     file.Path,
+			Path:     normalizeLazyPath(file.Path),
 			FileID:   file.ID,
 			Size:     file.Size,
 			Modified: file.Updated,
 			Chunks:   file.Chunks,
 			Status:   LazyStatusCached, // 本地文件存在，标记为已缓存
 		}
-		manifest.Assets[file.Path] = asset
+		repo.setLazyManifestAsset(manifest, asset)
 
 		scannedFiles = append(scannedFiles, file)
 		*files = append(*files, file)
 		repairedCount++
-		
+
 		if repairedCount%10 == 0 {
-			logging.LogInfof("scanLocalAssetsForRepair: progress: repaired=%d, existing=%d", 
+			logging.LogInfof("scanLocalAssetsForRepair: progress: repaired=%d, existing=%d",
 				repairedCount, existingCount)
 		}
-		
-		logging.LogInfof("scanLocalAssetsForRepair: added file [%s] to manifest (ID=%s, Size=%d, Chunks=%d)", 
+
+		logging.LogInfof("scanLocalAssetsForRepair: added file [%s] to manifest (ID=%s, Size=%d, Chunks=%d)",
 			relPath, file.ID, file.Size, len(file.Chunks))
 		return nil
 	})
@@ -849,7 +920,7 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 		return repairedCount, fmt.Errorf("walk assets directory failed: %w", err)
 	}
 
-	logging.LogInfof("scanLocalAssetsForRepair: scan completed: total scanned=%d, repaired=%d, existing=%d", 
+	logging.LogInfof("scanLocalAssetsForRepair: scan completed: total scanned=%d, repaired=%d, existing=%d",
 		repairedCount+existingCount, repairedCount, existingCount)
 
 	// 保存更新后的清单
