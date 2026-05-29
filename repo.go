@@ -32,6 +32,9 @@ import (
 	"time"
 
 	"github.com/88250/gulu"
+	"github.com/88250/lute/ast"
+	"github.com/88250/lute/html"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/ants/v2"
 	"github.com/restic/chunker"
 	ignore "github.com/sabhiram/go-gitignore"
@@ -537,6 +540,21 @@ func (repo *Repo) GetFiles(index *entity.Index) (ret []*entity.File, err error) 
 	return ret, nil
 }
 
+func (repo *Repo) GetFilesIter(index *entity.Index, handler func(file *entity.File) error) (err error) {
+	for _, fileID := range index.Files {
+		file, getErr := repo.GetFile(fileID)
+		if nil != getErr {
+			err = getErr
+			return
+		}
+
+		if err = handler(file); nil != err {
+			return
+		}
+	}
+	return
+}
+
 func (repo *Repo) GetFile(fileID string) (ret *entity.File, err error) {
 	ret, err = repo.store.GetFile(fileID)
 	return
@@ -544,6 +562,236 @@ func (repo *Repo) GetFile(fileID string) (ret *entity.File, err error) {
 
 func (repo *Repo) OpenFile(file *entity.File) (ret []byte, err error) {
 	ret, err = repo.openFile(file)
+	return
+}
+
+func (repo *Repo) SearchFile(keyword string, page int, pageSize int) (ret []*entity.File, fileIndexIDs map[string]string, totalCount, pageCount int, err error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 32
+	}
+
+	keyword = strings.ToLower(keyword)
+
+	// Phase 1: 持有锁收集所有索引中的文件 ID（去重），同时记录文件所属的最新快照 ID
+	var allFileIDs []string
+	idSet := map[string]bool{}
+	fileIndexIDsMap := map[string]string{}
+	var collectErr error
+	lock.Lock()
+	{
+		_, _, collectErr = repo.getIndexesIter(1, math.MaxInt, func(index *entity.Index) error {
+			for _, fileID := range index.Files {
+				if !idSet[fileID] {
+					idSet[fileID] = true
+					allFileIDs = append(allFileIDs, fileID)
+					fileIndexIDsMap[fileID] = index.ID
+				}
+			}
+			return nil
+		})
+	}
+	lock.Unlock()
+	if nil != collectErr {
+		err = collectErr
+		return
+	}
+	idSet = nil // 释放给 GC
+
+	if 0 == len(allFileIDs) {
+		return
+	}
+
+	// Phase 2: 并发搜索匹配文件
+	var matches []*entity.File
+	matchSeen := map[string]bool{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var workerErrs []error
+	var errMu sync.Mutex
+
+	poolSize := 4
+	if len(allFileIDs) < poolSize {
+		poolSize = len(allFileIDs)
+	}
+
+	p, _ := ants.NewPoolWithFunc(poolSize, func(arg interface{}) {
+		defer wg.Done()
+
+		fileID := arg.(string)
+		file, getErr := repo.store.GetFile(fileID)
+		if nil != getErr {
+			logging.LogErrorf("get file [%s] failed: %s", fileID, getErr)
+			return
+		}
+
+		mu.Lock()
+		if matchSeen[file.ID] {
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
+
+		name := path.Base(file.Path)
+		if strings.HasSuffix(name, ".sy") && !ast.IsNodeIDPattern(keyword) {
+			var data []byte
+			for _, c := range file.Chunks {
+				chunk, chunkErr := repo.store.GetChunk(c)
+				if nil != chunkErr {
+					logging.LogErrorf("get chunk [%s] for file [%s] failed: %s", c, file.Path, chunkErr)
+					errMu.Lock()
+					workerErrs = append(workerErrs, chunkErr)
+					errMu.Unlock()
+					return
+				}
+				data = append(data, chunk.Data...)
+			}
+
+			docIAL := map[string]string{}
+			iter := jsoniter.ParseBytes(jsoniter.ConfigCompatibleWithStandardLibrary, data)
+			for field := iter.ReadObject(); field != ""; field = iter.ReadObject() {
+				if field == "Properties" {
+					iter.ReadVal(&docIAL)
+					break
+				} else {
+					iter.Skip()
+				}
+			}
+
+			for k, v := range docIAL {
+				docIAL[k] = html.UnescapeAttrVal(v)
+			}
+			if title := docIAL["title"]; "" != title {
+				name = title
+			}
+		}
+
+		if strings.Contains(strings.ToLower(name), keyword) {
+			mu.Lock()
+			if !matchSeen[file.ID] {
+				matches = append(matches, file)
+				matchSeen[file.ID] = true
+			}
+			mu.Unlock()
+		}
+	})
+
+	for _, fileID := range allFileIDs {
+		wg.Add(1)
+		p.Invoke(fileID)
+	}
+	wg.Wait()
+	p.Release()
+
+	if 0 < len(workerErrs) {
+		err = workerErrs[0]
+		return
+	}
+
+	sort.Slice(matches, func(i, j int) bool { return matches[i].Updated > matches[j].Updated })
+
+	// Phase 3: 分页
+	totalCount = len(matches)
+	if totalCount == 0 {
+		pageCount = 0
+		return
+	}
+	pageCount = int(math.Ceil(float64(totalCount) / float64(pageSize)))
+	start := (page - 1) * pageSize
+	end := page * pageSize
+	if start > totalCount {
+		start = totalCount
+	}
+	if end > totalCount {
+		end = totalCount
+	}
+	ret = matches[start:end]
+	fileIndexIDs = make(map[string]string, len(ret))
+	for _, f := range ret {
+		fileIndexIDs[f.ID] = fileIndexIDsMap[f.ID]
+	}
+	return
+}
+
+func (repo *Repo) GetIndexesIter(page, pageSize int, handler func(index *entity.Index) error) (totalCount, pageCount int, err error) {
+	lock.Lock()
+	defer lock.Unlock()
+	return repo.getIndexesIter(page, pageSize, handler)
+}
+
+func (repo *Repo) getIndexesIter(page, pageSize int, handler func(index *entity.Index) error) (totalCount, pageCount int, err error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 32
+	}
+	if handler == nil {
+		return 0, 0, fmt.Errorf("handler is nil")
+	}
+
+	dir := filepath.Join(repo.Path, "indexes")
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		logging.LogErrorf("read dir [%s] failed: %s", dir, readErr)
+		err = readErr
+		return
+	}
+
+	type idxEntry struct {
+		id  string
+		mod time.Time
+	}
+	var list []idxEntry
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if len(name) != 40 {
+			continue
+		}
+		info, infoErr := e.Info()
+		if infoErr != nil {
+			logging.LogWarnf("get info for index file [%s] failed: %s", name, infoErr)
+			continue
+		}
+		list = append(list, idxEntry{id: name, mod: info.ModTime()})
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].mod.After(list[j].mod)
+	})
+
+	totalCount = len(list)
+	if totalCount == 0 {
+		pageCount = 0
+		return
+	}
+	pageCount = int(math.Ceil(float64(totalCount) / float64(pageSize)))
+
+	start := (page - 1) * pageSize
+	end := page * pageSize
+	if start > totalCount {
+		start = totalCount
+	}
+	if end > totalCount {
+		end = totalCount
+	}
+
+	for _, it := range list[start:end] {
+		index, getErr := repo.store.GetIndex(it.id)
+		if getErr != nil {
+			err = getErr
+			return
+		}
+		if hErr := handler(index); hErr != nil {
+			err = hErr
+			return
+		}
+	}
 	return
 }
 
