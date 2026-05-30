@@ -121,7 +121,7 @@ func TestGetChunkRejectsStoredHashMismatch(t *testing.T) {
 	}
 }
 
-func TestPutChunkOverwritesExistingHashMismatch(t *testing.T) {
+func TestPutChunkSkipsExistingObjectAfterValidatingInput(t *testing.T) {
 	clearTestdata(t)
 
 	aesKey, err := encryption.KDF(testRepoPassword, testRepoPasswordSalt)
@@ -148,13 +148,10 @@ func TestPutChunkOverwritesExistingHashMismatch(t *testing.T) {
 	}
 
 	if err = store.PutChunk(&entity.Chunk{ID: chunkID, Data: data}); nil != err {
-		t.Fatalf("put chunk should overwrite corrupt existing object: %s", err)
+		t.Fatalf("put chunk should accept valid input even when object exists: %s", err)
 	}
 	chunk, err := store.GetChunk(chunkID)
-	if nil != err {
-		t.Fatalf("get overwritten chunk failed: %s", err)
-	}
-	if !bytes.Equal(chunk.Data, data) {
-		t.Fatalf("unexpected chunk data [%s]", chunk.Data)
+	if nil == err {
+		t.Fatalf("existing corrupt object should not be overwritten: %#v", chunk)
 	}
 }

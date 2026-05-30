@@ -418,13 +418,7 @@ func (store *Store) PutChunk(chunk *entity.Chunk) (err error) {
 	}
 	dir, file := store.AbsPath(chunk.ID)
 	if gulu.File.IsExist(file) {
-		if _, err = store.GetChunk(chunk.ID); nil == err {
-			return
-		}
-		logging.LogWarnf("existing chunk [%s] is invalid, overwriting: %s", chunk.ID, err)
-		if err = os.Remove(file); nil != err {
-			return errors.New("put chunk failed: " + err.Error())
-		}
+		return
 	}
 
 	if err = os.MkdirAll(dir, 0755); nil != err {

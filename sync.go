@@ -1636,7 +1636,7 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 			appendSyncSample(&missingChunkSamples, "%s id=%s size=%d chunks=0", normalizedPath, file.ID, file.Size)
 		}
 		for _, chunkID := range file.Chunks {
-			_, chunkErr := repo.store.GetChunk(chunkID)
+			_, chunkErr := repo.store.Stat(chunkID)
 			if chunkErr != nil {
 				logging.LogWarnf("localUpsertFiles: lazy file [%s] has missing chunk [%s]", file.Path, chunkID)
 				missingChunkCount++
@@ -1657,7 +1657,7 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 				rebuiltCount++
 				missingChunks = false
 				for _, chunkID := range file.Chunks {
-					if _, chunkErr := repo.store.GetChunk(chunkID); chunkErr != nil {
+					if _, chunkErr := repo.store.Stat(chunkID); chunkErr != nil {
 						rebuiltStillMissingCount++
 						logging.LogWarnf("localUpsertFiles: rebuilt lazy file [%s] still has missing chunk [%s]", file.Path, chunkID)
 						missingChunks = true

@@ -210,6 +210,36 @@ func TestLocalUpsertFilesKeepsLazyChunksWhenRebuildFails(t *testing.T) {
 	}
 }
 
+func TestLocalUpsertFilesDoesNotReadExistingLazyChunks(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	chunkID := util.Hash([]byte("expected"))
+	localLazy := &entity.File{ID: "local-corrupt-existing-id", Path: "assets/existing.png", Size: 1, Updated: 1000, Chunks: []string{chunkID}}
+	if err := repo.store.PutFile(localLazy); err != nil {
+		t.Fatalf("put file failed: %s", err)
+	}
+	dir, file := repo.store.AbsPath(chunkID)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir chunk dir failed: %s", err)
+	}
+	encoded, err := repo.store.encodeData([]byte("actual"))
+	if err != nil {
+		t.Fatalf("encode failed: %s", err)
+	}
+	if err = os.WriteFile(file, encoded, 0644); err != nil {
+		t.Fatalf("write corrupt chunk failed: %s", err)
+	}
+
+	latest := &entity.Index{LazyFiles: []string{localLazy.ID}}
+	upserts, err := repo.localUpsertFiles(latest, &entity.Index{}, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("local upsert files failed: %s", err)
+	}
+	if len(upserts) != 1 || upserts[0].ID != localLazy.ID {
+		t.Fatalf("existing lazy chunk should be treated as present without reading: %#v", upserts)
+	}
+}
+
 func TestLazyLoadAssetRestoresChunksFromCloud(t *testing.T) {
 	repo := newLazyTestRepo(t)
 	cloudRoot := t.TempDir()
