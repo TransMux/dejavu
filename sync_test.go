@@ -53,6 +53,54 @@ func TestSync(t *testing.T) {
 	_ = trafficStat
 }
 
+func TestDiffUpsertRemoveNormalizesLazyAssetPaths(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	left := []*entity.File{{ID: "left-id", Path: "/assets/a.png", Size: 1, Updated: 1000}}
+	right := []*entity.File{{ID: "right-id", Path: "assets/a.png", Size: 1, Updated: 1000}}
+
+	upserts, removes := repo.diffUpsertRemove(left, right, false)
+	if len(upserts) != 0 || len(removes) != 0 {
+		t.Fatalf("equivalent lazy asset paths should not diff, upserts=%#v removes=%#v", upserts, removes)
+	}
+}
+
+func TestGetLazyFilesForIndexSkipsDSStore(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	chunkID := util.Hash([]byte("asset"))
+	manifest := &LazyManifest{
+		Version: "1.0",
+		Assets: map[string]*LazyAsset{
+			"assets/.DS_Store": {
+				Path:     "assets/.DS_Store",
+				FileID:   "ds-store-id",
+				Size:     1,
+				Modified: 1000,
+				Chunks:   []string{chunkID},
+			},
+			"assets/keep.png": {
+				Path:     "assets/keep.png",
+				FileID:   "keep-id",
+				Size:     1,
+				Modified: 1000,
+				Chunks:   []string{chunkID},
+			},
+		},
+	}
+	if err := repo.lazyLoader.saveManifest(manifest); err != nil {
+		t.Fatalf("save manifest failed: %s", err)
+	}
+
+	files, err := repo.getLazyFilesForIndex()
+	if err != nil {
+		t.Fatalf("get lazy files failed: %s", err)
+	}
+	if len(files) != 1 || files[0].Path != "assets/keep.png" {
+		t.Fatalf("unexpected lazy files: %#v", files)
+	}
+}
+
 func TestLocalUpsertFilesUploadsChangedLazySamePath(t *testing.T) {
 	repo := newLazyTestRepo(t)
 

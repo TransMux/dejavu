@@ -347,6 +347,11 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 
 	// 更新资源信息
 	for _, file := range lazyFiles {
+		if isIgnoredLazyAssetPath(file.Path) {
+			delete(manifest.Assets, normalizeLazyPath(file.Path))
+			continue
+		}
+
 		// 检查chunks是否有效
 		if len(file.Chunks) == 0 && file.Size > 0 {
 			logging.LogWarnf("updateLazyManifest: file [%s] has no chunks but size is %d bytes!", file.Path, file.Size)
@@ -449,6 +454,11 @@ func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, co
 			// 本地没有元数据，需要从云端获取
 			missingFileIDs = append(missingFileIDs, fileID)
 		} else {
+			if isIgnoredLazyAssetPath(file.Path) {
+				delete(manifest.Assets, normalizeLazyPath(file.Path))
+				continue
+			}
+
 			// 本地有元数据，直接更新清单
 			existingCount++
 			asset := &LazyAsset{
@@ -482,6 +492,11 @@ func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, co
 		} else {
 			// 将下载的元数据添加到清单
 			for _, cloudFile := range cloudFiles {
+				if isIgnoredLazyAssetPath(cloudFile.Path) {
+					delete(manifest.Assets, normalizeLazyPath(cloudFile.Path))
+					continue
+				}
+
 				asset := &LazyAsset{
 					Path:     normalizeLazyPath(cloudFile.Path),
 					FileID:   cloudFile.ID,
@@ -608,6 +623,10 @@ func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
 	logging.LogInfof("[DEBUG] getLazyFilesForIndex: manifest has %d assets", len(manifest.Assets))
 	var files []*entity.File
 	for _, asset := range manifest.Assets {
+		if isIgnoredLazyAssetPath(asset.Path) {
+			continue
+		}
+
 		// 检查本地文件是否存在
 		cleanPath := strings.TrimPrefix(asset.Path, "/")
 		localPath := filepath.Join(repo.DataPath, cleanPath)
@@ -864,6 +883,9 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 
 		// 确保路径以assets/开头
 		if !strings.HasPrefix(relPath, "assets/") {
+			return nil
+		}
+		if isIgnoredLazyAssetPath(relPath) {
 			return nil
 		}
 

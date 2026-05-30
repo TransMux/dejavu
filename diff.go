@@ -29,10 +29,10 @@ func (repo *Repo) diffUpsertRemove(left, right []*entity.File, log bool) (upsert
 	l := map[string]*entity.File{}
 	r := map[string]*entity.File{}
 	for _, f := range left {
-		l[f.Path] = f
+		l[repo.diffPathKey(f.Path)] = f
 	}
 	for _, f := range right {
-		r[f.Path] = f
+		r[repo.diffPathKey(f.Path)] = f
 	}
 
 	for lPath, lFile := range l {
@@ -45,7 +45,7 @@ func (repo *Repo) diffUpsertRemove(left, right []*entity.File, log bool) (upsert
 
 			continue
 		}
-		if !equalFile(lFile, rFile) {
+		if !repo.equalFile(lFile, rFile) {
 			if log {
 				logging.LogInfof("upsert [lID=%s, lPath=%s, lUpdated=%s, rID=%s, rPath=%s, rUpdated=%s]",
 					l[lPath].ID, l[lPath].Path, time.UnixMilli(l[lPath].Updated).Format("2006-01-02 15:04:05"),
@@ -60,13 +60,13 @@ func (repo *Repo) diffUpsertRemove(left, right []*entity.File, log bool) (upsert
 		lFile := l[rPath]
 		if nil == lFile {
 			// 防止删除懒加载文件
-			if repo.lazyLoadEnabled && (strings.HasPrefix(rPath, "assets/") || strings.HasPrefix(rPath, "/assets/")) {
+			if repo.lazyLoadEnabled && isAssetPath(rPath) {
 				if log {
 					logging.LogInfof("skip removing lazy file [%s, %s, %s]", r[rPath].ID, r[rPath].Path, time.UnixMilli(r[rPath].Updated).Format("2006-01-02 15:04:05"))
 				}
 				continue
 			}
-			
+
 			removes = append(removes, r[rPath])
 			if log {
 				logging.LogInfof("remove [%s, %s, %s]", r[rPath].ID, r[rPath].Path, time.UnixMilli(r[rPath].Updated).Format("2006-01-02 15:04:05"))
@@ -114,10 +114,10 @@ func (repo *Repo) diffIndex(leftIndex, rightIndex *entity.Index) (ret *LeftRight
 	l := map[string]*entity.File{}
 	r := map[string]*entity.File{}
 	for _, f := range leftFiles {
-		l[f.Path] = f
+		l[repo.diffPathKey(f.Path)] = f
 	}
 	for _, f := range rightFiles {
-		r[f.Path] = f
+		r[repo.diffPathKey(f.Path)] = f
 	}
 
 	ret = &LeftRightDiff{
@@ -131,7 +131,7 @@ func (repo *Repo) diffIndex(leftIndex, rightIndex *entity.Index) (ret *LeftRight
 			ret.AddsLeft = append(ret.AddsLeft, l[lPath])
 			continue
 		}
-		if !equalFile(lFile, rFile) {
+		if !repo.equalFile(lFile, rFile) {
 			ret.UpdatesLeft = append(ret.UpdatesLeft, l[lPath])
 			ret.UpdatesRight = append(ret.UpdatesRight, r[lPath])
 			continue
@@ -148,12 +148,23 @@ func (repo *Repo) diffIndex(leftIndex, rightIndex *entity.Index) (ret *LeftRight
 	return
 }
 
-func equalFile(left, right *entity.File) bool {
-	if left.Path != right.Path {
+func (repo *Repo) diffPathKey(filePath string) string {
+	if repo.lazyLoadEnabled && isAssetPath(filePath) {
+		return normalizeLazyPath(filePath)
+	}
+	return filePath
+}
+
+func (repo *Repo) equalFile(left, right *entity.File) bool {
+	if repo.diffPathKey(left.Path) != repo.diffPathKey(right.Path) {
 		return false
 	}
 	if left.Updated/1000 != right.Updated/1000 { // Improve data sync file timestamp comparison https://github.com/siyuan-note/siyuan/issues/8573
 		return false
 	}
 	return true
+}
+
+func isAssetPath(filePath string) bool {
+	return strings.HasPrefix(normalizeLazyPath(filePath), "assets/")
 }

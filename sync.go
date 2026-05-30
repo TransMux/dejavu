@@ -1539,6 +1539,10 @@ func normalizeLazyPath(path string) string {
 	return strings.TrimPrefix(filepath.ToSlash(path), "/")
 }
 
+func isIgnoredLazyAssetPath(path string) bool {
+	return filepath.Base(normalizeLazyPath(path)) == ".DS_Store"
+}
+
 func appendSyncSample(samples *[]string, format string, args ...interface{}) {
 	const limit = 8
 	if len(*samples) >= limit {

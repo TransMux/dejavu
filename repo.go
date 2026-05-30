@@ -1146,9 +1146,17 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	// Phase 6: Process upsert files and lazy files
 	logging.LogInfof("index0: phase 6/6 - processing upsert files and lazy files")
 
+	var normalUpserts []*entity.File
+	for _, file := range upserts {
+		if repo.lazyLoadEnabled && isAssetPath(file.Path) {
+			continue
+		}
+		normalUpserts = append(normalUpserts, file)
+	}
+
 	count := atomic.Int32{}
-	total := len(upserts)
-	logging.LogInfof("index0: processing %d upsert files", total)
+	total := len(normalUpserts)
+	logging.LogInfof("index0: processing %d upsert files (%d lazy upserts deferred)", total, len(upserts)-len(normalUpserts))
 	var workerErrs []error
 	workerErrLock := sync.Mutex{}
 	eventbus.Publish(eventbus.EvtIndexUpsertFiles, context, total)
@@ -1179,7 +1187,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		}
 	})
 
-	for _, file := range upserts {
+	for _, file := range normalUpserts {
 		waitGroup.Add(1)
 		err = p.Invoke(file)
 		if nil != err {
