@@ -176,6 +176,30 @@ func TestMergeLazyManifestFileWritesMergedManifest(t *testing.T) {
 	}
 }
 
+func TestMergeLazyManifestAssetsPrefersNonEmptyChunks(t *testing.T) {
+	local := &LazyManifest{Assets: map[string]*LazyAsset{
+		"assets/same.png": {
+			Path:     "assets/same.png",
+			FileID:   "empty-id",
+			Modified: 1000,
+		},
+	}}
+	cloud := &LazyManifest{Assets: map[string]*LazyAsset{
+		"assets/same.png": {
+			Path:     "assets/same.png",
+			FileID:   "chunked-id",
+			Modified: 1000,
+			Chunks:   []string{"chunk-id"},
+		},
+	}}
+
+	merged := mergeLazyManifestAssets(local, cloud)
+
+	if merged.Assets["assets/same.png"].FileID != "chunked-id" {
+		t.Fatalf("asset with chunks should win: %#v", merged.Assets["assets/same.png"])
+	}
+}
+
 func TestLocalUpsertFilesUploadsChangedLazySamePath(t *testing.T) {
 	repo := newLazyTestRepo(t)
 
