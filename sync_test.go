@@ -101,6 +101,32 @@ func TestGetLazyFilesForIndexSkipsDSStore(t *testing.T) {
 	}
 }
 
+func TestMergeLazyManifestAssetsUnionsAndNormalizesPaths(t *testing.T) {
+	local := &LazyManifest{Assets: map[string]*LazyAsset{
+		"assets/local.png": {Path: "assets/local.png", FileID: "local-id", Modified: 1000, Chunks: []string{"local-chunk"}},
+		"/assets/same.png": {Path: "/assets/same.png", FileID: "old-id", Modified: 1000, Chunks: []string{"old-chunk"}},
+	}}
+	cloud := &LazyManifest{Assets: map[string]*LazyAsset{
+		"assets/cloud.png": {Path: "assets/cloud.png", FileID: "cloud-id", Modified: 1000, Chunks: []string{"cloud-chunk"}},
+		"assets/same.png":  {Path: "assets/same.png", FileID: "new-id", Modified: 2000, Chunks: []string{"new-chunk"}},
+	}}
+
+	merged := mergeLazyManifestAssets(local, cloud)
+
+	if len(merged.Assets) != 3 {
+		t.Fatalf("unexpected merged assets: %#v", merged.Assets)
+	}
+	if merged.Assets["assets/same.png"].FileID != "new-id" {
+		t.Fatalf("newer asset should win: %#v", merged.Assets["assets/same.png"])
+	}
+	if _, exists := merged.Assets["/assets/same.png"]; exists {
+		t.Fatalf("merged manifest should normalize leading slash keys: %#v", merged.Assets)
+	}
+	if merged.Assets["assets/local.png"] == nil || merged.Assets["assets/cloud.png"] == nil {
+		t.Fatalf("merged manifest should keep unique assets: %#v", merged.Assets)
+	}
+}
+
 func TestLocalUpsertFilesUploadsChangedLazySamePath(t *testing.T) {
 	repo := newLazyTestRepo(t)
 
