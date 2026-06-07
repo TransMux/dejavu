@@ -54,13 +54,14 @@ var (
 type MergeResult struct {
 	Time                        time.Time
 	Upserts, Removes, Conflicts []*entity.File
+	MergedLazyManifest          bool
 
 	UpsertPetals []string // storage/petal/petals.json 中变更的插件，在思源中计算并填充
 	RemovePetals []string // storage/petal/petals.json 中删除的插件，在思源中计算并填充
 }
 
 func (mr *MergeResult) DataChanged() bool {
-	return len(mr.Upserts) > 0 || len(mr.Removes) > 0 || len(mr.Conflicts) > 0
+	return len(mr.Upserts) > 0 || len(mr.Removes) > 0 || len(mr.Conflicts) > 0 || mr.MergedLazyManifest
 }
 
 type DownloadTrafficStat struct {
@@ -336,6 +337,16 @@ func (repo *Repo) sync0(context map[string]interface{},
 		}
 
 		if localUpsert := repo.getFile(localUpserts, cloudUpsert); nil != localUpsert { // 相同的文件本地发生了变更
+			if "/.siyuan/lazy_manifest.json" == cloudUpsert.Path {
+				if mergeErr := repo.mergeLazyManifestFile(localUpsert, cloudUpsert, context); nil == mergeErr {
+					mergeResult.MergedLazyManifest = true
+					logging.LogInfof("sync merge lazy manifest [%s, %s, %s]", cloudUpsert.ID, cloudUpsert.Path, time.UnixMilli(cloudUpsert.Updated).Format("2006-01-02 15:04:05"))
+					continue
+				} else {
+					logging.LogWarnf("merge lazy manifest failed: %s", mergeErr)
+				}
+			}
+
 			// 无论是否发生实际下载文件，都需要生成本地历史，以确保任何情况下都能够通过数据历史恢复文件
 			tmpMergeConflicts = append(tmpMergeConflicts, cloudUpsert)
 
