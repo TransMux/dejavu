@@ -17,6 +17,7 @@
 package dejavu
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,6 +125,54 @@ func TestMergeLazyManifestAssetsUnionsAndNormalizesPaths(t *testing.T) {
 	}
 	if merged.Assets["assets/local.png"] == nil || merged.Assets["assets/cloud.png"] == nil {
 		t.Fatalf("merged manifest should keep unique assets: %#v", merged.Assets)
+	}
+}
+
+func TestMergeLazyManifestFileWritesMergedManifest(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	manifestPath := filepath.Join(repo.DataPath, ".siyuan", "lazy_manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0755); err != nil {
+		t.Fatalf("mkdir manifest dir failed: %s", err)
+	}
+	local := &LazyManifest{Assets: map[string]*LazyAsset{
+		"assets/local.png": {Path: "assets/local.png", FileID: "local-id", Modified: 1000, Chunks: []string{"local-chunk"}},
+	}}
+	cloud := &LazyManifest{Assets: map[string]*LazyAsset{
+		"assets/cloud.png": {Path: "assets/cloud.png", FileID: "cloud-id", Modified: 1000, Chunks: []string{"cloud-chunk"}},
+	}}
+	localData, _ := json.Marshal(local)
+	cloudData, _ := json.Marshal(cloud)
+	if err := os.WriteFile(manifestPath, localData, 0644); err != nil {
+		t.Fatalf("write local manifest failed: %s", err)
+	}
+	if err := os.Chtimes(manifestPath, time.UnixMilli(1000), time.UnixMilli(1000)); err != nil {
+		t.Fatalf("chtimes local manifest failed: %s", err)
+	}
+	localFile := entity.NewFile("/.siyuan/lazy_manifest.json", int64(len(localData)), 1000)
+	if err := repo.putFileChunks(localFile, map[string]interface{}{}, 1, 1); err != nil {
+		t.Fatalf("put local manifest failed: %s", err)
+	}
+	if err := os.WriteFile(manifestPath, cloudData, 0644); err != nil {
+		t.Fatalf("write cloud manifest failed: %s", err)
+	}
+	if err := os.Chtimes(manifestPath, time.UnixMilli(2000), time.UnixMilli(2000)); err != nil {
+		t.Fatalf("chtimes cloud manifest failed: %s", err)
+	}
+	cloudFile := entity.NewFile("/.siyuan/lazy_manifest.json", int64(len(cloudData)), 2000)
+	if err := repo.putFileChunks(cloudFile, map[string]interface{}{}, 1, 1); err != nil {
+		t.Fatalf("put cloud manifest failed: %s", err)
+	}
+
+	if err := repo.mergeLazyManifestFile(localFile, cloudFile, map[string]interface{}{}); err != nil {
+		t.Fatalf("merge lazy manifest failed: %s", err)
+	}
+
+	merged, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		t.Fatalf("get merged manifest failed: %s", err)
+	}
+	if merged.Assets["assets/local.png"] == nil || merged.Assets["assets/cloud.png"] == nil {
+		t.Fatalf("manifest should contain both sides: %#v", merged.Assets)
 	}
 }
 
