@@ -425,6 +425,52 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 	return repo.lazyLoader.saveManifest(manifest)
 }
 
+func mergeLazyManifestAssets(local, cloud *LazyManifest) *LazyManifest {
+	merged := &LazyManifest{
+		Version: "1.0",
+		Assets:  map[string]*LazyAsset{},
+		Updated: time.Now().UnixMilli(),
+	}
+	add := func(asset *LazyAsset) {
+		if nil == asset || isIgnoredLazyAssetPath(asset.Path) {
+			return
+		}
+		candidate := cloneLazyAsset(asset)
+		candidate.Path = normalizeLazyPath(candidate.Path)
+		existing := merged.Assets[candidate.Path]
+		if nil == existing || shouldUseLazyAsset(candidate, existing) {
+			merged.Assets[candidate.Path] = candidate
+		}
+	}
+	if nil != local {
+		for _, asset := range local.Assets {
+			add(asset)
+		}
+	}
+	if nil != cloud {
+		for _, asset := range cloud.Assets {
+			add(asset)
+		}
+	}
+	return merged
+}
+
+func cloneLazyAsset(asset *LazyAsset) *LazyAsset {
+	ret := *asset
+	ret.Chunks = append([]string{}, asset.Chunks...)
+	return &ret
+}
+
+func shouldUseLazyAsset(candidate, existing *LazyAsset) bool {
+	if candidate.Modified != existing.Modified {
+		return candidate.Modified > existing.Modified
+	}
+	if len(candidate.Chunks) != len(existing.Chunks) {
+		return len(candidate.Chunks) > len(existing.Chunks)
+	}
+	return candidate.Size >= existing.Size
+}
+
 // updateLazyManifestFromCloudIndex 从云端索引更新懒加载清单，不下载文件内容
 func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, context map[string]interface{}) error {
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
