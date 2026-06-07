@@ -471,6 +471,42 @@ func shouldUseLazyAsset(candidate, existing *LazyAsset) bool {
 	return candidate.Size >= existing.Size
 }
 
+func (repo *Repo) mergeLazyManifestFile(localFile, cloudFile *entity.File, context map[string]interface{}) (err error) {
+	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
+		return nil
+	}
+	localManifest, err := repo.checkoutLazyManifest(localFile, "local", context)
+	if nil != err {
+		return fmt.Errorf("checkout local lazy manifest failed: %w", err)
+	}
+	cloudManifest, err := repo.checkoutLazyManifest(cloudFile, "cloud", context)
+	if nil != err {
+		return fmt.Errorf("checkout cloud lazy manifest failed: %w", err)
+	}
+
+	merged := mergeLazyManifestAssets(localManifest, cloudManifest)
+	return repo.lazyLoader.saveManifest(merged)
+}
+
+func (repo *Repo) checkoutLazyManifest(file *entity.File, name string, context map[string]interface{}) (*LazyManifest, error) {
+	if nil == file {
+		return nil, fmt.Errorf("manifest file is nil")
+	}
+	dir := filepath.Join(repo.TempPath, "repo", "sync", "lazy-manifest", name)
+	if err := repo.checkoutFile(file, dir, 1, 1, context); nil != err {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".siyuan", "lazy_manifest.json"))
+	if nil != err {
+		return nil, err
+	}
+	manifest := &LazyManifest{}
+	if err = json.Unmarshal(data, manifest); nil != err {
+		return nil, err
+	}
+	return manifest, nil
+}
+
 // updateLazyManifestFromCloudIndex 从云端索引更新懒加载清单，不下载文件内容
 func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, context map[string]interface{}) error {
 	if !repo.lazyLoadEnabled || repo.lazyLoader == nil {
