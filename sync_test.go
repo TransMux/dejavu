@@ -66,6 +66,35 @@ func TestDiffUpsertRemoveNormalizesLazyAssetPaths(t *testing.T) {
 	}
 }
 
+func TestIndexDeduplicatesLazyAssetPaths(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	relPath := "assets/paper.pdf.sya"
+	data := []byte(`{"annotation":true}`)
+	absPath := filepath.Join(repo.DataPath, relPath)
+	if err := os.WriteFile(absPath, data, 0644); err != nil {
+		t.Fatalf("write asset failed: %s", err)
+	}
+	modTime := time.Unix(1780923939, 0)
+	if err := os.Chtimes(absPath, modTime, modTime); err != nil {
+		t.Fatalf("chtimes failed: %s", err)
+	}
+	manifestFile := entity.NewFile(relPath, int64(len(data)), modTime.UnixMilli())
+	if err := repo.lazyLoader.saveManifest(&LazyManifest{Version: "1.0", Assets: map[string]*LazyAsset{
+		relPath: {Path: relPath, FileID: manifestFile.ID, Size: int64(len(data)), Modified: modTime.UnixMilli()},
+	}}); err != nil {
+		t.Fatalf("save manifest failed: %s", err)
+	}
+
+	index, err := repo.Index("Index 1", true, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("index failed: %s", err)
+	}
+	if len(index.LazyFiles) != 1 || index.LazyFiles[0] != manifestFile.ID {
+		t.Fatalf("unexpected lazy files: %#v", index.LazyFiles)
+	}
+}
+
 func TestGetLazyFilesForIndexSkipsDSStore(t *testing.T) {
 	repo := newLazyTestRepo(t)
 

@@ -1214,15 +1214,24 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	// 创建upserts的映射，提高查找效率
 	upsertMap := make(map[string]*entity.File)
 	for _, file := range upserts {
-		upsertMap[file.Path] = file
+		upsertMap[repo.diffPathKey(file.Path)] = file
+	}
+
+	fileMap := make(map[string]*entity.File)
+	for _, file := range files {
+		fileMap[repo.diffPathKey(file.Path)] = file
 	}
 
 	// 分离文件并直接添加到索引 - 一次遍历完成所有处理
 	var lazyFiles []*entity.File
 	for _, file := range files {
 		isLazyFile := repo.lazyLoadEnabled && (strings.HasPrefix(file.Path, "assets/") || strings.HasPrefix(file.Path, "/assets/"))
+		pathKey := repo.diffPathKey(file.Path)
+		if isLazyFile && fileMap[pathKey] != file {
+			continue
+		}
 
-		if upsertFile, isInUpserts := upsertMap[file.Path]; isInUpserts {
+		if upsertFile, isInUpserts := upsertMap[pathKey]; isInUpserts {
 			// 文件在upserts中，需要重新处理chunks
 			if isLazyFile {
 				lazyFiles = append(lazyFiles, upsertFile)
