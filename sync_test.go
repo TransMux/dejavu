@@ -95,6 +95,46 @@ func TestIndexDeduplicatesLazyAssetPaths(t *testing.T) {
 	}
 }
 
+func TestIndexRewritesUnreadableLazyFileMetadata(t *testing.T) {
+	repo := newLazyTestRepo(t)
+
+	relPath := "assets/corrupt-metadata.png"
+	data := []byte("asset")
+	chunkID := util.Hash(data)
+	manifestFile := entity.NewFile(relPath, int64(len(data)), 1000)
+	manifestFile.Chunks = []string{chunkID}
+	if err := repo.lazyLoader.saveManifest(&LazyManifest{Version: "1.0", Assets: map[string]*LazyAsset{
+		relPath: {
+			Path:     relPath,
+			FileID:   manifestFile.ID,
+			Size:     manifestFile.Size,
+			Modified: manifestFile.Updated,
+			Chunks:   manifestFile.Chunks,
+		},
+	}}); err != nil {
+		t.Fatalf("save manifest failed: %s", err)
+	}
+
+	dir, file := repo.store.AbsPath(manifestFile.ID)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir object dir failed: %s", err)
+	}
+	if err := os.WriteFile(file, []byte("bad metadata"), 0644); err != nil {
+		t.Fatalf("write bad metadata failed: %s", err)
+	}
+
+	index, err := repo.Index("Index 1", true, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("index failed: %s", err)
+	}
+	if len(index.LazyFiles) != 1 || index.LazyFiles[0] != manifestFile.ID {
+		t.Fatalf("unexpected lazy files: %#v", index.LazyFiles)
+	}
+	if _, err = repo.store.GetFile(manifestFile.ID); err != nil {
+		t.Fatalf("lazy metadata should be readable after index: %s", err)
+	}
+}
+
 func TestGetLazyFilesForIndexSkipsDSStore(t *testing.T) {
 	repo := newLazyTestRepo(t)
 
