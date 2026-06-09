@@ -1260,9 +1260,10 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		logging.LogInfof("index0: processing %d lazy files for chunk processing", len(lazyFiles))
 
 		// 处理懒加载文件的chunks - 这些都是upserts中的文件，需要重新处理
-		for _, file := range lazyFiles {
+		totalLazyFiles := len(lazyFiles)
+		for i, file := range lazyFiles {
 			lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
-			if putErr := repo.putFileChunks(file, lazyContext, 1, 1); putErr != nil {
+			if putErr := repo.putFileChunks(file, lazyContext, i+1, totalLazyFiles); putErr != nil {
 				logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
 				err = putErr
 				return
