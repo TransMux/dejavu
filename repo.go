@@ -1242,6 +1242,11 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		} else {
 			// 文件不在upserts中，直接添加到索引
 			if isLazyFile {
+				if ensureErr := repo.ensureLazyFileStored(file, context); nil != ensureErr {
+					err = ensureErr
+					logging.LogErrorf("ensure lazy file metadata [%s] failed: %s", file.Path, ensureErr)
+					return
+				}
 				ret.LazyFiles = append(ret.LazyFiles, file.ID)
 			} else {
 				ret.Files = append(ret.Files, file.ID)
@@ -1259,6 +1264,11 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
 			if putErr := repo.putFileChunks(file, lazyContext, 1, 1); putErr != nil {
 				logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
+				err = putErr
+				return
+			}
+			if putErr := repo.ensureLazyFileStored(file, lazyContext); putErr != nil {
+				logging.LogErrorf("ensure lazy file metadata [%s] failed: %s", file.Path, putErr)
 				err = putErr
 				return
 			}
@@ -1307,6 +1317,23 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	logging.LogInfof("index0: phase 6/6 completed - index creation finished")
 	logging.LogInfof("index0: successfully created index with %d files, %d lazy files", len(ret.Files), len(ret.LazyFiles))
 	return
+}
+
+func (repo *Repo) ensureLazyFileStored(file *entity.File, context map[string]interface{}) error {
+	if _, getErr := repo.store.GetFile(file.ID); nil == getErr {
+		if _, statErr := repo.store.Stat(file.ID); nil == statErr {
+			return nil
+		}
+	}
+
+	logging.LogWarnf("lazy file metadata [%s, %s] missing or unreadable, rebuilding", file.ID, file.Path)
+	if err := repo.store.Remove(file.ID); nil != err {
+		return err
+	}
+	if len(file.Chunks) > 0 {
+		return repo.store.PutFile(file)
+	}
+	return repo.putFileChunks(file, context, 1, 1)
 }
 
 func (repo *Repo) builtInIgnore(info os.FileInfo, absPath string) (ignored bool, err error) {
