@@ -953,6 +953,9 @@ func (repo *Repo) scanLocalAssetsForRepair(files *[]*entity.File) (int, error) {
 		if info.IsDir() {
 			return nil
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
 
 		// 计算相对路径
 		relPath, relErr := filepath.Rel(repo.DataPath, path)

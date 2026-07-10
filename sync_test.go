@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -168,6 +169,39 @@ func TestGetLazyFilesForIndexSkipsDSStore(t *testing.T) {
 	}
 	if len(files) != 1 || files[0].Path != "assets/keep.png" {
 		t.Fatalf("unexpected lazy files: %#v", files)
+	}
+}
+
+func TestScanLocalAssetsForRepairSkipsSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlink requires extra privileges on Windows")
+	}
+
+	repo := newLazyTestRepo(t)
+	externalFile := filepath.Join(t.TempDir(), "large.bin")
+	if err := os.WriteFile(externalFile, []byte("external"), 0644); err != nil {
+		t.Fatalf("write external file failed: %s", err)
+	}
+	linkedAsset := filepath.Join(repo.DataPath, "assets", "linked.bin")
+	if err := os.Symlink(externalFile, linkedAsset); err != nil {
+		t.Skipf("create symlink failed: %s", err)
+	}
+
+	var files []*entity.File
+	repairedCount, err := repo.scanLocalAssetsForRepair(&files)
+	if err != nil {
+		t.Fatalf("scan local assets failed: %s", err)
+	}
+	if repairedCount != 0 || len(files) != 0 {
+		t.Fatalf("symlink should be skipped, repaired=%d files=%#v", repairedCount, files)
+	}
+
+	manifest, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		t.Fatalf("get manifest failed: %s", err)
+	}
+	if len(manifest.Assets) != 0 {
+		t.Fatalf("symlink should not be added to manifest: %#v", manifest.Assets)
 	}
 }
 
