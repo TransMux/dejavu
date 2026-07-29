@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,12 +32,14 @@ import (
 )
 
 func TestSync(t *testing.T) {
+	if "" == os.Getenv("DEJAVU_SYNC_INTEGRATION") {
+		t.Skip("需要设置 DEJAVU_SYNC_INTEGRATION 并启动本地云端测试服务")
+	}
+
 	repo, _ := initIndex(t)
 
 	userId := "0"
 	token := ""
-
-	return // 注释掉不跑
 
 	repo.cloud = &cloud.SiYuan{BaseCloud: &cloud.BaseCloud{Conf: &cloud.Conf{
 		Dir:           "test",
@@ -64,6 +67,96 @@ func TestDiffUpsertRemoveNormalizesLazyAssetPaths(t *testing.T) {
 	upserts, removes := repo.diffUpsertRemove(left, right, false)
 	if len(upserts) != 0 || len(removes) != 0 {
 		t.Fatalf("equivalent lazy asset paths should not diff, upserts=%#v removes=%#v", upserts, removes)
+	}
+}
+
+func TestIndexIgnoresRefUsedStorage(t *testing.T) {
+	root := t.TempDir()
+	aesKey, err := encryption.KDF(testRepoPassword, testRepoPasswordSalt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := NewRepoWithLazyLoad(
+		filepath.Join(root, "workspace"),
+		filepath.Join(root, "repo"),
+		filepath.Join(root, "history"),
+		filepath.Join(root, "temp"),
+		deviceID, deviceName, deviceOS, aesKey, ignoreLines(), nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageDir := filepath.Join(repo.DataPath, "storage")
+	if err := os.MkdirAll(storageDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(storageDir, "ref-used.json"), []byte(`{"local":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(storageDir, "keep.json"), []byte(`{"sync":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	index, err := repo.Index("ref-used protection", true, map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := repo.GetFiles(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]bool{}
+	for _, file := range files {
+		paths[strings.TrimPrefix(filepath.ToSlash(file.Path), "/")] = true
+	}
+	if paths["storage/ref-used.json"] {
+		t.Fatal("storage/ref-used.json must remain device-local")
+	}
+	if !paths["storage/keep.json"] {
+		t.Fatal("control storage file was not indexed")
+	}
+}
+
+func TestIndexIgnoresRefUsedStorageCaseAlias(t *testing.T) {
+	if "darwin" != runtime.GOOS && "windows" != runtime.GOOS {
+		t.Skip("case-insensitive alias protection applies to macOS and Windows")
+	}
+	root := t.TempDir()
+	aesKey, err := encryption.KDF(testRepoPassword, testRepoPasswordSalt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := NewRepoWithLazyLoad(
+		filepath.Join(root, "workspace"),
+		filepath.Join(root, "repo"),
+		filepath.Join(root, "history"),
+		filepath.Join(root, "temp"),
+		deviceID, deviceName, deviceOS, aesKey, ignoreLines(), nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageDir := filepath.Join(repo.DataPath, "Storage")
+	if err = os.MkdirAll(storageDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(storageDir, "REF-USED.JSON"), []byte(`{"local":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(repo.DataPath, "keep.txt"), []byte("sync"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	index, err := repo.Index("ref-used case alias protection", true, map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := repo.GetFiles(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if strings.EqualFold(strings.TrimPrefix(filepath.ToSlash(file.Path), "/"), "storage/ref-used.json") {
+			t.Fatalf("case alias was indexed as [%s]", file.Path)
+		}
 	}
 }
 

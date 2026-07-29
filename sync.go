@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,8 @@ var (
 
 	ErrCloudGenerateConflictHistory = errors.New("generate conflict history failed")
 )
+
+const refUsedRepoPath = "/storage/ref-used.json"
 
 type MergeResult struct {
 	Time                        time.Time
@@ -101,13 +104,15 @@ func (repo *Repo) GetCloudLatest(context map[string]interface{}) (cloudLatest *e
 	lock.Lock()
 	defer lock.Unlock()
 
-	_, cloudLatest, err = repo.downloadCloudLatest(context)
+	_, _, cloudLatest, err = repo.downloadCloudLatest(context)
 	return
 }
 
 func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult, trafficStat *TrafficStat, err error) {
 	lock.Lock()
 	defer lock.Unlock()
+	unlockDeviceLocalFiles := repo.lockDeviceLocalSyncFiles()
+	defer unlockDeviceLocalFiles()
 
 	// 锁定云端，防止其他设备并发上传数据
 	err = repo.tryLockCloud(repo.DeviceID, context)
@@ -140,18 +145,23 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 		logging.LogErrorf("get latest failed: %s", err)
 		return
 	}
+	latest, _, err = repo.sanitizeStoredIndex(latest, "[Sync] Remove device-local files")
+	if nil != err {
+		logging.LogErrorf("sanitize latest failed: %s", err)
+		return
+	}
 
 	// 从云端获取最新索引
-	length, cloudLatest, err := repo.downloadCloudLatest(context)
+	length, latestAPIGet, cloudLatest, err := repo.downloadCloudLatest(context)
 	if nil != err {
 		if !errors.Is(err, cloud.ErrCloudObjectNotFound) {
 			logging.LogErrorf("download cloud latest failed: %s", err)
 			return
 		}
 	}
-	trafficStat.DownloadFileCount++
+	trafficStat.DownloadFileCount += latestAPIGet
 	trafficStat.DownloadBytes += length
-	trafficStat.APIGet++
+	trafficStat.APIGet += latestAPIGet
 
 	if cloudLatest.ID == latest.ID {
 		// 数据一致，直接返回
@@ -172,14 +182,15 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 	}
 
 	// 从云端下载缺失文件并入库
-	length, fetchedFiles, err := repo.downloadCloudFilesPut(fetchFileIDs, context)
-	if nil != err {
+	downloadResult, fetchedFiles := repo.downloadCloudFilesPutDetailed(fetchFileIDs, context)
+	trafficStat.DownloadBytes += downloadResult.bytes
+	trafficStat.DownloadFileCount += downloadResult.completed
+	trafficStat.APIGet += downloadResult.attempted
+	if nil != downloadResult.err {
+		err = downloadResult.err
 		logging.LogErrorf("download cloud files put failed: %s", err)
 		return
 	}
-	trafficStat.DownloadBytes += length
-	trafficStat.DownloadFileCount += len(fetchFileIDs)
-	trafficStat.APIGet += trafficStat.DownloadFileCount
 
 	// 执行数据同步
 	err = repo.sync0(context, fetchedFiles, cloudLatest, latest, mergeResult, trafficStat)
@@ -196,6 +207,27 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 func (repo *Repo) sync0(context map[string]interface{},
 	fetchedFiles []*entity.File, cloudLatest *entity.Index, latest *entity.Index, mergeResult *MergeResult, trafficStat *TrafficStat) (err error) {
 
+	// 获取云端普通文件列表（不包含懒加载文件）
+	cloudLatestFiles, err := repo.getFiles(cloudLatest.Files)
+	if nil != err {
+		logging.LogErrorf("get cloud latest files failed: %s", err)
+		return
+	}
+	cloudLazyFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
+	if nil != lazyErr {
+		logging.LogErrorf("get cloud lazy files failed: %s", lazyErr)
+		return lazyErr
+	}
+	var ignoredCloudDeviceLocalFiles bool
+	cloudLatest, ignoredCloudDeviceLocalFiles, err = repo.sanitizeIndexFiles(cloudLatest, cloudLatestFiles, cloudLazyFiles,
+		"[Sync] Remove device-local cloud files")
+	if nil != err {
+		logging.LogErrorf("sanitize cloud latest failed: %s", err)
+		return err
+	}
+	cloudLatestFiles, _ = repo.filterProtectedSyncFiles(cloudLatestFiles)
+	cloudLazyFiles, _ = repo.filterProtectedSyncFiles(cloudLazyFiles)
+
 	// 处理懒加载文件：只更新清单，不参与常规同步流程
 	if len(cloudLatest.LazyFiles) > 0 {
 		err = repo.updateLazyManifestFromCloudIndex(cloudLatest.LazyFiles, context)
@@ -205,65 +237,40 @@ func (repo *Repo) sync0(context map[string]interface{},
 		}
 	}
 
-	// 获取云端普通文件列表（不包含懒加载文件）
-	cloudLatestFiles, err := repo.getFiles(cloudLatest.Files)
-	if nil != err {
-		logging.LogErrorf("get cloud latest files failed: %s", err)
-		return
-	}
-
 	// 如果本地未启用懒加载，需要将云端的懒加载文件当作普通文件处理
 	if !repo.lazyLoadEnabled && len(cloudLatest.LazyFiles) > 0 {
-		lazyCloudFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
-		if nil != lazyErr {
-			logging.LogWarnf("get cloud lazy files as normal files failed: %s", lazyErr)
-			// 不中断流程，继续处理普通文件
-		} else {
-			cloudLatestFiles = append(cloudLatestFiles, lazyCloudFiles...)
-		}
+		cloudLatestFiles = append(cloudLatestFiles, cloudLazyFiles...)
 	}
 
 	// 所有文件都是普通文件（懒加载文件已单独处理）
 	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
 
-	waitGroup := sync.WaitGroup{}
-	waitGroup.Add(1)
-	var errs []error
-	go func() { // 从云端下载缺失分块并入库
-		defer waitGroup.Done()
-
+	transferTraffic, transferErr := runConcurrentSyncTransfers(func(ret *TrafficStat) error { // 从云端下载缺失分块并入库
 		fetchChunkIDs, downloadErr := repo.localNotFoundChunks(cloudChunkIDs)
 		if nil != downloadErr {
 			logging.LogErrorf("get local not found chunks failed: %s", downloadErr)
-			errs = append(errs, downloadErr)
-			return
+			return downloadErr
 		}
 
-		length, downloadErr := repo.downloadCloudChunksPut(fetchChunkIDs, context)
-		if nil != downloadErr {
-			logging.LogErrorf("download cloud chunks put failed: %s", downloadErr)
-			errs = append(errs, downloadErr)
-			return
+		downloadResult := repo.downloadCloudChunksPutDetailed(fetchChunkIDs, context)
+		ret.DownloadBytes = downloadResult.bytes
+		ret.DownloadChunkCount = downloadResult.completed
+		ret.APIGet = downloadResult.attempted
+		if nil != downloadResult.err {
+			logging.LogErrorf("download cloud chunks put failed: %s", downloadResult.err)
 		}
-		trafficStat.DownloadBytes += length
-		trafficStat.DownloadChunkCount += len(fetchChunkIDs)
-		trafficStat.APIGet += trafficStat.DownloadChunkCount
-	}()
-
-	waitGroup.Add(1)
-	go func() { // 上传差异数据
-		defer waitGroup.Done()
-
-		uploadErr := repo.uploadCloud(context, latest, cloudLatest, cloudChunkIDs, trafficStat)
+		return downloadResult.err
+	}, func(ret *TrafficStat) error { // 上传差异数据
+		uploadErr := repo.uploadCloud(context, latest, cloudLatest, cloudChunkIDs, ret)
 		if nil != uploadErr {
 			logging.LogErrorf("upload cloud failed: %s", uploadErr)
-			errs = append(errs, uploadErr)
-			return
+			return uploadErr
 		}
-	}()
-	waitGroup.Wait()
-	if 0 < len(errs) {
-		err = errs[0]
+		return nil
+	})
+	mergeTrafficStat(trafficStat, transferTraffic)
+	if nil != transferErr {
+		err = transferErr
 		return
 	}
 
@@ -281,6 +288,8 @@ func (repo *Repo) sync0(context map[string]interface{},
 		return
 	}
 	localUpserts, localRemoves := repo.diffUpsertRemove(latestFiles, latestSyncFiles, false)
+	localUpserts, _ = repo.filterProtectedSyncFiles(localUpserts)
+	localRemoves, _ = repo.filterProtectedSyncFiles(localRemoves)
 
 	latestFileMap := map[string]*entity.File{}
 	for _, file := range latestFiles {
@@ -309,7 +318,7 @@ func (repo *Repo) sync0(context map[string]interface{},
 
 	// 避免旧的本地数据覆盖云端数据 https://github.com/siyuan-note/siyuan/issues/7403
 	localUpserts = repo.filterLocalUpserts(localUpserts, cloudUpserts)
-	localChanged := 0 < len(localUpserts) || 0 < len(localRemoves)
+	localChanged := 0 < len(localUpserts) || 0 < len(localRemoves) || ignoredCloudDeviceLocalFiles
 
 	// 记录本地 syncignore 变更
 	var localUpsertIgnore *entity.File
@@ -430,6 +439,8 @@ func (repo *Repo) sync0(context map[string]interface{},
 	mergeResult.Removes = mergeResultRemovesTmp
 
 	// 冲突文件复制到数据历史文件夹
+	repo.filterProtectedMergeResult(mergeResult)
+	tmpMergeConflicts, _ = repo.filterProtectedSyncFiles(tmpMergeConflicts)
 	if 0 < len(tmpMergeConflicts) {
 		temp := filepath.Join(repo.TempPath, "repo", "sync", "conflicts", nowStr)
 		for i, file := range tmpMergeConflicts {
@@ -596,6 +607,7 @@ func (repo *Repo) checkoutTree(file *entity.File, checkoutDir string, luteEngine
 }
 
 func (repo *Repo) restoreFiles(mergeResult *MergeResult, context map[string]interface{}) (err error) {
+	repo.filterProtectedMergeResult(mergeResult)
 	err = repo.checkoutFiles(mergeResult.Upserts, context)
 	if nil != err {
 		logging.LogErrorf("checkout files failed: %s", err)
@@ -720,10 +732,7 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 		return
 	}
 
-	checkIndex := &entity.CheckIndex{ID: util.RandHash(), IndexID: latest.ID}
-	for _, file := range files {
-		checkIndex.Files = append(checkIndex.Files, &entity.CheckIndexFile{ID: file.ID, Chunks: file.Chunks})
-	}
+	checkIndex := buildCheckIndex(latest, files)
 
 	// 更新本地 latest 的关联的 checkIndexID，后续会将本地 latest 上传到云端
 	latest.CheckIndexID = checkIndex.ID
@@ -870,6 +879,164 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 	return
 }
 
+func buildCheckIndex(index *entity.Index, files []*entity.File) *entity.CheckIndex {
+	ret := &entity.CheckIndex{ID: util.RandHash(), IndexID: index.ID}
+	for _, file := range files {
+		ret.Files = append(ret.Files, &entity.CheckIndexFile{ID: file.ID, Chunks: file.Chunks})
+	}
+	return ret
+}
+
+type syncTransferTask func(traffic *TrafficStat) error
+
+type syncTransferResult struct {
+	traffic *TrafficStat
+	err     error
+}
+
+func runConcurrentSyncTransfers(download, upload syncTransferTask) (traffic *TrafficStat, err error) {
+	tasks := [2]syncTransferTask{download, upload}
+	results := [2]syncTransferResult{}
+	waitGroup := sync.WaitGroup{}
+	for i, task := range tasks {
+		results[i].traffic = &TrafficStat{m: &sync.Mutex{}}
+		waitGroup.Add(1)
+		go func(resultIndex int, run syncTransferTask) {
+			defer waitGroup.Done()
+			defer func() {
+				if recovered := recover(); nil != recovered {
+					results[resultIndex].err = concurrentTransferPanicError("sync transfer", recovered)
+				}
+			}()
+			results[resultIndex].err = run(results[resultIndex].traffic)
+		}(i, task)
+	}
+	waitGroup.Wait()
+
+	traffic = &TrafficStat{m: &sync.Mutex{}}
+	mergeTrafficStat(traffic, results[0].traffic)
+	mergeTrafficStat(traffic, results[1].traffic)
+	if nil != results[0].err {
+		return traffic, results[0].err
+	}
+	if nil != results[1].err {
+		return traffic, results[1].err
+	}
+	return traffic, nil
+}
+
+type concurrentObjectTransferResult struct {
+	bytes     int64
+	completed int
+	attempted int
+	err       error
+}
+
+type concurrentTransferState struct {
+	bytes     atomic.Int64
+	completed atomic.Int64
+	attempted atomic.Int64
+	errMu     sync.Mutex
+	err       error
+}
+
+func (state *concurrentTransferState) getErr() error {
+	state.errMu.Lock()
+	defer state.errMu.Unlock()
+	return state.err
+}
+
+func (state *concurrentTransferState) setErr(err error) {
+	state.errMu.Lock()
+	defer state.errMu.Unlock()
+	if nil == state.err {
+		state.err = err
+	}
+}
+
+func (state *concurrentTransferState) result() concurrentObjectTransferResult {
+	return concurrentObjectTransferResult{
+		bytes:     state.bytes.Load(),
+		completed: int(state.completed.Load()),
+		attempted: int(state.attempted.Load()),
+		err:       state.getErr(),
+	}
+}
+
+func concurrentTransferPanicError(objectType string, recovered interface{}) error {
+	if recoveredErr, ok := recovered.(error); ok {
+		return fmt.Errorf("%s worker panic: %w", objectType, recoveredErr)
+	}
+	return fmt.Errorf("%s worker panic: %v", objectType, recovered)
+}
+
+func runConcurrentObjectTransfers(ids []string, poolSize int, objectType string,
+	transfer func(id string, attempt int) (int64, error)) (ret concurrentObjectTransferResult) {
+	if 1 > len(ids) {
+		return
+	}
+	if poolSize > len(ids) {
+		poolSize = len(ids)
+	}
+
+	waitGroup := &sync.WaitGroup{}
+	state := &concurrentTransferState{}
+	pool, err := ants.NewPoolWithFunc(poolSize, func(arg interface{}) {
+		defer waitGroup.Done()
+		defer func() {
+			if recovered := recover(); nil != recovered {
+				state.setErr(concurrentTransferPanicError(objectType, recovered))
+			}
+		}()
+		if nil != state.getErr() {
+			return
+		}
+
+		attempt := int(state.attempted.Add(1))
+		length, transferErr := transfer(arg.(string), attempt)
+		if nil != transferErr {
+			state.setErr(transferErr)
+			return
+		}
+		state.bytes.Add(length)
+		state.completed.Add(1)
+	})
+	if nil != err {
+		ret.err = err
+		return
+	}
+	defer pool.Release()
+
+	for _, id := range ids {
+		if nil != state.getErr() {
+			break
+		}
+		waitGroup.Add(1)
+		if invokeErr := pool.Invoke(id); nil != invokeErr {
+			waitGroup.Done()
+			logging.LogErrorf("invoke failed: %s", invokeErr)
+			state.setErr(invokeErr)
+			break
+		}
+	}
+	waitGroup.Wait()
+	return state.result()
+}
+
+func mergeTrafficStat(target, delta *TrafficStat) {
+	if nil == target || nil == delta {
+		return
+	}
+	target.DownloadFileCount += delta.DownloadFileCount
+	target.DownloadChunkCount += delta.DownloadChunkCount
+	target.DownloadBytes += delta.DownloadBytes
+	target.UploadFileCount += delta.UploadFileCount
+	target.UploadChunkCount += delta.UploadChunkCount
+	target.UploadBytes += delta.UploadBytes
+	target.APIGet += delta.APIGet
+	target.APIPut += delta.APIPut
+}
+
 // filterLocalUpserts 避免旧的本地数据覆盖云端数据 https://github.com/siyuan-note/siyuan/issues/7403
 func (repo *Repo) filterLocalUpserts(localUpserts, cloudUpserts []*entity.File) (ret []*entity.File) {
 	cloudUpsertsMap := map[string]*entity.File{}
@@ -944,6 +1111,7 @@ func (repo *Repo) getSyncCloudFiles(cloudLatest *entity.Index, context map[strin
 		logging.LogErrorf("download cloud files put failed: %s", err)
 		return
 	}
+	fetchedFiles, _ = repo.filterProtectedSyncFiles(fetchedFiles)
 	trafficStat := &TrafficStat{m: &sync.Mutex{}}
 	trafficStat.DownloadBytes += length
 	trafficStat.DownloadFileCount += len(fetchFileIDs)
@@ -959,125 +1127,50 @@ func (repo *Repo) getSyncCloudFiles(cloudLatest *entity.Index, context map[strin
 }
 
 func (repo *Repo) downloadCloudChunksPut(chunkIDs []string, context map[string]interface{}) (downloadBytes int64, err error) {
-	if 1 > len(chunkIDs) {
-		return
-	}
+	result := repo.downloadCloudChunksPutDetailed(chunkIDs, context)
+	return result.bytes, result.err
+}
 
-	waitGroup := &sync.WaitGroup{}
-	var downloadErr error
-	poolSize := repo.cloud.GetConcurrentReqs()
-	if poolSize > len(chunkIDs) {
-		poolSize = len(chunkIDs)
-	}
-	count := atomic.Int32{}
-	dBytes := atomic.Int64{}
+func (repo *Repo) downloadCloudChunksPutDetailed(chunkIDs []string, context map[string]interface{}) concurrentObjectTransferResult {
 	total := len(chunkIDs)
-	p, err := ants.NewPoolWithFunc(poolSize, func(arg interface{}) {
-		defer waitGroup.Done()
-		if nil != downloadErr {
-			return // 快速失败
-		}
-
-		chunkID := arg.(string)
-		count.Add(1)
-		length, chunk, dccErr := repo.downloadCloudChunk(chunkID, int(count.Load()), total, context)
-		if nil != dccErr {
-			downloadErr = dccErr
-			return
-		}
-		if pcErr := repo.store.PutChunk(chunk); nil != pcErr {
-			downloadErr = pcErr
-			return
-		}
-		dBytes.Add(length)
-	})
-	if nil != err {
-		return
-	}
-
 	eventbus.Publish(eventbus.EvtCloudBeforeDownloadChunks, context, total)
-	for _, chunkID := range chunkIDs {
-		waitGroup.Add(1)
-		if err = p.Invoke(chunkID); nil != err {
-			logging.LogErrorf("invoke failed: %s", err)
-			return
-		}
-		if nil != downloadErr {
-			err = downloadErr
-			return
-		}
-	}
-	waitGroup.Wait()
-	p.Release()
-	downloadBytes = dBytes.Load()
-	if nil != downloadErr {
-		err = downloadErr
-		return
-	}
-	return
+	return runConcurrentObjectTransfers(chunkIDs, repo.cloud.GetConcurrentReqs(), "download chunk",
+		func(chunkID string, attempt int) (int64, error) {
+			length, chunk, dccErr := repo.downloadCloudChunk(chunkID, attempt, total, context)
+			if nil != dccErr {
+				return 0, dccErr
+			}
+			if pcErr := repo.store.PutChunk(chunk); nil != pcErr {
+				return 0, pcErr
+			}
+			return length, nil
+		})
 }
 
 func (repo *Repo) downloadCloudFilesPut(fileIDs []string, context map[string]interface{}) (downloadBytes int64, ret []*entity.File, err error) {
-	if 1 > len(fileIDs) {
-		return
-	}
+	result, ret := repo.downloadCloudFilesPutDetailed(fileIDs, context)
+	return result.bytes, ret, result.err
+}
 
-	lock := &sync.Mutex{}
-	waitGroup := &sync.WaitGroup{}
-	var downloadErr error
-	poolSize := repo.cloud.GetConcurrentReqs()
-	if poolSize > len(fileIDs) {
-		poolSize = len(fileIDs)
-	}
-	count := atomic.Int32{}
-	dBytes := atomic.Int64{}
+func (repo *Repo) downloadCloudFilesPutDetailed(fileIDs []string, context map[string]interface{}) (result concurrentObjectTransferResult, ret []*entity.File) {
+	retLock := &sync.Mutex{}
 	total := len(fileIDs)
-	p, err := ants.NewPoolWithFunc(poolSize, func(arg interface{}) {
-		defer waitGroup.Done()
-		if nil != downloadErr {
-			return // 快速失败
-		}
-
-		fileID := arg.(string)
-		count.Add(1)
-		length, file, dcfErr := repo.downloadCloudFile(fileID, int(count.Load()), total, context)
-		if nil != dcfErr {
-			downloadErr = dcfErr
-			return
-		}
-		if pfErr := repo.store.PutFile(file); nil != pfErr {
-			downloadErr = pfErr
-			return
-		}
-		dBytes.Add(length)
-
-		lock.Lock()
-		ret = append(ret, file)
-		lock.Unlock()
-	})
-	if nil != err {
-		return
-	}
-
 	eventbus.Publish(eventbus.EvtCloudBeforeDownloadFiles, context, total)
-	for _, fileID := range fileIDs {
-		waitGroup.Add(1)
-		if err = p.Invoke(fileID); nil != err {
-			logging.LogErrorf("invoke failed: %s", err)
-			return
-		}
-		if nil != downloadErr {
-			err = downloadErr
-			return
-		}
-	}
-	waitGroup.Wait()
-	p.Release()
-	downloadBytes = dBytes.Load()
-	if nil != downloadErr {
-		err = downloadErr
-		return
-	}
+	result = runConcurrentObjectTransfers(fileIDs, repo.cloud.GetConcurrentReqs(), "download file",
+		func(fileID string, attempt int) (int64, error) {
+			length, file, dcfErr := repo.downloadCloudFile(fileID, attempt, total, context)
+			if nil != dcfErr {
+				return 0, dcfErr
+			}
+			if pfErr := repo.store.PutFile(file); nil != pfErr {
+				return 0, pfErr
+			}
+
+			retLock.Lock()
+			ret = append(ret, file)
+			retLock.Unlock()
+			return length, nil
+		})
 	return
 }
 
@@ -1158,75 +1251,42 @@ func (repo *Repo) uploadCloudMissingObjects(trafficStat *TrafficStat, context ma
 		stillMissingObjects[missingObject] = true
 
 		absFilePath := filepath.Join(repo.Path, "objects", missingObject)
-		info, statErr := os.Stat(absFilePath)
+		_, statErr := os.Stat(absFilePath)
 		if nil != statErr {
 			// 本地没有该文件，忽略
 			logging.LogWarnf("cloud missing object [%s] not found: %s", missingObject, statErr)
 			continue
 		}
 
-		length := info.Size()
-		trafficStat.m.Lock()
-		trafficStat.UploadBytes += length
-		trafficStat.UploadFileCount++
-		trafficStat.m.Unlock()
 		missingObjects = append(missingObjects, missingObject)
 	}
 	missingObjects = gulu.Str.RemoveDuplicatedElem(missingObjects)
 
-	waitGroup := &sync.WaitGroup{}
-	var uploadErr error
-	poolSize := repo.cloud.GetConcurrentReqs()
-	if poolSize > len(missingObjects) {
-		poolSize = len(missingObjects)
-	}
-	count := atomic.Int32{}
 	total := len(missingObjects)
 	lock := sync.Mutex{}
-	p, err := ants.NewPoolWithFunc(poolSize, func(arg interface{}) {
-		defer waitGroup.Done()
-		if nil != uploadErr {
-			return // 快速失败
-		}
+	result := runConcurrentObjectTransfers(missingObjects, repo.cloud.GetConcurrentReqs(), "upload missing object",
+		func(objectPath string, attempt int) (int64, error) {
+			filePath := "objects/" + objectPath
+			eventbus.Publish(eventbus.EvtCloudBeforeFixObjects, context, attempt, total)
+			length, uoErr := repo.cloud.UploadObject(filePath, false)
+			if nil != uoErr {
+				logging.LogErrorf("upload cloud missing object [%s] failed: %s", filePath, uoErr)
+				return 0, uoErr
+			}
 
-		objectPath := arg.(string)
-		filePath := "objects/" + objectPath
-		count.Add(1)
-		eventbus.Publish(eventbus.EvtCloudBeforeFixObjects, context, int(count.Load()), total)
-		_, uoErr := repo.cloud.UploadObject(filePath, false)
-		if nil != uoErr {
-			uploadErr = uoErr
-			err = uploadErr
-			logging.LogErrorf("upload cloud missing object [%s] failed: %s", filePath, uploadErr)
-			return
-		}
-
-		lock.Lock()
-		delete(stillMissingObjects, objectPath)
-		lock.Unlock()
-		logging.LogInfof("uploaded cloud missing object [%s]", filePath)
-	})
-	if nil != err {
-		logging.LogWarnf("upload cloud missing objects failed: %s", err)
-		return
-	}
-
-	for _, missingObject := range missingObjects {
-		waitGroup.Add(1)
-		if err = p.Invoke(missingObject); nil != err {
-			logging.LogErrorf("invoke failed: %s", err)
-			return
-		}
-		if nil != uploadErr {
-			err = uploadErr
-			return
-		}
-	}
-	waitGroup.Wait()
-	p.Release()
-
-	if nil != err {
-		logging.LogWarnf("upload cloud missing objects failed: %s", err)
+			lock.Lock()
+			delete(stillMissingObjects, objectPath)
+			lock.Unlock()
+			logging.LogInfof("uploaded cloud missing object [%s]", filePath)
+			return length, nil
+		})
+	trafficStat.m.Lock()
+	trafficStat.UploadBytes += result.bytes
+	trafficStat.UploadFileCount += result.completed
+	trafficStat.APIPut += result.attempted
+	trafficStat.m.Unlock()
+	if nil != result.err {
+		logging.LogWarnf("upload cloud missing objects failed: %s", result.err)
 		return
 	}
 
@@ -1265,7 +1325,9 @@ func (repo *Repo) uploadCloudMissingObjects(trafficStat *TrafficStat, context ma
 }
 
 func (repo *Repo) updateCloudCheckIndex(checkIndex *entity.CheckIndex, context map[string]interface{}) (err error) {
-	if _, ok := repo.cloud.(*cloud.SiYuan); !ok {
+	switch repo.cloud.(type) {
+	case *cloud.SiYuan, *cloud.Local:
+	default:
 		// S3/WebDAV 不上传校验索引 S3/WebDAV data sync no longer uploads check index https://github.com/siyuan-note/siyuan/issues/10180
 		return
 	}
@@ -1377,111 +1439,47 @@ func (repo *Repo) uploadIndex(index *entity.Index, context map[string]interface{
 }
 
 func (repo *Repo) uploadFiles(upsertFiles []*entity.File, context map[string]interface{}) (uploadBytes int64, err error) {
-	if 1 > len(upsertFiles) {
-		return
-	}
+	result := repo.uploadFilesDetailed(upsertFiles, context)
+	return result.bytes, result.err
+}
 
-	waitGroup := &sync.WaitGroup{}
-	var uploadErr error
-	poolSize := repo.cloud.GetConcurrentReqs()
-	if poolSize > len(upsertFiles) {
-		poolSize = len(upsertFiles)
+func (repo *Repo) uploadFilesDetailed(upsertFiles []*entity.File, context map[string]interface{}) concurrentObjectTransferResult {
+	ids := make([]string, 0, len(upsertFiles))
+	for _, file := range upsertFiles {
+		ids = append(ids, file.ID)
 	}
-	count, uploadedCount := atomic.Int32{}, atomic.Int32{}
 	total := len(upsertFiles)
-	p, err := ants.NewPoolWithFunc(poolSize, func(arg interface{}) {
-		defer waitGroup.Done()
-		if nil != uploadErr {
-			return // 快速失败
-		}
-
-		upsertFileID := arg.(string)
-		filePath := path.Join("objects", upsertFileID[:2], upsertFileID[2:])
-		count.Add(1)
-		eventbus.Publish(eventbus.EvtCloudBeforeUploadFile, context, int(count.Load()), total)
-		length, uoErr := repo.cloud.UploadObject(filePath, false)
-		if nil != uoErr {
-			uploadErr = uoErr
-			err = uploadErr
-			return
-		}
-		uploadBytes += length
-		uploadedCount.Add(1)
-		//logging.LogInfof("uploaded file [%s, %d/%d]", filePath, int(uploadedCount.Load()), total)
-	})
-	if nil != err {
-		return
-	}
-
 	eventbus.Publish(eventbus.EvtCloudBeforeUploadFiles, context, total)
-	for _, upsertFile := range upsertFiles {
-		waitGroup.Add(1)
-		if err = p.Invoke(upsertFile.ID); nil != err {
-			logging.LogErrorf("invoke failed: %s", err)
-			return
-		}
-		if nil != uploadErr {
-			err = uploadErr
-			return
-		}
-	}
-	waitGroup.Wait()
-	p.Release()
-	return
+	return runConcurrentObjectTransfers(ids, repo.cloud.GetConcurrentReqs(), "upload file",
+		func(upsertFileID string, attempt int) (int64, error) {
+			filePath := path.Join("objects", upsertFileID[:2], upsertFileID[2:])
+			eventbus.Publish(eventbus.EvtCloudBeforeUploadFile, context, attempt, total)
+			length, uoErr := repo.cloud.UploadObject(filePath, false)
+			if nil != uoErr {
+				return 0, uoErr
+			}
+			return length, nil
+		})
 }
 
 func (repo *Repo) uploadChunks(upsertChunkIDs []string, context map[string]interface{}) (uploadBytes int64, err error) {
-	if 1 > len(upsertChunkIDs) {
-		return
-	}
+	result := repo.uploadChunksDetailed(upsertChunkIDs, context)
+	return result.bytes, result.err
+}
 
-	waitGroup := &sync.WaitGroup{}
-	var uploadErr error
-	poolSize := repo.cloud.GetConcurrentReqs()
-	if poolSize > len(upsertChunkIDs) {
-		poolSize = len(upsertChunkIDs)
-	}
-	count, uploadedCount := atomic.Int32{}, atomic.Int32{}
+func (repo *Repo) uploadChunksDetailed(upsertChunkIDs []string, context map[string]interface{}) concurrentObjectTransferResult {
 	total := len(upsertChunkIDs)
-	p, err := ants.NewPoolWithFunc(poolSize, func(arg interface{}) {
-		defer waitGroup.Done()
-		if nil != uploadErr {
-			return // 快速失败
-		}
-
-		upsertChunkID := arg.(string)
-		filePath := path.Join("objects", upsertChunkID[:2], upsertChunkID[2:])
-		count.Add(1)
-		eventbus.Publish(eventbus.EvtCloudBeforeUploadChunk, context, int(count.Load()), total)
-		length, uoErr := repo.cloud.UploadObject(filePath, false)
-		if nil != uoErr {
-			uploadErr = uoErr
-			err = uploadErr
-			return
-		}
-		uploadBytes += length
-		uploadedCount.Add(1)
-		//logging.LogInfof("uploaded chunk [%s, %d/%d]", filePath, int(uploadedCount.Load()), total)
-	})
-	if nil != err {
-		return
-	}
-
 	eventbus.Publish(eventbus.EvtCloudBeforeUploadChunks, context, total)
-	for _, upsertChunkID := range upsertChunkIDs {
-		waitGroup.Add(1)
-		if err = p.Invoke(upsertChunkID); nil != err {
-			logging.LogErrorf("invoke failed: %s", err)
-			return
-		}
-		if nil != uploadErr {
-			err = uploadErr
-			return
-		}
-	}
-	waitGroup.Wait()
-	p.Release()
-	return
+	return runConcurrentObjectTransfers(upsertChunkIDs, repo.cloud.GetConcurrentReqs(), "upload chunk",
+		func(upsertChunkID string, attempt int) (int64, error) {
+			filePath := path.Join("objects", upsertChunkID[:2], upsertChunkID[2:])
+			eventbus.Publish(eventbus.EvtCloudBeforeUploadChunk, context, attempt, total)
+			length, uoErr := repo.cloud.UploadObject(filePath, false)
+			if nil != uoErr {
+				return 0, uoErr
+			}
+			return length, nil
+		})
 }
 
 func (repo *Repo) localNotFoundChunks(chunkIDs []string) (ret []string, err error) {
@@ -1585,7 +1583,9 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 			return
 		}
 
-		ret = append(ret, file)
+		if !repo.isProtectedSyncPath(file.Path) {
+			ret = append(ret, file)
+		}
 	}
 	lazyFiles := map[string]bool{}
 	for _, file := range latest.LazyFiles {
@@ -1687,6 +1687,9 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 			}
 		}
 
+		if repo.isProtectedSyncPath(file.Path) {
+			continue
+		}
 		if !missingChunks {
 			includedLazy++
 			ret = append(ret, file)
@@ -1719,6 +1722,104 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 		logging.LogInfof("localUpsertFiles: skipped samples=%v", skippedSamples)
 	}
 	return
+}
+
+func (repo *Repo) lockDeviceLocalSyncFiles() func() {
+	refUsedPath := filepath.Join(repo.DataPath, "storage", "ref-used.json")
+	filelock.Lock(refUsedPath)
+	return func() {
+		filelock.Unlock(refUsedPath)
+	}
+}
+
+func (repo *Repo) resolveSyncPath(filePath string) (absPath string, safe bool) {
+	filePath = strings.ReplaceAll(filePath, "\\", "/")
+	filePath = strings.TrimLeft(filePath, "/")
+	absPath = filepath.Clean(filepath.Join(repo.DataPath, filepath.FromSlash(filePath)))
+	relPath, err := filepath.Rel(filepath.Clean(repo.DataPath), absPath)
+	if nil != err || "." == relPath || !filepath.IsLocal(relPath) {
+		return absPath, false
+	}
+	return absPath, true
+}
+
+func (repo *Repo) isProtectedSyncPath(filePath string) bool {
+	absPath, safe := repo.resolveSyncPath(filePath)
+	if !safe {
+		return true
+	}
+	refUsedPath := filepath.Join(repo.DataPath, "storage", "ref-used.json")
+	if "darwin" == runtime.GOOS || "windows" == runtime.GOOS {
+		return strings.EqualFold(refUsedPath, absPath)
+	}
+	return refUsedPath == absPath
+}
+
+func (repo *Repo) filterProtectedSyncFiles(files []*entity.File) (ret []*entity.File, filtered bool) {
+	for _, file := range files {
+		if nil != file && repo.isProtectedSyncPath(file.Path) {
+			filtered = true
+			continue
+		}
+		ret = append(ret, file)
+	}
+	return
+}
+
+func (repo *Repo) filterProtectedMergeResult(mergeResult *MergeResult) {
+	if nil == mergeResult {
+		return
+	}
+	mergeResult.Upserts, _ = repo.filterProtectedSyncFiles(mergeResult.Upserts)
+	mergeResult.Removes, _ = repo.filterProtectedSyncFiles(mergeResult.Removes)
+	mergeResult.Conflicts, _ = repo.filterProtectedSyncFiles(mergeResult.Conflicts)
+}
+
+func (repo *Repo) sanitizeStoredIndex(index *entity.Index, memo string) (ret *entity.Index, sanitized bool, err error) {
+	files, err := repo.getFiles(index.Files)
+	if nil != err {
+		return nil, false, err
+	}
+	lazyFiles, err := repo.getFiles(index.LazyFiles)
+	if nil != err {
+		return nil, false, err
+	}
+	ret, sanitized, err = repo.sanitizeIndexFiles(index, files, lazyFiles, memo)
+	if nil != err || !sanitized {
+		return
+	}
+	err = repo.UpdateLatest(ret)
+	return
+}
+
+func (repo *Repo) sanitizeIndexFiles(index *entity.Index, files, lazyFiles []*entity.File, memo string) (ret *entity.Index, sanitized bool, err error) {
+	filteredFiles, filesFiltered := repo.filterProtectedSyncFiles(files)
+	filteredLazyFiles, lazyFilesFiltered := repo.filterProtectedSyncFiles(lazyFiles)
+	if !filesFiltered && !lazyFilesFiltered {
+		return index, false, nil
+	}
+
+	cleaned := *index
+	cleaned.ID = util.RandHash()
+	cleaned.Memo = memo
+	cleaned.Created = time.Now().UnixMilli()
+	cleaned.CheckIndexID = ""
+	cleaned.Files = make([]string, 0, len(filteredFiles))
+	cleaned.LazyFiles = make([]string, 0, len(filteredLazyFiles))
+	cleaned.Size = 0
+	for _, file := range filteredFiles {
+		cleaned.Files = append(cleaned.Files, file.ID)
+		cleaned.Size += file.Size
+	}
+	for _, file := range filteredLazyFiles {
+		cleaned.LazyFiles = append(cleaned.LazyFiles, file.ID)
+		cleaned.Size += file.Size
+	}
+	cleaned.Count = len(cleaned.Files)
+	if err = repo.store.PutIndex(&cleaned); nil != err {
+		return nil, false, err
+	}
+	return &cleaned, true, nil
 }
 
 func (repo *Repo) UpdateLatestSync(index *entity.Index) (err error) {
@@ -1770,27 +1871,29 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 	logging.LogInfof("uploadCloud: upsert chunks=%d", len(upsertChunkIDs))
 
 	// 上传分块
-	length, err := repo.uploadChunks(upsertChunkIDs, context)
-	if nil != err {
+	uploadResult := repo.uploadChunksDetailed(upsertChunkIDs, context)
+	trafficStat.UploadChunkCount += uploadResult.completed
+	trafficStat.UploadBytes += uploadResult.bytes
+	trafficStat.APIPut += uploadResult.attempted
+	if nil != uploadResult.err {
+		err = uploadResult.err
 		logging.LogErrorf("upload chunks failed: %s", err)
 		return
 	}
-	trafficStat.UploadChunkCount += len(upsertChunkIDs)
-	trafficStat.UploadBytes += length
-	trafficStat.APIPut += trafficStat.UploadChunkCount
-	logging.LogInfof("uploadCloud: uploaded chunks=%d bytes=%d", len(upsertChunkIDs), length)
+	logging.LogInfof("uploadCloud: uploaded chunks=%d bytes=%d", uploadResult.completed, uploadResult.bytes)
 
 	// 上传文件
-	length, err = repo.uploadFiles(upsertFiles, context)
-	if nil != err {
+	uploadResult = repo.uploadFilesDetailed(upsertFiles, context)
+	trafficStat.UploadFileCount += uploadResult.completed
+	trafficStat.UploadBytes += uploadResult.bytes
+	trafficStat.APIPut += uploadResult.attempted
+	if nil != uploadResult.err {
+		err = uploadResult.err
 		logging.LogErrorf("upload files failed: %s", err)
 		return
 	}
-	trafficStat.UploadFileCount += len(upsertFiles)
-	trafficStat.UploadBytes += length
-	trafficStat.APIPut += trafficStat.UploadFileCount
 	logging.LogInfof("uploadCloud: uploaded files=%d lazy=%d bytes=%d cost=%s",
-		len(upsertFiles), upsertLazyFiles, length, time.Since(start))
+		uploadResult.completed, upsertLazyFiles, uploadResult.bytes, time.Since(start))
 	return
 }
 
@@ -1916,12 +2019,13 @@ func (repo *Repo) downloadCloudIndex(id string, context map[string]interface{}) 
 	return
 }
 
-func (repo *Repo) downloadCloudLatest(context map[string]interface{}) (downloadBytes int64, index *entity.Index, err error) {
+func (repo *Repo) downloadCloudLatest(context map[string]interface{}) (downloadBytes int64, apiGets int, index *entity.Index, err error) {
 	start := time.Now()
 	index = &entity.Index{}
 
 	key := path.Join("refs", "latest")
 	eventbus.Publish(eventbus.EvtCloudBeforeDownloadRef, context, "refs/latest")
+	apiGets++
 	data, err := repo.downloadCloudObject(key)
 	if nil != err {
 		if errors.Is(err, cloud.ErrCloudObjectNotFound) {
@@ -1942,6 +2046,7 @@ func (repo *Repo) downloadCloudLatest(context map[string]interface{}) (downloadB
 	}
 
 	isS3OrSiYuan := repo.isCloudS3() || repo.isCloudSiYuan()
+	apiGets++
 	waitGroup := sync.WaitGroup{}
 	waitGroup.Add(1)
 	go func() {
@@ -1965,6 +2070,7 @@ func (repo *Repo) downloadCloudLatest(context map[string]interface{}) (downloadB
 	if isS3OrSiYuan && ("" != seqNumLatestID && "" != index.ID && latestID != seqNumLatestID) {
 		logging.LogWarnf("cloud latest [%s] not match seq num latest [%s]", latestID, seqNumLatestID)
 		// 以时间较新的为准
+		apiGets++
 		_, seqNumLatest, downloadErr := repo.downloadCloudIndex(seqNumLatestID, context)
 		if nil != downloadErr {
 			logging.LogWarnf("download seq num latest [%s] failed: %s", seqNumLatestID, downloadErr)
@@ -2038,6 +2144,7 @@ func (repo *Repo) getHistoryDirNow(now, suffix string) (ret string, err error) {
 
 func (repo *Repo) CheckoutFilesFromCloud(files []*entity.File, context map[string]interface{}) (stat *DownloadTrafficStat, err error) {
 	stat = &DownloadTrafficStat{}
+	files, _ = repo.filterProtectedSyncFiles(files)
 
 	chunkIDs := repo.getChunks(files)
 	chunkIDs, err = repo.localNotFoundChunks(chunkIDs)
@@ -2045,11 +2152,13 @@ func (repo *Repo) CheckoutFilesFromCloud(files []*entity.File, context map[strin
 		return
 	}
 
-	stat.DownloadBytes, err = repo.downloadCloudChunksPut(chunkIDs, context)
-	if nil != err {
+	downloadResult := repo.downloadCloudChunksPutDetailed(chunkIDs, context)
+	stat.DownloadBytes = downloadResult.bytes
+	stat.DownloadChunkCount = downloadResult.completed
+	if nil != downloadResult.err {
+		err = downloadResult.err
 		return
 	}
-	stat.DownloadChunkCount += len(chunkIDs)
 
 	err = repo.checkoutFiles(files, context)
 	return

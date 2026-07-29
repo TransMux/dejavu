@@ -27,7 +27,6 @@ import (
 	"github.com/88250/gulu"
 	"github.com/siyuan-note/dejavu/entity"
 	"github.com/siyuan-note/encryption"
-	"github.com/siyuan-note/eventbus"
 )
 
 const (
@@ -48,7 +47,6 @@ var (
 
 func TestIndexEmpty(t *testing.T) {
 	clearTestdata(t)
-	subscribeEvents(t)
 
 	aesKey, err := encryption.KDF(testRepoPassword, testRepoPasswordSalt)
 	if nil != err {
@@ -74,7 +72,6 @@ func TestIndexEmpty(t *testing.T) {
 
 func TestPurge(t *testing.T) {
 	clearTestdata(t)
-	subscribeEvents(t)
 
 	repo, _ := initIndex(t)
 	stat, err := repo.Purge(context.Background())
@@ -88,7 +85,6 @@ func TestPurge(t *testing.T) {
 
 func TestIndexCheckout(t *testing.T) {
 	clearTestdata(t)
-	subscribeEvents(t)
 
 	repo, index := initIndex(t)
 	index2, err := repo.Index("Index 2", true, map[string]interface{}{})
@@ -121,7 +117,6 @@ func TestIndexCheckout(t *testing.T) {
 
 func TestSearchFile(t *testing.T) {
 	clearTestdata(t)
-	subscribeEvents(t)
 
 	repo, _ := initIndex(t)
 
@@ -147,46 +142,6 @@ func clearTestdata(t *testing.T) {
 		t.Fatalf("remove failed: %s", err)
 		return
 	}
-}
-
-func subscribeEvents(t *testing.T) {
-	eventbus.Subscribe(eventbus.EvtIndexBeforeWalkData, func(context map[string]interface{}, path string) {
-		t.Logf("[%s]: [%s]", eventbus.EvtIndexBeforeWalkData, path)
-	})
-	eventbus.Subscribe(eventbus.EvtIndexWalkData, func(context map[string]interface{}, path string) {
-		t.Logf("[%s]: [%s]", eventbus.EvtIndexWalkData, path)
-	})
-	eventbus.Subscribe(eventbus.EvtIndexBeforeGetLatestFiles, func(context map[string]interface{}, total int) {
-		t.Logf("[%s]: [%v/%v]", eventbus.EvtIndexBeforeGetLatestFiles, 0, total)
-	})
-	eventbus.Subscribe(eventbus.EvtIndexGetLatestFile, func(context map[string]interface{}, count int, total int) {
-		t.Logf("[%s]: [%v/%v]", eventbus.EvtIndexGetLatestFile, count, total)
-	})
-	eventbus.Subscribe(eventbus.EvtIndexUpsertFiles, func(context map[string]interface{}, total int) {
-		t.Logf("[%s]: [%v/%v]", eventbus.EvtIndexUpsertFiles, 0, total)
-	})
-	eventbus.Subscribe(eventbus.EvtIndexUpsertFile, func(context map[string]interface{}, count int, total int) {
-		t.Logf("[%s]: [%v/%v]", eventbus.EvtIndexUpsertFile, count, total)
-	})
-
-	eventbus.Subscribe(eventbus.EvtCheckoutBeforeWalkData, func(context map[string]interface{}, path string) {
-		t.Logf("[%s]: [%s]", eventbus.EvtCheckoutBeforeWalkData, path)
-	})
-	eventbus.Subscribe(eventbus.EvtCheckoutWalkData, func(context map[string]interface{}, path string) {
-		t.Logf("[%s]: [%s]", eventbus.EvtCheckoutWalkData, path)
-	})
-	eventbus.Subscribe(eventbus.EvtCheckoutUpsertFiles, func(context map[string]interface{}, total int) {
-		t.Logf("[%s]: [%d/%d]", eventbus.EvtCheckoutUpsertFiles, 0, total)
-	})
-	eventbus.Subscribe(eventbus.EvtCheckoutUpsertFile, func(context map[string]interface{}, count, total int) {
-		t.Logf("[%s]: [%d/%d]", eventbus.EvtCheckoutUpsertFile, count, total)
-	})
-	eventbus.Subscribe(eventbus.EvtCheckoutRemoveFiles, func(context map[string]interface{}, total int) {
-		t.Logf("[%s]: [%d/%d]", eventbus.EvtCheckoutRemoveFiles, 0, total)
-	})
-	eventbus.Subscribe(eventbus.EvtCheckoutRemoveFile, func(context map[string]interface{}, count, total int) {
-		t.Logf("[%s]: [%d/%d]", eventbus.EvtCheckoutRemoveFile, count, total)
-	})
 }
 
 func initIndex(t *testing.T) (repo *Repo, index *entity.Index) {

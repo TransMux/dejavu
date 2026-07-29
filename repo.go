@@ -26,6 +26,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -492,6 +493,8 @@ func (repo *Repo) Checkout(id string, context map[string]interface{}) (upserts, 
 	latestFiles = append(latestFiles, lazyFiles...)
 
 	upserts, removes = repo.diffUpsertRemove(latestFiles, files, false)
+	upserts, _ = repo.filterProtectedSyncFiles(upserts)
+	removes, _ = repo.filterProtectedSyncFiles(removes)
 	if 1 > len(upserts) && 1 > len(removes) {
 		return
 	}
@@ -501,15 +504,7 @@ func (repo *Repo) Checkout(id string, context map[string]interface{}) (upserts, 
 		return
 	}
 
-	total := len(removes)
-	eventbus.Publish(eventbus.EvtCheckoutRemoveFiles, context, total)
-	for i, f := range removes {
-		absPath := repo.absPath(f.Path)
-		if err = filelock.Remove(absPath); nil != err {
-			return
-		}
-		eventbus.Publish(eventbus.EvtCheckoutRemoveFile, context, i+1, total)
-	}
+	err = repo.removeFiles(removes, context)
 	return
 }
 
@@ -1366,7 +1361,10 @@ func (repo *Repo) builtInIgnore(info os.FileInfo, absPath string) (ignored bool,
 			// 数据同步忽略最近文档存储 https://github.com/siyuan-note/siyuan/issues/7246
 			return true, nil
 		}
-		if strings.HasSuffix(slashAbsPath, "data/storage/ref-used.json") {
+		refUsedPath := filepath.Join(repo.DataPath, "storage", "ref-used.json")
+		cleanAbsPath := filepath.Clean(absPath)
+		if cleanAbsPath == refUsedPath || (("darwin" == runtime.GOOS || "windows" == runtime.GOOS) &&
+			strings.EqualFold(cleanAbsPath, refUsedPath)) {
 			// 数据同步忽略最近引用存储 https://github.com/siyuan-note/siyuan/issues/16468
 			return true, nil
 		}
@@ -1601,6 +1599,7 @@ func (repo *Repo) openFile(file *entity.File) (ret []byte, err error) {
 }
 
 func (repo *Repo) removeFiles(files []*entity.File, context map[string]interface{}) (err error) {
+	files, _ = repo.filterProtectedSyncFiles(files)
 	total := len(files)
 	if 1 > total {
 		return
@@ -1618,6 +1617,7 @@ func (repo *Repo) removeFiles(files []*entity.File, context map[string]interface
 }
 
 func (repo *Repo) checkoutFiles(files []*entity.File, context map[string]interface{}) (err error) {
+	files, _ = repo.filterProtectedSyncFiles(files)
 	if 1 > len(files) {
 		return
 	}
