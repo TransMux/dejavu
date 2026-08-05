@@ -143,7 +143,10 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 	downloadResult = repo.downloadCloudChunksPutDetailed(fetchChunkIDs, context)
 	trafficStat.DownloadBytes += downloadResult.bytes
 	trafficStat.DownloadChunkCount += downloadResult.completed
-	trafficStat.APIGet += downloadResult.attempted
+	trafficStat.APIGet += downloadResult.attempted - downloadResult.peerCount
+	trafficStat.PeerDownloadBytes += downloadResult.peerBytes
+	trafficStat.PeerDownloadChunkCount += downloadResult.peerCount
+	trafficStat.PeerFallbackCount += downloadResult.peerFallbackCount
 	if nil != downloadResult.err {
 		err = downloadResult.err
 		logging.LogErrorf("download cloud chunks put failed: %s", err)

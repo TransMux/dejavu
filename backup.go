@@ -64,7 +64,7 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 
 	// 处理普通文件和懒加载文件
 	var normalFiles, lazyFiles []string
-	
+
 	// 处理index.Files中的普通文件
 	allFiles, err := repo.getFiles(index.Files)
 	if nil != err {
@@ -80,7 +80,7 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 			normalFiles = append(normalFiles, file.ID)
 		}
 	}
-	
+
 	// 处理index.LazyFiles（无论本地是否启用懒加载都需要处理）
 	if len(index.LazyFiles) > 0 {
 		if repo.lazyLoadEnabled {
@@ -120,8 +120,9 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 	}
 
 	// 从云端获取分块并入库（只下载普通文件的chunks）
-	length, err = repo.downloadCloudChunksPut(fetchChunkIDs, context)
-	downloadBytes += length
+	downloadStat, downloadErr := repo.downloadCloudChunksPut(fetchChunkIDs, context)
+	err = downloadErr
+	downloadBytes += downloadStat.CloudBytes
 	downloadChunkCount = len(fetchChunkIDs)
 	apiGet += downloadChunkCount
 
@@ -132,7 +133,7 @@ func (repo *Repo) downloadIndex(id string, context map[string]interface{}) (down
 			logging.LogErrorf("get lazy files failed: %s", lazyErr)
 			return 0, 0, 0, lazyErr
 		}
-		
+
 		// 更新懒加载清单但不下载chunks
 		if updateErr := repo.updateLazyManifest(lazyFileObjs); updateErr != nil {
 			logging.LogErrorf("update lazy manifest failed: %s", updateErr)
@@ -209,7 +210,7 @@ func (repo *Repo) uploadTagIndex(tag, id string, context map[string]interface{})
 
 	// 计算云端缺失的文件（包括普通文件和懒加载文件）
 	var uploadFiles []*entity.File
-	
+
 	// 处理普通文件
 	for _, localFileID := range index.Files {
 		if !gulu.Str.Contains(localFileID, cloudFileIDs) {
@@ -222,7 +223,7 @@ func (repo *Repo) uploadTagIndex(tag, id string, context map[string]interface{})
 			uploadFiles = append(uploadFiles, uploadFile)
 		}
 	}
-	
+
 	// 处理懒加载文件
 	for _, lazyFileID := range index.LazyFiles {
 		if !gulu.Str.Contains(lazyFileID, cloudFileIDs) {

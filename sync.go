@@ -68,9 +68,12 @@ func (mr *MergeResult) DataChanged() bool {
 }
 
 type DownloadTrafficStat struct {
-	DownloadFileCount  int
-	DownloadChunkCount int
-	DownloadBytes      int64
+	DownloadFileCount      int
+	DownloadChunkCount     int
+	DownloadBytes          int64
+	PeerDownloadChunkCount int
+	PeerDownloadBytes      int64
+	PeerFallbackCount      int
 }
 
 type UploadTrafficStat struct {
@@ -113,6 +116,44 @@ func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult
 	defer lock.Unlock()
 	unlockDeviceLocalFiles := repo.lockDeviceLocalSyncFiles()
 	defer unlockDeviceLocalFiles()
+	var preflightTraffic *TrafficStat
+
+	skipCloudPreflight := false
+	if nil != context {
+		skipCloudPreflight, _ = context["skipCloudPreflight"].(bool)
+	}
+	if !skipCloudPreflight {
+		mergeResult = &MergeResult{Time: time.Now()}
+		preflightTraffic = &TrafficStat{m: &sync.Mutex{}}
+		trafficStat = preflightTraffic
+		latest, latestErr := repo.Latest()
+		if nil != latestErr {
+			logging.LogErrorf("get latest failed: %s", latestErr)
+			err = latestErr
+			return
+		}
+		latest, _, latestErr = repo.sanitizeStoredIndex(latest, "[Sync Preflight] Remove device-local files")
+		if nil != latestErr {
+			logging.LogErrorf("sanitize latest failed: %s", latestErr)
+			err = latestErr
+			return
+		}
+		length, latestAPIGet, cloudLatest, latestErr := repo.downloadCloudLatest(context)
+		if nil != latestErr {
+			if !errors.Is(latestErr, cloud.ErrCloudObjectNotFound) {
+				logging.LogErrorf("download cloud latest failed: %s", latestErr)
+				err = latestErr
+				return
+			}
+		}
+		trafficStat.DownloadFileCount += latestAPIGet
+		trafficStat.DownloadBytes += length
+		trafficStat.APIGet += latestAPIGet
+		if cloudLatest.ID == latest.ID {
+			// 数据一致时不获取云端锁，减少无变更同步的远程请求。
+			return
+		}
+	}
 
 	// 锁定云端，防止其他设备并发上传数据
 	err = repo.tryLockCloud(repo.DeviceID, context)
@@ -122,6 +163,7 @@ func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult
 	defer repo.unlockCloud(context)
 
 	mergeResult, trafficStat, err = repo.sync(context)
+	mergeTrafficStat(trafficStat, preflightTraffic)
 	if e, ok := err.(*os.PathError); ok && isNoSuchFileOrDirErr(err) {
 		p := e.Path
 		if !strings.Contains(p, "objects") {
@@ -255,7 +297,10 @@ func (repo *Repo) sync0(context map[string]interface{},
 		downloadResult := repo.downloadCloudChunksPutDetailed(fetchChunkIDs, context)
 		ret.DownloadBytes = downloadResult.bytes
 		ret.DownloadChunkCount = downloadResult.completed
-		ret.APIGet = downloadResult.attempted
+		ret.APIGet = downloadResult.attempted - downloadResult.peerCount
+		ret.PeerDownloadBytes = downloadResult.peerBytes
+		ret.PeerDownloadChunkCount = downloadResult.peerCount
+		ret.PeerFallbackCount = downloadResult.peerFallbackCount
 		if nil != downloadResult.err {
 			logging.LogErrorf("download cloud chunks put failed: %s", downloadResult.err)
 		}
@@ -319,6 +364,24 @@ func (repo *Repo) sync0(context map[string]interface{},
 	// 避免旧的本地数据覆盖云端数据 https://github.com/siyuan-note/siyuan/issues/7403
 	localUpserts = repo.filterLocalUpserts(localUpserts, cloudUpserts)
 	localChanged := 0 < len(localUpserts) || 0 < len(localRemoves) || ignoredCloudDeviceLocalFiles
+	localUpsertsByID := map[string]*entity.File{}
+	localUpsertsByPath := map[string]*entity.File{}
+	for _, localUpsert := range localUpserts {
+		localUpsertsByID[localUpsert.ID] = localUpsert
+		localUpsertsByPath[localUpsert.Path] = localUpsert
+	}
+	localRemovesByID := map[string]*entity.File{}
+	localRemovesByPath := map[string]*entity.File{}
+	for _, localRemove := range localRemoves {
+		localRemovesByID[localRemove.ID] = localRemove
+		localRemovesByPath[localRemove.Path] = localRemove
+	}
+	latestSyncFilesByID := map[string]*entity.File{}
+	latestSyncFilesByPath := map[string]*entity.File{}
+	for _, latestSyncFile := range latestSyncFiles {
+		latestSyncFilesByID[latestSyncFile.ID] = latestSyncFile
+		latestSyncFilesByPath[latestSyncFile.Path] = latestSyncFile
+	}
 
 	// 记录本地 syncignore 变更
 	var localUpsertIgnore *entity.File
@@ -329,9 +392,9 @@ func (repo *Repo) sync0(context map[string]interface{},
 		}
 	}
 
-	var fetchedFileIDs []string
+	fetchedFileIDs := map[string]bool{}
 	for _, fetchedFile := range fetchedFiles {
-		fetchedFileIDs = append(fetchedFileIDs, fetchedFile.ID)
+		fetchedFileIDs[fetchedFile.ID] = true
 	}
 
 	nowStr := mergeResult.Time.Format("2006-01-02-150405")
@@ -345,7 +408,11 @@ func (repo *Repo) sync0(context map[string]interface{},
 			cloudUpsertIgnore = cloudUpsert
 		}
 
-		if localUpsert := repo.getFile(localUpserts, cloudUpsert); nil != localUpsert { // 相同的文件本地发生了变更
+		localUpsert := localUpsertsByPath[cloudUpsert.Path]
+		if nil == localUpsert {
+			localUpsert = localUpsertsByID[cloudUpsert.ID]
+		}
+		if nil != localUpsert { // 相同的文件本地发生了变更
 			if "/.siyuan/lazy_manifest.json" == cloudUpsert.Path {
 				if mergeErr := repo.mergeLazyManifestFile(localUpsert, cloudUpsert, context); nil == mergeErr {
 					mergeResult.MergedLazyManifest = true
@@ -359,10 +426,14 @@ func (repo *Repo) sync0(context map[string]interface{},
 			// 无论是否发生实际下载文件，都需要生成本地历史，以确保任何情况下都能够通过数据历史恢复文件
 			tmpMergeConflicts = append(tmpMergeConflicts, cloudUpsert)
 
-			if gulu.Str.Contains(cloudUpsert.ID, fetchedFileIDs) {
+			if fetchedFileIDs[cloudUpsert.ID] {
 				// 发生实际下载文件的情况，尝试解决冲突
 
-				if repo.ignoreLocalUpsert(localUpsert, latestSyncFiles, nowStr, context) {
+				latestSyncFile := latestSyncFilesByPath[localUpsert.Path]
+				if nil == latestSyncFile {
+					latestSyncFile = latestSyncFilesByID[localUpsert.ID]
+				}
+				if repo.ignoreLocalUpsert(localUpsert, latestSyncFile, nowStr, context) {
 					// 如果能忽略本地变更的话则不算做冲突，进行正常合并
 					mergeResult.Upserts = append(mergeResult.Upserts, cloudUpsert)
 					logging.LogInfof("sync merge upsert [%s, %s, %s]", cloudUpsert.ID, cloudUpsert.Path, time.UnixMilli(cloudUpsert.Updated).Format("2006-01-02 15:04:05"))
@@ -376,7 +447,11 @@ func (repo *Repo) sync0(context map[string]interface{},
 			continue
 		}
 
-		if nil == repo.getFile(localRemoves, cloudUpsert) {
+		localRemove := localRemovesByPath[cloudUpsert.Path]
+		if nil == localRemove {
+			localRemove = localRemovesByID[cloudUpsert.ID]
+		}
+		if nil == localRemove {
 			if strings.HasSuffix(cloudUpsert.Path, ".tmp") {
 				// 数据仓库不迁出 `.tmp` 临时文件 https://github.com/siyuan-note/siyuan/issues/7087
 				logging.LogWarnf("ignored tmp file [%s]", cloudUpsert.Path)
@@ -398,7 +473,11 @@ func (repo *Repo) sync0(context map[string]interface{},
 
 	// 计算能够无冲突合并的 remove，冲突的文件以本地 upsert 为准
 	for _, cloudRemove := range cloudRemoves {
-		if nil == repo.getFile(localUpserts, cloudRemove) {
+		localUpsert := localUpsertsByPath[cloudRemove.Path]
+		if nil == localUpsert {
+			localUpsert = localUpsertsByID[cloudRemove.ID]
+		}
+		if nil == localUpsert {
 			mergeResult.Removes = append(mergeResult.Removes, cloudRemove)
 		}
 	}
@@ -494,12 +573,11 @@ func (repo *Repo) sync0(context map[string]interface{},
 	return
 }
 
-func (repo *Repo) ignoreLocalUpsert(localUpsert *entity.File, latestSyncFiles []*entity.File, now string, context map[string]interface{}) bool {
+func (repo *Repo) ignoreLocalUpsert(localUpsert, latestSyncFile *entity.File, now string, context map[string]interface{}) bool {
 	if !strings.HasSuffix(localUpsert.Path, ".sy") {
 		return false // 非 .sy 文件目前不做内容对比，直接认为本地 upsert 是最新的
 	}
 
-	latestSyncFile := repo.getFile(latestSyncFiles, localUpsert)
 	if nil == latestSyncFile {
 		return false // 本地 upsert 是新增的文件
 	}
@@ -926,10 +1004,13 @@ func runConcurrentSyncTransfers(download, upload syncTransferTask) (traffic *Tra
 }
 
 type concurrentObjectTransferResult struct {
-	bytes     int64
-	completed int
-	attempted int
-	err       error
+	bytes             int64
+	completed         int
+	attempted         int
+	peerBytes         int64
+	peerCount         int
+	peerFallbackCount int
+	err               error
 }
 
 type concurrentTransferState struct {
@@ -1030,6 +1111,9 @@ func mergeTrafficStat(target, delta *TrafficStat) {
 	target.DownloadFileCount += delta.DownloadFileCount
 	target.DownloadChunkCount += delta.DownloadChunkCount
 	target.DownloadBytes += delta.DownloadBytes
+	target.PeerDownloadChunkCount += delta.PeerDownloadChunkCount
+	target.PeerDownloadBytes += delta.PeerDownloadBytes
+	target.PeerFallbackCount += delta.PeerFallbackCount
 	target.UploadFileCount += delta.UploadFileCount
 	target.UploadChunkCount += delta.UploadChunkCount
 	target.UploadBytes += delta.UploadBytes
@@ -1044,11 +1128,11 @@ func (repo *Repo) filterLocalUpserts(localUpserts, cloudUpserts []*entity.File) 
 		cloudUpsertsMap[cloudUpsert.Path] = cloudUpsert
 	}
 
-	var toRemoveLocalUpsertPaths []string
+	toRemoveLocalUpsertPaths := map[string]bool{}
 	for _, localUpsert := range localUpserts {
 		if cloudUpsert := cloudUpsertsMap[localUpsert.Path]; nil != cloudUpsert {
 			if localUpsert.Updated < cloudUpsert.Updated-1000*60*7 { // 本地早于云端 7 分钟
-				toRemoveLocalUpsertPaths = append(toRemoveLocalUpsertPaths, localUpsert.Path) // 使用云端数据覆盖本地数据
+				toRemoveLocalUpsertPaths[localUpsert.Path] = true // 使用云端数据覆盖本地数据
 				logging.LogWarnf("ignored local upsert [%s, %s, %s] because it is older than cloud upsert [%s, %s, %s]",
 					localUpsert.ID, localUpsert.Path, time.UnixMilli(localUpsert.Updated).Format("2006-01-02 15:04:05"),
 					cloudUpsert.ID, cloudUpsert.Path, time.UnixMilli(cloudUpsert.Updated).Format("2006-01-02 15:04:05"))
@@ -1057,7 +1141,7 @@ func (repo *Repo) filterLocalUpserts(localUpserts, cloudUpserts []*entity.File) 
 	}
 
 	for _, localUpsert := range localUpserts {
-		if !gulu.Str.Contains(localUpsert.Path, toRemoveLocalUpsertPaths) {
+		if !toRemoveLocalUpsertPaths[localUpsert.Path] {
 			ret = append(ret, localUpsert)
 		}
 	}
@@ -1126,25 +1210,90 @@ func (repo *Repo) getSyncCloudFiles(cloudLatest *entity.Index, context map[strin
 	return
 }
 
-func (repo *Repo) downloadCloudChunksPut(chunkIDs []string, context map[string]interface{}) (downloadBytes int64, err error) {
+func (repo *Repo) downloadCloudChunksPut(chunkIDs []string, context map[string]interface{}) (stat *chunkDownloadStat, err error) {
 	result := repo.downloadCloudChunksPutDetailed(chunkIDs, context)
-	return result.bytes, result.err
+	stat = &chunkDownloadStat{
+		CloudBytes:        result.bytes,
+		PeerBytes:         result.peerBytes,
+		PeerCount:         result.peerCount,
+		PeerFallbackCount: result.peerFallbackCount,
+	}
+	return stat, result.err
 }
 
 func (repo *Repo) downloadCloudChunksPutDetailed(chunkIDs []string, context map[string]interface{}) concurrentObjectTransferResult {
+	if 1 > len(chunkIDs) {
+		return concurrentObjectTransferResult{}
+	}
+
+	peerChunks := map[string]bool{}
+	if nil != repo.chunkSource {
+		if found, hasErr := repo.chunkSource.HasChunks(chunkIDs); nil == hasErr {
+			peerChunks = found
+		} else {
+			logging.LogWarnf("query chunk source [%s] failed: %s", repo.chunkSource.Name(), hasErr)
+		}
+	}
+
+	cloudConcurrentReqs := repo.cloud.GetConcurrentReqs()
+	if cloudConcurrentReqs < 1 {
+		cloudConcurrentReqs = 1
+	}
+	peerConcurrentReqs := 0
+	if nil != repo.chunkSource {
+		peerConcurrentReqs = repo.chunkSource.GetConcurrentReqs()
+		if peerConcurrentReqs < 1 {
+			peerConcurrentReqs = 1
+		}
+	}
+	cloudSemaphore := make(chan struct{}, cloudConcurrentReqs)
+	peerSemaphore := make(chan struct{}, peerConcurrentReqs)
+	peerBytes := atomic.Int64{}
+	peerCount := atomic.Int64{}
+	peerFallbackCount := atomic.Int64{}
 	total := len(chunkIDs)
 	eventbus.Publish(eventbus.EvtCloudBeforeDownloadChunks, context, total)
-	return runConcurrentObjectTransfers(chunkIDs, repo.cloud.GetConcurrentReqs(), "download chunk",
+	ret := runConcurrentObjectTransfers(chunkIDs, cloudConcurrentReqs+peerConcurrentReqs, "download chunk",
 		func(chunkID string, attempt int) (int64, error) {
-			length, chunk, dccErr := repo.downloadCloudChunk(chunkID, attempt, total, context)
+			var length int64
+			var chunk *entity.Chunk
+			var dccErr error
+			downloadedFromPeer := false
+			if peerChunks[chunkID] {
+				peerSemaphore <- struct{}{}
+				length, chunk, dccErr = repo.downloadSourceChunk(chunkID)
+				<-peerSemaphore
+				if nil == dccErr {
+					downloadedFromPeer = true
+					peerBytes.Add(length)
+					peerCount.Add(1)
+				} else {
+					peerFallbackCount.Add(1)
+					logging.LogWarnf("download chunk [%s] from source [%s] failed, falling back to cloud: %s",
+						chunkID, repo.chunkSource.Name(), dccErr)
+				}
+			}
+			if nil == chunk {
+				cloudSemaphore <- struct{}{}
+				length, chunk, dccErr = repo.downloadCloudChunk(chunkID, attempt, total, context)
+				<-cloudSemaphore
+			}
 			if nil != dccErr {
 				return 0, dccErr
 			}
 			if pcErr := repo.store.PutChunk(chunk); nil != pcErr {
 				return 0, pcErr
 			}
+			if downloadedFromPeer {
+				// 对等下载流量单独统计，不计入云端下载字节数。
+				return 0, nil
+			}
 			return length, nil
 		})
+	ret.peerBytes = peerBytes.Load()
+	ret.peerCount = int(peerCount.Load())
+	ret.peerFallbackCount = int(peerFallbackCount.Load())
+	return ret
 }
 
 func (repo *Repo) downloadCloudFilesPut(fileIDs []string, context map[string]interface{}) (downloadBytes int64, ret []*entity.File, err error) {
@@ -1949,6 +2098,25 @@ func (repo *Repo) downloadCloudChunk(id string, count, total int, context map[st
 	return
 }
 
+func (repo *Repo) downloadSourceChunk(id string) (length int64, ret *entity.Chunk, err error) {
+	data, err := repo.chunkSource.DownloadChunk(id)
+	if nil != err {
+		return
+	}
+	key := path.Join("objects", id[:2], id[2:])
+	data, err = repo.decodeDownloadedData(key, data)
+	if nil != err {
+		return
+	}
+	if util.Hash(data) != id {
+		err = fmt.Errorf("%w: source chunk [%s] hash mismatch", ErrRepoFatal, id)
+		return
+	}
+	length = int64(len(data))
+	ret = &entity.Chunk{ID: id, Data: data}
+	return
+}
+
 func (repo *Repo) downloadCloudFile(id string, count, total int, context map[string]interface{}) (length int64, ret *entity.File, err error) {
 	eventbus.Publish(eventbus.EvtCloudBeforeDownloadFile, context, count, total)
 
@@ -2155,6 +2323,9 @@ func (repo *Repo) CheckoutFilesFromCloud(files []*entity.File, context map[strin
 	downloadResult := repo.downloadCloudChunksPutDetailed(chunkIDs, context)
 	stat.DownloadBytes = downloadResult.bytes
 	stat.DownloadChunkCount = downloadResult.completed
+	stat.PeerDownloadBytes = downloadResult.peerBytes
+	stat.PeerDownloadChunkCount = downloadResult.peerCount
+	stat.PeerFallbackCount = downloadResult.peerFallbackCount
 	if nil != downloadResult.err {
 		err = downloadResult.err
 		return

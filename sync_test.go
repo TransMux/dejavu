@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +31,18 @@ import (
 	"github.com/siyuan-note/dejavu/util"
 	"github.com/siyuan-note/encryption"
 )
+
+type countingLocalCloud struct {
+	*cloud.Local
+	lockUploads atomic.Int32
+}
+
+func (c *countingLocalCloud) UploadObject(filePath string, overwrite bool) (length int64, err error) {
+	if "lock-sync" == filePath {
+		c.lockUploads.Add(1)
+	}
+	return c.Local.UploadObject(filePath, overwrite)
+}
 
 func TestSync(t *testing.T) {
 	if "" == os.Getenv("DEJAVU_SYNC_INTEGRATION") {
@@ -56,6 +69,57 @@ func TestSync(t *testing.T) {
 	}
 	_ = mergeResult
 	_ = trafficStat
+}
+
+func TestSyncCloudLockFastPath(t *testing.T) {
+	tempDir := t.TempDir()
+	dataPath := filepath.Join(tempDir, "data")
+	repoPath := filepath.Join(tempDir, "repo")
+	historyPath := filepath.Join(tempDir, "history")
+	tempPath := filepath.Join(tempDir, "temp")
+	cloudPath := filepath.Join(tempDir, "cloud")
+	if err := os.MkdirAll(dataPath, 0755); nil != err {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataPath, "doc.txt"), []byte("data"), 0644); nil != err {
+		t.Fatal(err)
+	}
+
+	localCloud := &countingLocalCloud{Local: cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{
+		Dir:           "main",
+		RepoPath:      repoPath,
+		AvailableSize: 1024 * 1024 * 1024,
+		Local:         &cloud.ConfLocal{Endpoint: cloudPath},
+	}})}
+	repo, err := NewRepo(dataPath, repoPath, historyPath, tempPath, "device", "Device", "windows",
+		[]byte("0123456789abcdef0123456789abcdef"), nil, localCloud)
+	if nil != err {
+		t.Fatal(err)
+	}
+	if _, err = repo.Index("Initial index", false, map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+
+	if _, _, err = repo.Sync(map[string]interface{}{"skipCloudPreflight": true}); nil != err {
+		t.Fatal(err)
+	}
+	if 1 != localCloud.lockUploads.Load() {
+		t.Fatalf("initial sync uploaded cloud lock [%d] times", localCloud.lockUploads.Load())
+	}
+
+	if _, _, err = repo.Sync(map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+	if 1 != localCloud.lockUploads.Load() {
+		t.Fatalf("unchanged sync uploaded cloud lock [%d] times", localCloud.lockUploads.Load())
+	}
+
+	if _, _, err = repo.Sync(map[string]interface{}{"skipCloudPreflight": true}); nil != err {
+		t.Fatal(err)
+	}
+	if 2 != localCloud.lockUploads.Load() {
+		t.Fatalf("prepared sync uploaded cloud lock [%d] times", localCloud.lockUploads.Load())
+	}
 }
 
 func TestDiffUpsertRemoveNormalizesLazyAssetPaths(t *testing.T) {
