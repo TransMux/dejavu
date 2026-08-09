@@ -23,7 +23,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -773,6 +775,9 @@ func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncClou
 			logging.LogErrorf("update cloud indexes failed: %s", err)
 			return
 		}
+		if err = repo.completeUploadTransactionForIndex(latest.ID); nil != err {
+			return
+		}
 		if lazyFilesNeedSync {
 			logging.LogInfof("sync: successfully updated cloud indexes with lazy files (count=%d)", len(latest.LazyFiles))
 		}
@@ -803,7 +808,7 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 		latest.ID, len(latest.Files), len(latest.LazyFiles), latest.CheckIndexID)
 
 	// 生成校验索引
-	files, getErr := repo.getFiles(latest.Files)
+	files, getErr := repo.GetFiles(latest)
 	if nil != getErr {
 		logging.LogErrorf("get files failed: %s", getErr)
 		err = getErr
@@ -811,6 +816,12 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 	}
 
 	checkIndex := buildCheckIndex(latest, files)
+	if "" != latest.CheckIndexID {
+		// An index ID is immutable. Reuse its existing integrity object ID on
+		// retries instead of changing CheckIndexID while uploading the index with
+		// overwrite=false.
+		checkIndex.ID = latest.CheckIndexID
+	}
 
 	// 更新本地 latest 的关联的 checkIndexID，后续会将本地 latest 上传到云端
 	latest.CheckIndexID = checkIndex.ID
@@ -825,14 +836,12 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 	errLock := sync.Mutex{}
 	waitGroup := &sync.WaitGroup{}
 
-	// 更新云端 latest
+	// Upload the index before publishing it. refs/latest is deliberately updated
+	// only after every prerequisite below succeeds, otherwise another device can
+	// observe an index whose integrity metadata was never published.
 	waitGroup.Add(1)
 	go func() {
 		defer waitGroup.Done()
-
-		// 上传索引和更新 refs/latest 两个操作需要保证顺序，否则可能会导致云端索引 和 refs/latest 不一致 https://github.com/siyuan-note/siyuan/issues/10111
-
-		// 上传索引
 		length, uploadErr := repo.uploadIndex(latest, context)
 		if nil != uploadErr {
 			logging.LogErrorf("upload latest index failed: %s", uploadErr)
@@ -847,55 +856,24 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 		trafficStat.APIPut++
 		trafficStat.m.Unlock()
 
-		// 更新 refs/latest
-		length, uploadErr = repo.updateCloudRef("refs/latest", context)
-		if nil != uploadErr {
-			logging.LogErrorf("update cloud [refs/latest] failed: %s", uploadErr)
+		downloadLength, uploadedIndex, verifyErr := repo.downloadCloudIndex(latest.ID, context)
+		if nil != verifyErr || !sameIndex(latest, uploadedIndex) {
+			if nil == verifyErr {
+				verifyErr = fmt.Errorf("uploaded index identity mismatch")
+			}
 			errLock.Lock()
-			errs = append(errs, uploadErr)
+			errs = append(errs, fmt.Errorf("verify uploaded index [%s] failed: %w", latest.ID, verifyErr))
 			errLock.Unlock()
 			return
 		}
 		trafficStat.m.Lock()
-		trafficStat.UploadFileCount++
-		trafficStat.UploadBytes += length
-		trafficStat.APIPut++
+		trafficStat.DownloadFileCount++
+		trafficStat.DownloadBytes += downloadLength
+		trafficStat.APIGet++
 		trafficStat.m.Unlock()
 	}()
 
 	isS3OrSiYuan := repo.isCloudS3() || repo.isCloudSiYuan()
-	if isS3OrSiYuan {
-		// 上传最新索引列表 https://github.com/siyuan-note/siyuan/issues/12991
-		// 上传 refs/latest 后可能存在缓存导致后续下载 refs/latest 时返回的是旧数据，所以这里还需要再上传 refs/latest-seqNum-id，
-		// 后续下载 latest 时使用 list 接口返回前缀为 refs/latest- 的对象，然后取最新的一个和下载到的 latest 对比，
-		// 如果不一致则重现下载 refs/latest 进行确认，具体细节参考 downloadCloudLatest()
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
-
-			_, maxSeqNum, seqNumLatests := repo.getSeqNumLatest()
-			seqNum := maxSeqNum + 1
-			_, uploadErr := repo.cloud.UploadBytes("refs/latest-"+strconv.Itoa(seqNum)+"-"+latest.ID, []byte(latest.ID), true)
-			if nil != uploadErr {
-				logging.LogErrorf("update cloud [refs/latest-%d] failed: %s", seqNum, uploadErr)
-				errLock.Lock()
-				errs = append(errs, uploadErr)
-				errLock.Unlock()
-				return
-			}
-
-			// 删除旧的 refs/latest-*
-			go func() {
-				for _, seqNumLatest := range seqNumLatests {
-					deleteErr := repo.cloud.RemoveObject(seqNumLatest)
-					if nil != deleteErr {
-						logging.LogWarnf("delete cloud [%s] failed: %s", seqNumLatest, deleteErr)
-						continue
-					}
-				}
-			}()
-		}()
-	}
 
 	// 更新云端索引列表
 	waitGroup.Add(1)
@@ -952,9 +930,65 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 			latest.ID, len(errs), time.Since(start), err)
 		return
 	}
+
+	var seqNumLatests []string
+	var uploadErr error
+	if isS3OrSiYuan {
+		_, maxSeqNum, existingSeqNumLatests := repo.getSeqNumLatest()
+		seqNumLatests = existingSeqNumLatests
+		seqNum := maxSeqNum + 1
+		if _, uploadErr = repo.cloud.UploadBytes("refs/latest-"+strconv.Itoa(seqNum)+"-"+latest.ID, []byte(latest.ID), true); nil != uploadErr {
+			return fmt.Errorf("update cloud [refs/latest-%d] failed: %w", seqNum, uploadErr)
+		}
+	}
+
+	// refs/latest is the publication boundary. Keep it last so failures above
+	// leave the previously published snapshot available. The cache-busting
+	// marker is safe to expose first: readers retry refs/latest until it agrees.
+	length, uploadErr := repo.updateCloudRef("refs/latest", context)
+	if nil != uploadErr {
+		return uploadErr
+	}
+	trafficStat.m.Lock()
+	trafficStat.UploadFileCount++
+	trafficStat.UploadBytes += length
+	trafficStat.APIPut++
+	trafficStat.m.Unlock()
+
+	if isS3OrSiYuan {
+		go func() {
+			for _, seqNumLatest := range seqNumLatests {
+				if deleteErr := repo.cloud.RemoveObject(seqNumLatest); nil != deleteErr {
+					logging.LogWarnf("delete cloud [%s] failed: %s", seqNumLatest, deleteErr)
+				}
+			}
+		}()
+	}
 	logging.LogInfof("updateCloudIndexes: completed latestID=%s files=%d lazyFiles=%d checkIndexID=%s cost=%s",
 		latest.ID, len(latest.Files), len(latest.LazyFiles), latest.CheckIndexID, time.Since(start))
 	return
+}
+
+func sameIndex(expected, actual *entity.Index) bool {
+	if nil == expected || nil == actual || expected.ID != actual.ID || expected.Memo != actual.Memo ||
+		expected.Created != actual.Created || expected.Count != actual.Count || expected.Size != actual.Size ||
+		expected.SystemID != actual.SystemID || expected.SystemName != actual.SystemName || expected.SystemOS != actual.SystemOS ||
+		expected.CheckIndexID != actual.CheckIndexID || expected.AesKeyVerifyVal != actual.AesKeyVerifyVal ||
+		expected.LazyManifest != actual.LazyManifest || len(expected.Files) != len(actual.Files) ||
+		len(expected.LazyFiles) != len(actual.LazyFiles) {
+		return false
+	}
+	for i, id := range expected.Files {
+		if id != actual.Files[i] {
+			return false
+		}
+	}
+	for i, id := range expected.LazyFiles {
+		if id != actual.LazyFiles[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func buildCheckIndex(index *entity.Index, files []*entity.File) *entity.CheckIndex {
@@ -1011,14 +1045,20 @@ type concurrentObjectTransferResult struct {
 	peerCount         int
 	peerFallbackCount int
 	err               error
+	completedIDs      []string
+	failedIDs         map[string]error
+	skippedIDs        []string
 }
 
 type concurrentTransferState struct {
-	bytes     atomic.Int64
-	completed atomic.Int64
-	attempted atomic.Int64
-	errMu     sync.Mutex
-	err       error
+	bytes        atomic.Int64
+	completed    atomic.Int64
+	attempted    atomic.Int64
+	errMu        sync.Mutex
+	err          error
+	resultMu     sync.Mutex
+	completedIDs []string
+	failedIDs    map[string]error
 }
 
 func (state *concurrentTransferState) getErr() error {
@@ -1036,12 +1076,37 @@ func (state *concurrentTransferState) setErr(err error) {
 }
 
 func (state *concurrentTransferState) result() concurrentObjectTransferResult {
-	return concurrentObjectTransferResult{
-		bytes:     state.bytes.Load(),
-		completed: int(state.completed.Load()),
-		attempted: int(state.attempted.Load()),
-		err:       state.getErr(),
+	state.resultMu.Lock()
+	completedIDs := append([]string(nil), state.completedIDs...)
+	failedIDs := make(map[string]error, len(state.failedIDs))
+	for id, err := range state.failedIDs {
+		failedIDs[id] = err
 	}
+	state.resultMu.Unlock()
+	sort.Strings(completedIDs)
+	return concurrentObjectTransferResult{
+		bytes:        state.bytes.Load(),
+		completed:    int(state.completed.Load()),
+		attempted:    int(state.attempted.Load()),
+		err:          state.getErr(),
+		completedIDs: completedIDs,
+		failedIDs:    failedIDs,
+	}
+}
+
+func (state *concurrentTransferState) recordCompleted(id string) {
+	state.resultMu.Lock()
+	state.completedIDs = append(state.completedIDs, id)
+	state.resultMu.Unlock()
+}
+
+func (state *concurrentTransferState) recordFailed(id string, err error) {
+	state.resultMu.Lock()
+	if nil == state.failedIDs {
+		state.failedIDs = map[string]error{}
+	}
+	state.failedIDs[id] = err
+	state.resultMu.Unlock()
 }
 
 func concurrentTransferPanicError(objectType string, recovered interface{}) error {
@@ -1063,10 +1128,13 @@ func runConcurrentObjectTransfers(ids []string, poolSize int, objectType string,
 	waitGroup := &sync.WaitGroup{}
 	state := &concurrentTransferState{}
 	pool, err := ants.NewPoolWithFunc(poolSize, func(arg interface{}) {
+		id := arg.(string)
 		defer waitGroup.Done()
 		defer func() {
 			if recovered := recover(); nil != recovered {
-				state.setErr(concurrentTransferPanicError(objectType, recovered))
+				panicErr := concurrentTransferPanicError(objectType, recovered)
+				state.recordFailed(id, panicErr)
+				state.setErr(panicErr)
 			}
 		}()
 		if nil != state.getErr() {
@@ -1074,13 +1142,15 @@ func runConcurrentObjectTransfers(ids []string, poolSize int, objectType string,
 		}
 
 		attempt := int(state.attempted.Add(1))
-		length, transferErr := transfer(arg.(string), attempt)
+		length, transferErr := transfer(id, attempt)
 		if nil != transferErr {
+			state.recordFailed(id, transferErr)
 			state.setErr(transferErr)
 			return
 		}
 		state.bytes.Add(length)
 		state.completed.Add(1)
+		state.recordCompleted(id)
 	})
 	if nil != err {
 		ret.err = err
@@ -1101,7 +1171,20 @@ func runConcurrentObjectTransfers(ids []string, poolSize int, objectType string,
 		}
 	}
 	waitGroup.Wait()
-	return state.result()
+	ret = state.result()
+	completed := make(map[string]bool, len(ret.completedIDs))
+	for _, id := range ret.completedIDs {
+		completed[id] = true
+	}
+	for _, id := range ids {
+		if !completed[id] {
+			if _, failed := ret.failedIDs[id]; !failed {
+				ret.skippedIDs = append(ret.skippedIDs, id)
+			}
+		}
+	}
+	sort.Strings(ret.skippedIDs)
+	return ret
 }
 
 func mergeTrafficStat(target, delta *TrafficStat) {
@@ -1506,7 +1589,40 @@ func (repo *Repo) updateCloudCheckIndex(checkIndex *entity.CheckIndex, context m
 		logging.LogErrorf("upload check index failed: %s", err)
 		return
 	}
+	readback, err := repo.cloud.DownloadObject("check/indexes/" + checkIndex.ID)
+	if nil != err {
+		return fmt.Errorf("read back check index [%s] failed: %w", checkIndex.ID, err)
+	}
+	readback, err = repo.store.compressDecoder.DecodeAll(readback, nil)
+	if nil != err {
+		return fmt.Errorf("decode check index [%s] readback failed: %w", checkIndex.ID, err)
+	}
+	verified := &entity.CheckIndex{}
+	if err = gulu.JSON.UnmarshalJSON(readback, verified); nil != err {
+		return fmt.Errorf("unmarshal check index [%s] readback failed: %w", checkIndex.ID, err)
+	}
+	if !sameCheckIndex(checkIndex, verified) {
+		return fmt.Errorf("check index [%s] readback identity mismatch", checkIndex.ID)
+	}
 	return
+}
+
+func sameCheckIndex(expected, actual *entity.CheckIndex) bool {
+	if nil == expected || nil == actual || expected.ID != actual.ID || expected.IndexID != actual.IndexID || len(expected.Files) != len(actual.Files) {
+		return false
+	}
+	for i, expectedFile := range expected.Files {
+		actualFile := actual.Files[i]
+		if nil == expectedFile || nil == actualFile || expectedFile.ID != actualFile.ID || len(expectedFile.Chunks) != len(actualFile.Chunks) {
+			return false
+		}
+		for j, chunk := range expectedFile.Chunks {
+			if chunk != actualFile.Chunks[j] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (repo *Repo) updateCloudIndexesV2(latest *entity.Index, context map[string]interface{}) (downloadBytes, uploadBytes int64, err error) {
@@ -2018,31 +2134,120 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 		return
 	}
 	logging.LogInfof("uploadCloud: upsert chunks=%d", len(upsertChunkIDs))
+	uploadFileIDs := make([]string, 0, len(upsertFiles))
+	for _, file := range upsertFiles {
+		uploadFileIDs = append(uploadFileIDs, file.ID)
+	}
+	uploadTx, txErr := repo.beginUploadTransaction(latest.ID, upsertChunkIDs, uploadFileIDs)
+	if nil != txErr {
+		return txErr
+	}
+	if _, saveErr := repo.verifyAndRecordUploadIDs(uploadTx, true, completedUploadIDs(uploadTx.CompletedChunks), trafficStat, context); nil != saveErr {
+		return saveErr
+	}
+	if _, saveErr := repo.verifyAndRecordUploadIDs(uploadTx, false, completedUploadIDs(uploadTx.CompletedFiles), trafficStat, context); nil != saveErr {
+		return saveErr
+	}
+	upsertChunkIDs, _ = pendingUploadIDs(upsertChunkIDs, uploadTx.CompletedChunks)
 
 	// 上传分块
 	uploadResult := repo.uploadChunksDetailed(upsertChunkIDs, context)
 	trafficStat.UploadChunkCount += uploadResult.completed
 	trafficStat.UploadBytes += uploadResult.bytes
 	trafficStat.APIPut += uploadResult.attempted
+	verificationErr, saveErr := repo.verifyAndRecordUploadIDs(uploadTx, true, uploadResult.completedIDs, trafficStat, context)
+	for id, failure := range uploadResult.failedIDs {
+		uploadTx.Failed[id] = failure.Error()
+	}
+	if nil == saveErr {
+		saveErr = repo.saveUploadTransaction(uploadTx)
+	}
+	if nil != saveErr {
+		return saveErr
+	}
 	if nil != uploadResult.err {
-		err = uploadResult.err
-		logging.LogErrorf("upload chunks failed: %s", err)
-		return
+		return uploadResult.err
+	}
+	if nil != verificationErr {
+		return verificationErr
 	}
 	logging.LogInfof("uploadCloud: uploaded chunks=%d bytes=%d", uploadResult.completed, uploadResult.bytes)
 
 	// 上传文件
-	uploadResult = repo.uploadFilesDetailed(upsertFiles, context)
+	pendingFileIDs, _ := pendingUploadIDs(uploadFileIDs, uploadTx.CompletedFiles)
+	pendingFileSet := make(map[string]bool, len(pendingFileIDs))
+	for _, id := range pendingFileIDs {
+		pendingFileSet[id] = true
+	}
+	pendingFiles := make([]*entity.File, 0, len(pendingFileIDs))
+	for _, file := range upsertFiles {
+		if pendingFileSet[file.ID] {
+			pendingFiles = append(pendingFiles, file)
+		}
+	}
+	uploadResult = repo.uploadFilesDetailed(pendingFiles, context)
 	trafficStat.UploadFileCount += uploadResult.completed
 	trafficStat.UploadBytes += uploadResult.bytes
 	trafficStat.APIPut += uploadResult.attempted
+	verificationErr, saveErr = repo.verifyAndRecordUploadIDs(uploadTx, false, uploadResult.completedIDs, trafficStat, context)
+	for id, failure := range uploadResult.failedIDs {
+		uploadTx.Failed[id] = failure.Error()
+	}
+	if nil == saveErr {
+		saveErr = repo.saveUploadTransaction(uploadTx)
+	}
+	if nil != saveErr {
+		return saveErr
+	}
 	if nil != uploadResult.err {
-		err = uploadResult.err
-		logging.LogErrorf("upload files failed: %s", err)
-		return
+		return uploadResult.err
+	}
+	if nil != verificationErr {
+		return verificationErr
 	}
 	logging.LogInfof("uploadCloud: uploaded files=%d lazy=%d bytes=%d cost=%s",
 		uploadResult.completed, upsertLazyFiles, uploadResult.bytes, time.Since(start))
+	return
+}
+
+func (repo *Repo) verifyUploadedChunks(ids []string, context map[string]interface{}) (downloadBytes int64, verified, apiGets int, err error) {
+	for i, id := range ids {
+		apiGets++
+		length, _, downloadErr := repo.downloadCloudChunk(id, i+1, len(ids), context)
+		downloadBytes += length
+		if nil != downloadErr {
+			err = fmt.Errorf("verify uploaded chunk [%s] failed: %w", id, downloadErr)
+			return
+		}
+		verified++
+	}
+	return
+}
+
+func (repo *Repo) verifyUploadedFiles(ids []string, context map[string]interface{}) (downloadBytes int64, verified, apiGets int, err error) {
+	for i, id := range ids {
+		apiGets++
+		length, file, downloadErr := repo.downloadCloudFile(id, i+1, len(ids), context)
+		downloadBytes += length
+		if nil != downloadErr {
+			err = fmt.Errorf("verify uploaded file [%s] failed: %w", id, downloadErr)
+			return
+		}
+		if nil == file || file.ID != id {
+			err = fmt.Errorf("verify uploaded file [%s] failed: metadata ID mismatch", id)
+			return
+		}
+		expected, getErr := repo.store.GetFile(id)
+		if nil != getErr {
+			err = fmt.Errorf("load local file metadata [%s] for verification failed: %w", id, getErr)
+			return
+		}
+		if !reflect.DeepEqual(file, expected) {
+			err = fmt.Errorf("verify uploaded file [%s] failed: metadata identity mismatch", id)
+			return
+		}
+		verified++
+	}
 	return
 }
 

@@ -298,6 +298,25 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 
 	// 从文件列表中得到去重后的分块列表
 	uploadChunkIDs := repo.getChunks(uploadFiles)
+	uploadFileIDs := make([]string, 0, len(uploadFiles))
+	for _, file := range uploadFiles {
+		uploadFileIDs = append(uploadFileIDs, file.ID)
+	}
+	uploadTx, txErr := repo.beginUploadTransaction(latest.ID, uploadChunkIDs, uploadFileIDs)
+	if nil != txErr {
+		return trafficStat, txErr
+	}
+	// A durable confirmation is only a resume hint. Revalidate it because the
+	// remote object may have disappeared or changed since the previous run.
+	_, txErr = repo.verifyAndRecordUploadIDs(uploadTx, true, completedUploadIDs(uploadTx.CompletedChunks), trafficStat, context)
+	if nil != txErr {
+		return trafficStat, txErr
+	}
+	_, txErr = repo.verifyAndRecordUploadIDs(uploadTx, false, completedUploadIDs(uploadTx.CompletedFiles), trafficStat, context)
+	if nil != txErr {
+		return trafficStat, txErr
+	}
+	uploadChunkIDs, _ = pendingUploadIDs(uploadChunkIDs, uploadTx.CompletedChunks)
 
 	// 这里暂时不计算云端缺失的分块了，因为目前计数云端缺失分块的代价太大
 	//uploadChunkIDs, err = repo.cloud.GetChunks(uploadChunkIDs)
@@ -311,20 +330,59 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 	trafficStat.UploadChunkCount += uploadResult.completed
 	trafficStat.UploadBytes += uploadResult.bytes
 	trafficStat.APIPut += uploadResult.attempted
+	verificationErr, saveErr := repo.verifyAndRecordUploadIDs(uploadTx, true, uploadResult.completedIDs, trafficStat, context)
+	for id, failure := range uploadResult.failedIDs {
+		uploadTx.Failed[id] = failure.Error()
+	}
+	if nil == saveErr {
+		saveErr = repo.saveUploadTransaction(uploadTx)
+	}
+	if nil != saveErr {
+		return trafficStat, saveErr
+	}
 	if nil != uploadResult.err {
 		err = uploadResult.err
 		logging.LogErrorf("upload chunks failed: %s", err)
 		return
 	}
+	if nil != verificationErr {
+		err = verificationErr
+		return
+	}
 
 	// 上传文件
-	uploadResult = repo.uploadFilesDetailed(uploadFiles, context)
+	pendingFileIDs, _ := pendingUploadIDs(uploadFileIDs, uploadTx.CompletedFiles)
+	pendingFiles := make([]*entity.File, 0, len(pendingFileIDs))
+	pendingFileSet := make(map[string]bool, len(pendingFileIDs))
+	for _, id := range pendingFileIDs {
+		pendingFileSet[id] = true
+	}
+	for _, file := range uploadFiles {
+		if pendingFileSet[file.ID] {
+			pendingFiles = append(pendingFiles, file)
+		}
+	}
+	uploadResult = repo.uploadFilesDetailed(pendingFiles, context)
 	trafficStat.UploadFileCount += uploadResult.completed
 	trafficStat.UploadBytes += uploadResult.bytes
 	trafficStat.APIPut += uploadResult.attempted
+	verificationErr, saveErr = repo.verifyAndRecordUploadIDs(uploadTx, false, uploadResult.completedIDs, trafficStat, context)
+	for id, failure := range uploadResult.failedIDs {
+		uploadTx.Failed[id] = failure.Error()
+	}
+	if nil == saveErr {
+		saveErr = repo.saveUploadTransaction(uploadTx)
+	}
+	if nil != saveErr {
+		return trafficStat, saveErr
+	}
 	if nil != uploadResult.err {
 		err = uploadResult.err
 		logging.LogErrorf("upload files failed: %s", err)
+		return
+	}
+	if nil != verificationErr {
+		err = verificationErr
 		return
 	}
 
@@ -332,6 +390,9 @@ func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *Traff
 	err = repo.updateCloudIndexes(latest, trafficStat, context)
 	if nil != err {
 		logging.LogErrorf("update cloud indexes failed: %s", err)
+		return
+	}
+	if err = repo.completeUploadTransaction(uploadTx); nil != err {
 		return
 	}
 

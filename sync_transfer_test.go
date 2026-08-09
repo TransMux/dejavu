@@ -9,9 +9,15 @@
 package dejavu
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/siyuan-note/dejavu/cloud"
+	"github.com/siyuan-note/dejavu/util"
 )
 
 func TestRunConcurrentSyncTransfersAggregatesAfterBothWorkers(t *testing.T) {
@@ -60,6 +66,68 @@ func TestRunConcurrentSyncTransfersAggregatesAfterBothWorkers(t *testing.T) {
 		11 != result.traffic.UploadFileCount || 13 != result.traffic.UploadChunkCount || 17 != result.traffic.UploadBytes ||
 		7 != result.traffic.APIGet || 19 != result.traffic.APIPut {
 		t.Fatalf("unexpected aggregate traffic: %#v", result.traffic)
+	}
+}
+
+func TestUploadTransactionRejectsMalformedAndUnsafeState(t *testing.T) {
+	repo := &Repo{Path: t.TempDir()}
+	transactionDir := filepath.Join(repo.Path, "upload-transactions")
+	if err := os.MkdirAll(transactionDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(transactionDir, "current.json"), []byte(`{"indexID":"0123456789abcdef0123456789abcdef01234567"`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.beginUploadTransaction("0123456789abcdef0123456789abcdef01234567", nil, nil); err == nil {
+		t.Fatal("malformed durable transaction was silently accepted")
+	}
+	if err := os.Remove(filepath.Join(transactionDir, "current.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.beginUploadTransaction("../../outside", nil, nil); err == nil {
+		t.Fatal("unsafe transaction index ID was accepted")
+	}
+	tx, err := repo.beginUploadTransaction("0123456789abcdef0123456789abcdef01234567", []string{"a", "a", "b"}, []string{"f", "f"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tx.PlannedChunks) != 2 || len(tx.PlannedFiles) != 1 {
+		t.Fatalf("duplicate plan was not normalized: %#v %#v", tx.PlannedChunks, tx.PlannedFiles)
+	}
+}
+
+func TestUploadTransactionDemotesMissingRemoteConfirmation(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	repo.cloud = cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{Dir: "journal-revalidate", AvailableSize: 1 << 30,
+		Local: &cloud.ConfLocal{Endpoint: t.TempDir(), ConcurrentReqs: 1}}})
+	indexID := "0123456789abcdef0123456789abcdef01234567"
+	chunkID := util.Hash([]byte("previously uploaded"))
+	tx, err := repo.beginUploadTransaction(indexID, []string{chunkID}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.CompletedChunks[chunkID] = true
+	if err = repo.saveUploadTransaction(tx); err != nil {
+		t.Fatal(err)
+	}
+	traffic := &TrafficStat{}
+	verifyErr, saveErr := repo.verifyAndRecordUploadIDs(tx, true, completedUploadIDs(tx.CompletedChunks), traffic, map[string]interface{}{})
+	if verifyErr == nil || saveErr != nil {
+		t.Fatalf("verifyErr=%v saveErr=%v", verifyErr, saveErr)
+	}
+	if tx.CompletedChunks[chunkID] || tx.Failed[chunkID] == "" || traffic.APIGet != 1 || traffic.DownloadChunkCount != 0 {
+		t.Fatalf("missing confirmation not durably demoted: tx=%#v traffic=%#v", tx, traffic)
+	}
+	data, err := os.ReadFile(filepath.Join(repo.Path, "upload-transactions", "current.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := &uploadTransaction{}
+	if err = json.Unmarshal(data, persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.CompletedChunks[chunkID] || persisted.Failed[chunkID] == "" {
+		t.Fatalf("demotion was not persisted: %#v", persisted)
 	}
 }
 
@@ -191,5 +259,72 @@ func TestRunConcurrentObjectTransfersWaitsAndPreservesCompletedTraffic(t *testin
 	}
 	if 17 != result.bytes || 1 != result.completed || 2 != result.attempted {
 		t.Fatalf("unexpected partial result: %#v", result)
+	}
+}
+
+func TestRunConcurrentObjectTransfersReportsObjectOutcomes(t *testing.T) {
+	failure := errors.New("object unavailable")
+	result := runConcurrentObjectTransfers([]string{"ok", "bad"}, 1, "test object",
+		func(id string, _ int) (int64, error) {
+			if id == "bad" {
+				return 0, failure
+			}
+			return 7, nil
+		})
+	if len(result.completedIDs) != 1 || result.completedIDs[0] != "ok" {
+		t.Fatalf("completed IDs = %#v", result.completedIDs)
+	}
+	if !errors.Is(result.failedIDs["bad"], failure) {
+		t.Fatalf("failed IDs = %#v", result.failedIDs)
+	}
+}
+
+func TestUploadTransactionPersistsAndResumesConfirmedObjects(t *testing.T) {
+	repo := &Repo{Path: t.TempDir()}
+	indexID := "0123456789abcdef0123456789abcdef01234567"
+	tx, err := repo.beginUploadTransaction(indexID, []string{"chunk-a", "chunk-b"}, []string{"file-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := concurrentObjectTransferResult{completedIDs: []string{"chunk-a"}, failedIDs: map[string]error{"chunk-b": errors.New("offline")}}
+	if err = repo.recordUploadResult(tx, true, result); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := repo.beginUploadTransaction(indexID, []string{"chunk-a", "chunk-b"}, []string{"file-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, skipped := pendingUploadIDs(resumed.PlannedChunks, resumed.CompletedChunks)
+	if len(pending) != 1 || pending[0] != "chunk-b" || len(skipped) != 1 || skipped[0] != "chunk-a" {
+		t.Fatalf("resume pending=%#v skipped=%#v", pending, skipped)
+	}
+	if resumed.Failed["chunk-b"] != "offline" {
+		t.Fatalf("failed result was not durable: %#v", resumed.Failed)
+	}
+	if err = repo.completeUploadTransaction(resumed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(filepath.Join(repo.Path, "upload-transactions", "current.json")); !os.IsNotExist(err) {
+		t.Fatalf("current transaction was not cleaned up: %v", err)
+	}
+	if _, err = os.Stat(filepath.Join(repo.Path, "upload-transactions", "completed", indexID+".json")); err != nil {
+		t.Fatalf("completed summary missing: %v", err)
+	}
+}
+
+func TestRunConcurrentObjectTransfersReportsSkippedIDsDeterministically(t *testing.T) {
+	failure := errors.New("stop")
+	result := runConcurrentObjectTransfers([]string{"bad", "z", "a"}, 1, "test object",
+		func(id string, _ int) (int64, error) {
+			if id == "bad" {
+				return 0, failure
+			}
+			return 1, nil
+		})
+	if !errors.Is(result.failedIDs["bad"], failure) {
+		t.Fatalf("failed IDs = %#v", result.failedIDs)
+	}
+	if len(result.skippedIDs) != 2 || result.skippedIDs[0] != "a" || result.skippedIDs[1] != "z" {
+		t.Fatalf("skipped IDs = %#v", result.skippedIDs)
 	}
 }

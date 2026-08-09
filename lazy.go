@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -43,20 +44,32 @@ const (
 
 // LazyAsset 懒加载资源描述
 type LazyAsset struct {
-	Path     string     `json:"path"`
-	FileID   string     `json:"fileId"`
-	Size     int64      `json:"size"`
-	Hash     string     `json:"hash"`
-	Modified int64      `json:"mtime"`
-	Chunks   []string   `json:"chunks"`
-	Status   LazyStatus `json:"status"`
+	Path     string   `json:"path"`
+	FileID   string   `json:"fileId"`
+	Size     int64    `json:"size"`
+	Hash     string   `json:"hash"`
+	Modified int64    `json:"mtime"`
+	Chunks   []string `json:"chunks"`
+	// RevivesDeletion proves that this version was created after observing the
+	// indicated tombstone. A later filesystem mtime alone is not such proof.
+	RevivesDeletion int64 `json:"revivesDeletion,omitempty"`
+	// Status is device-local materialization state. It is derived from local
+	// files and must never participate in the synchronized resource catalog.
+	Status LazyStatus `json:"-"`
 }
 
 // LazyManifest 懒加载清单
 type LazyManifest struct {
-	Version string                `json:"version"`
-	Assets  map[string]*LazyAsset `json:"assets"`
-	Updated int64                 `json:"updated"`
+	Version    string                    `json:"version"`
+	Assets     map[string]*LazyAsset     `json:"assets"`
+	Tombstones map[string]*LazyTombstone `json:"tombstones,omitempty"`
+	Updated    int64                     `json:"updated"`
+}
+
+type LazyTombstone struct {
+	Path      string `json:"path"`
+	FileID    string `json:"fileId"`
+	DeletedAt int64  `json:"deletedAt"`
 }
 
 // LazyLoader 懒加载管理器
@@ -262,18 +275,15 @@ func (ll *LazyLoader) ClearCache() error {
 		return err
 	}
 
-	for path, asset := range manifest.Assets {
+	for path := range manifest.Assets {
 		localPath := filepath.Join(ll.repo.DataPath, path)
 		if gulu.File.IsExist(localPath) {
 			if err := os.Remove(localPath); err != nil {
 				logging.LogWarnf("remove cached file [%s] failed: %s", localPath, err)
-			} else {
-				asset.Status = LazyStatusPending
 			}
 		}
 	}
-
-	return ll.saveManifest(manifest)
+	return nil
 }
 
 // getManifest 获取懒加载清单
@@ -309,7 +319,6 @@ func (ll *LazyLoader) getManifest() (*LazyManifest, error) {
 // saveManifest 保存懒加载清单
 func (ll *LazyLoader) saveManifest(manifest *LazyManifest) error {
 	manifest.Updated = time.Now().UnixMilli()
-	ll.manifest = manifest
 
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -322,7 +331,11 @@ func (ll *LazyLoader) saveManifest(manifest *LazyManifest) error {
 		return fmt.Errorf("create manifest dir failed: %w", err)
 	}
 
-	return gulu.File.WriteFileSafer(manifestPath, data, 0644)
+	if err = gulu.File.WriteFileSafer(manifestPath, data, 0644); nil != err {
+		return err
+	}
+	ll.manifest = manifest
+	return nil
 }
 
 // getManifestPath 获取清单文件路径
@@ -396,6 +409,13 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 		}
 
 		normalizedPath := normalizeLazyPath(file.Path)
+		if tombstone := manifest.Tombstones[normalizedPath]; nil != tombstone {
+			if file.Updated <= tombstone.DeletedAt {
+				continue
+			}
+			asset.RevivesDeletion = tombstone.DeletedAt
+			delete(manifest.Tombstones, normalizedPath)
+		}
 		if file.Path != normalizedPath {
 			leadingSlashPathCount++
 			appendSyncSample(&normalizedPathSamples, "%s -> %s", file.Path, normalizedPath)
@@ -427,9 +447,10 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 
 func mergeLazyManifestAssets(local, cloud *LazyManifest) *LazyManifest {
 	merged := &LazyManifest{
-		Version: "1.0",
-		Assets:  map[string]*LazyAsset{},
-		Updated: time.Now().UnixMilli(),
+		Version:    "1.0",
+		Assets:     map[string]*LazyAsset{},
+		Tombstones: map[string]*LazyTombstone{},
+		Updated:    time.Now().UnixMilli(),
 	}
 	add := func(asset *LazyAsset) {
 		if nil == asset || isIgnoredLazyAssetPath(asset.Path) {
@@ -452,7 +473,93 @@ func mergeLazyManifestAssets(local, cloud *LazyManifest) *LazyManifest {
 			add(asset)
 		}
 	}
+	mergeTombstones := func(manifest *LazyManifest) {
+		if nil == manifest {
+			return
+		}
+		for _, tombstone := range manifest.Tombstones {
+			if nil == tombstone {
+				continue
+			}
+			candidate := *tombstone
+			candidate.Path = normalizeLazyPath(candidate.Path)
+			existing := merged.Tombstones[candidate.Path]
+			if nil == existing || candidate.DeletedAt > existing.DeletedAt {
+				merged.Tombstones[candidate.Path] = &candidate
+			}
+		}
+	}
+	mergeTombstones(local)
+	mergeTombstones(cloud)
+	for path, tombstone := range merged.Tombstones {
+		if nil == tombstone {
+			continue
+		}
+		if asset := merged.Assets[path]; nil != asset && asset.RevivesDeletion >= tombstone.DeletedAt {
+			delete(merged.Tombstones, path)
+		} else {
+			delete(merged.Assets, path)
+		}
+	}
 	return merged
+}
+
+func (repo *Repo) DeleteLazyAsset(path, fileID string) error {
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader {
+		return nil
+	}
+	repo.lazyLoader.mutex.Lock()
+	defer repo.lazyLoader.mutex.Unlock()
+	manifest, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return err
+	}
+	manifest = cloneLazyManifest(manifest)
+	path = normalizeLazyPath(path)
+	asset := manifest.Assets[path]
+	if nil == asset || asset.FileID != fileID {
+		return fmt.Errorf("lazy asset version changed [%s]", path)
+	}
+	if nil == manifest.Tombstones {
+		manifest.Tombstones = map[string]*LazyTombstone{}
+	}
+	manifest.Tombstones[path] = &LazyTombstone{Path: path, FileID: fileID, DeletedAt: time.Now().UnixMilli()}
+	delete(manifest.Assets, path)
+	delete(manifest.Assets, "/"+path)
+	return repo.lazyLoader.saveManifest(manifest)
+}
+
+func cloneLazyManifest(manifest *LazyManifest) *LazyManifest {
+	ret := &LazyManifest{Version: manifest.Version, Updated: manifest.Updated,
+		Assets: make(map[string]*LazyAsset, len(manifest.Assets)), Tombstones: make(map[string]*LazyTombstone, len(manifest.Tombstones))}
+	for path, asset := range manifest.Assets {
+		if nil != asset {
+			ret.Assets[path] = cloneLazyAsset(asset)
+		}
+	}
+	for path, tombstone := range manifest.Tombstones {
+		if nil != tombstone {
+			copy := *tombstone
+			ret.Tombstones[path] = &copy
+		}
+	}
+	return ret
+}
+
+func (repo *Repo) LazyAssetID(path string) string {
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader {
+		return ""
+	}
+	repo.lazyLoader.mutex.RLock()
+	defer repo.lazyLoader.mutex.RUnlock()
+	manifest, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return ""
+	}
+	if asset := manifest.Assets[normalizeLazyPath(path)]; nil != asset {
+		return asset.FileID
+	}
+	return ""
 }
 
 func cloneLazyAsset(asset *LazyAsset) *LazyAsset {
@@ -604,6 +711,9 @@ func (repo *Repo) setLazyManifestAsset(manifest *LazyManifest, asset *LazyAsset)
 		manifest.Assets = map[string]*LazyAsset{}
 	}
 	asset.Path = normalizeLazyPath(asset.Path)
+	if nil != manifest.Tombstones[asset.Path] {
+		return
+	}
 	delete(manifest.Assets, "/"+asset.Path)
 	manifest.Assets[asset.Path] = asset
 }
@@ -704,40 +814,53 @@ func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
 
 	logging.LogInfof("[DEBUG] getLazyFilesForIndex: manifest has %d assets", len(manifest.Assets))
 	var files []*entity.File
-	for _, asset := range manifest.Assets {
+	manifestMigrated := false
+	assetKeys := make([]string, 0, len(manifest.Assets))
+	for key := range manifest.Assets {
+		assetKeys = append(assetKeys, key)
+	}
+	sort.Strings(assetKeys)
+	canonicalPaths := make(map[string]string, len(assetKeys))
+	for _, key := range assetKeys {
+		canonicalPath := normalizeLazyPath(manifest.Assets[key].Path)
+		if previous, exists := canonicalPaths[canonicalPath]; exists && previous != key {
+			return nil, fmt.Errorf("duplicate lazy manifest path after normalization [%s]: keys [%s] and [%s]", canonicalPath, previous, key)
+		}
+		canonicalPaths[canonicalPath] = key
+	}
+	for _, key := range assetKeys {
+		asset := manifest.Assets[key]
 		if isIgnoredLazyAssetPath(asset.Path) {
 			continue
 		}
 
-		// 检查本地文件是否存在
-		cleanPath := strings.TrimPrefix(asset.Path, "/")
-		localPath := filepath.Join(repo.DataPath, cleanPath)
-
-		if gulu.File.IsExist(localPath) {
-			// 本地文件存在，使用实际文件信息
-			info, statErr := os.Stat(localPath)
-			if statErr == nil {
-				file := &entity.File{
-					ID:      asset.FileID,
-					Path:    asset.Path,
-					Size:    info.Size(),
-					Updated: info.ModTime().UnixMilli(),
-					Chunks:  asset.Chunks,
+		// The manifest is the last fully chunked immutable version. A local file
+		// may already have changed and will be handled by the upsert path; never
+		// combine its new stat with the manifest's old chunks.
+		localPath := filepath.Join(repo.DataPath, strings.TrimPrefix(asset.Path, "/"))
+		if len(asset.Chunks) > 0 || gulu.File.IsExist(localPath) {
+			file := entity.NewFile(normalizeLazyPath(asset.Path), asset.Size, asset.Modified)
+			file.Chunks = asset.Chunks
+			if file.ID != asset.FileID {
+				if putErr := repo.store.PutFile(file); nil != putErr {
+					return nil, fmt.Errorf("migrate lazy metadata [%s]: %w", asset.Path, putErr)
 				}
-				files = append(files, file)
+				asset.FileID = file.ID
+				asset.Path = file.Path
+				manifestMigrated = true
 			}
-		} else {
-			// 本地文件不存在，使用清单中的元数据创建虚拟条目
-			if len(asset.Chunks) > 0 {
-				file := &entity.File{
-					ID:      asset.FileID,
-					Path:    asset.Path,
-					Size:    asset.Size,
-					Updated: asset.Modified,
-					Chunks:  asset.Chunks,
-				}
-				files = append(files, file)
-			}
+			files = append(files, file)
+		}
+	}
+	if manifestMigrated {
+		normalizedAssets := make(map[string]*LazyAsset, len(manifest.Assets))
+		for _, asset := range manifest.Assets {
+			asset.Path = normalizeLazyPath(asset.Path)
+			normalizedAssets[asset.Path] = asset
+		}
+		manifest.Assets = normalizedAssets
+		if saveErr := repo.lazyLoader.saveManifest(manifest); nil != saveErr {
+			return nil, fmt.Errorf("save migrated lazy manifest: %w", saveErr)
 		}
 	}
 

@@ -329,6 +329,240 @@ func TestGetLazyFilesForIndexSkipsDSStore(t *testing.T) {
 	}
 }
 
+func TestBuildCheckIndexIncludesLazyFiles(t *testing.T) {
+	normal := &entity.File{ID: "normal", Chunks: []string{"normal-chunk"}}
+	lazy := &entity.File{ID: "lazy", Chunks: []string{"lazy-chunk"}}
+	index := &entity.Index{ID: "index", Files: []string{normal.ID}, LazyFiles: []string{lazy.ID}}
+	check := buildCheckIndex(index, []*entity.File{normal, lazy})
+	if len(check.Files) != 2 {
+		t.Fatalf("check files = %#v", check.Files)
+	}
+	if check.Files[1].ID != lazy.ID || len(check.Files[1].Chunks) != 1 || check.Files[1].Chunks[0] != "lazy-chunk" {
+		t.Fatalf("lazy file closure missing: %#v", check.Files)
+	}
+}
+
+func TestLazyTombstonePreventsStaleManifestResurrection(t *testing.T) {
+	// A stale device may carry a future filesystem mtime. Wall-clock ordering
+	// must not let a writer that never observed the tombstone resurrect it.
+	asset := &LazyAsset{Path: "assets/deleted.png", FileID: "old", Modified: 9000, Chunks: []string{"chunk"}}
+	local := &LazyManifest{Assets: map[string]*LazyAsset{}, Tombstones: map[string]*LazyTombstone{
+		asset.Path: {Path: asset.Path, FileID: asset.FileID, DeletedAt: 2000},
+	}}
+	stale := &LazyManifest{Assets: map[string]*LazyAsset{asset.Path: asset}}
+	merged := mergeLazyManifestAssets(local, stale)
+	if merged.Assets[asset.Path] != nil {
+		t.Fatalf("stale asset was resurrected: %#v", merged.Assets[asset.Path])
+	}
+	if merged.Tombstones[asset.Path] == nil {
+		t.Fatal("tombstone was lost")
+	}
+}
+
+func TestCloudLazyIndexCannotBypassLocalTombstone(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	path := "assets/deleted.png"
+	manifest := &LazyManifest{Assets: map[string]*LazyAsset{}, Tombstones: map[string]*LazyTombstone{
+		path: {Path: path, FileID: "deleted", DeletedAt: 2000},
+	}}
+	repo.setLazyManifestAsset(manifest, &LazyAsset{Path: path, FileID: "stale", Modified: 9000, Chunks: []string{"chunk"}})
+	if manifest.Assets[path] != nil {
+		t.Fatalf("cloud index bypassed tombstone: %#v", manifest.Assets[path])
+	}
+}
+
+func TestLazyAssetCanReviveOnlyAfterObservingTombstone(t *testing.T) {
+	path := "assets/recreated.png"
+	tombstone := &LazyTombstone{Path: path, FileID: "deleted", DeletedAt: 2000}
+	deleted := &LazyManifest{Assets: map[string]*LazyAsset{}, Tombstones: map[string]*LazyTombstone{path: tombstone}}
+	revived := &LazyManifest{Assets: map[string]*LazyAsset{path: {
+		Path: path, FileID: "new", Modified: 3000, Chunks: []string{"new-chunk"}, RevivesDeletion: tombstone.DeletedAt,
+	}}}
+	merged := mergeLazyManifestAssets(deleted, revived)
+	if merged.Assets[path] == nil || merged.Tombstones[path] != nil {
+		t.Fatalf("observed post-delete recreation was not preserved: %#v", merged)
+	}
+
+	newerDelete := &LazyManifest{Assets: map[string]*LazyAsset{}, Tombstones: map[string]*LazyTombstone{path: {
+		Path: path, FileID: "new", DeletedAt: 4000,
+	}}}
+	merged = mergeLazyManifestAssets(revived, newerDelete)
+	if merged.Assets[path] != nil || merged.Tombstones[path] == nil {
+		t.Fatalf("newer tombstone lost to older revival proof: %#v", merged)
+	}
+}
+
+func TestClearLazyCacheDoesNotChangeCatalogOrCreateTombstone(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	path := "assets/cache-only.png"
+	absPath := filepath.Join(repo.DataPath, path)
+	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(absPath, []byte("cache"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &LazyManifest{Version: "1.0", Assets: map[string]*LazyAsset{
+		path: {Path: path, FileID: "file", Modified: 1000},
+	}}
+	if err := repo.lazyLoader.saveManifest(manifest); err != nil {
+		t.Fatal(err)
+	}
+	before := manifest.Updated
+	if err := repo.ClearLazyCache(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(absPath); !os.IsNotExist(err) {
+		t.Fatal("cached bytes were not evicted")
+	}
+	got, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Assets[path] == nil || len(got.Tombstones) != 0 || got.Updated != before {
+		t.Fatalf("cache eviction changed resource truth: %#v", got)
+	}
+}
+
+func TestProcessLazyRepairQueueUsesTrustedLocalObjectAndBoundsBatch(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	cloudPath := filepath.Join(t.TempDir(), "cloud")
+	if err := os.MkdirAll(cloudPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	repo.cloud = cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{Dir: "repair", RepoPath: repo.Path, Local: &cloud.ConfLocal{Endpoint: cloudPath, ConcurrentReqs: 1}}})
+	data := []byte("trusted repair bytes")
+	id := util.Hash(data)
+	if err := repo.store.PutChunk(&entity.Chunk{ID: id, Data: data}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.enqueueLazyRepair(id, "chunk", os.ErrNotExist); err != nil {
+		t.Fatal(err)
+	}
+	secondID := util.Hash([]byte("not available locally"))
+	if err := repo.enqueueLazyRepair(secondID, "chunk", os.ErrNotExist); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := repo.ProcessLazyRepairQueue(1, map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired != 1 {
+		t.Fatalf("repaired=%d, want 1", repaired)
+	}
+	items, err := repo.loadLazyRepairQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != secondID {
+		t.Fatalf("bounded remaining queue=%#v", items)
+	}
+}
+
+func TestVerifyUploadedFilesRejectsChangedChunkClosureWithSameFileID(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	localCloud := cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{
+		Dir: "metadata-readback", AvailableSize: 1 << 30,
+		Local: &cloud.ConfLocal{Endpoint: t.TempDir(), ConcurrentReqs: 1},
+	}})
+	repo.cloud = localCloud
+	expected := entity.NewFile("assets/readback.png", 7, 1700000000000)
+	expected.Chunks = []string{"expected-chunk"}
+	if err := repo.store.PutFile(expected); err != nil {
+		t.Fatal(err)
+	}
+	altered := *expected
+	altered.Chunks = []string{"different-chunk"}
+	data, err := json.Marshal(&altered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := repo.store.encodeData(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectPath := filepath.ToSlash(filepath.Join("objects", expected.ID[:2], expected.ID[2:]))
+	if _, err = localCloud.UploadBytes(objectPath, encoded, true); err != nil {
+		t.Fatal(err)
+	}
+	_, verified, apiGets, err := repo.verifyUploadedFiles([]string{expected.ID}, map[string]interface{}{})
+	if err == nil || !strings.Contains(err.Error(), "metadata identity mismatch") {
+		t.Fatalf("error = %v, want metadata identity mismatch", err)
+	}
+	if verified != 0 || apiGets != 1 {
+		t.Fatalf("verified=%d apiGets=%d, want 0 successful and 1 attempted", verified, apiGets)
+	}
+}
+
+func TestGetLazyFilesForIndexMigratesNonCanonicalFileID(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	updated := int64(1700000000000)
+	canonical := entity.NewFile("assets/legacy.png", 4, updated)
+	canonical.Chunks = []string{util.Hash([]byte("data"))}
+	if err := repo.lazyLoader.saveManifest(&LazyManifest{Version: "1.0", Assets: map[string]*LazyAsset{
+		"/assets/legacy.png": {
+			Path: "/assets/legacy.png", FileID: "legacy-id", Size: canonical.Size,
+			Modified: updated, Chunks: canonical.Chunks,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	files, err := repo.getLazyFilesForIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].ID != canonical.ID || files[0].Path != canonical.Path {
+		t.Fatalf("canonical lazy metadata = %#v, want %#v", files, canonical)
+	}
+	manifest, err := repo.lazyLoader.getManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset := manifest.Assets[canonical.Path]
+	if asset == nil || asset.FileID != canonical.ID {
+		t.Fatalf("manifest was not migrated: %#v", manifest.Assets)
+	}
+	if _, err = repo.store.GetFile(canonical.ID); err != nil {
+		t.Fatalf("canonical metadata was not stored: %s", err)
+	}
+}
+
+func TestGetLazyFilesForIndexDoesNotMixChangedLocalStatWithOldChunks(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	oldUpdated := int64(1700000000000)
+	old := entity.NewFile("assets/changed.png", 4, oldUpdated)
+	old.Chunks = []string{util.Hash([]byte("old!"))}
+	if err := repo.lazyLoader.saveManifest(&LazyManifest{Version: "1.0", Assets: map[string]*LazyAsset{
+		old.Path: {Path: old.Path, FileID: old.ID, Size: old.Size, Modified: oldUpdated, Chunks: old.Chunks},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	localPath := filepath.Join(repo.DataPath, old.Path)
+	if err := os.WriteFile(localPath, []byte("new content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	files, err := repo.getLazyFilesForIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].ID != old.ID || files[0].Size != old.Size || files[0].Chunks[0] != old.Chunks[0] {
+		t.Fatalf("mixed immutable metadata: %#v, want old manifest %#v", files, old)
+	}
+}
+
+func TestGetLazyFilesForIndexRejectsDuplicateCanonicalPaths(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	if err := repo.lazyLoader.saveManifest(&LazyManifest{Version: "1.0", Assets: map[string]*LazyAsset{
+		"/assets/duplicate.png": {Path: "/assets/duplicate.png", FileID: "one", Size: 1, Modified: 1000, Chunks: []string{"one"}},
+		"assets/duplicate.png":  {Path: "assets/duplicate.png", FileID: "two", Size: 2, Modified: 2000, Chunks: []string{"two"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.getLazyFilesForIndex(); err == nil || !strings.Contains(err.Error(), "duplicate lazy manifest path") {
+		t.Fatalf("error = %v, want duplicate canonical path rejection", err)
+	}
+}
+
 func TestScanLocalAssetsForRepairSkipsSymlink(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("creating symlink requires extra privileges on Windows")

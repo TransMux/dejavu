@@ -472,6 +472,84 @@ type recordingLocalCloud struct {
 	uploads []string
 }
 
+type corruptObjectReadbackCloud struct {
+	*cloud.Local
+	corrupt atomic.Bool
+	missing atomic.Bool
+}
+
+func (testCloud *corruptObjectReadbackCloud) DownloadObject(filePath string) ([]byte, error) {
+	data, err := testCloud.Local.DownloadObject(filePath)
+	if err == nil && testCloud.missing.Load() && strings.HasPrefix(filepath.ToSlash(filePath), "objects/") {
+		return nil, cloud.ErrCloudObjectNotFound
+	}
+	if err == nil && testCloud.corrupt.Load() && strings.HasPrefix(filepath.ToSlash(filePath), "objects/") {
+		return []byte("corrupt readback"), nil
+	}
+	return data, err
+}
+
+type failingLocalCloud struct {
+	*cloud.Local
+	failPath string
+	err      error
+}
+
+func (testCloud *failingLocalCloud) UploadObject(filePath string, overwrite bool) (int64, error) {
+	if filePath == testCloud.failPath {
+		return 0, testCloud.err
+	}
+	return testCloud.Local.UploadObject(filePath, overwrite)
+}
+
+func TestUpdateCloudIndexesDoesNotPublishLatestWhenPrerequisiteFails(t *testing.T) {
+	root := t.TempDir()
+	dataPath := filepath.Join(root, "data")
+	repoPath := filepath.Join(root, "repo")
+	cloudPath := filepath.Join(root, "cloud")
+	for _, dir := range []string{dataPath, repoPath, cloudPath} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dataPath, "document.txt"), []byte("publication ordering"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	aesKey, err := encryption.KDF("publication-password", "publication-salt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localCloud := cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{
+		Dir: "publication", AvailableSize: 1 << 40,
+		Local: &cloud.ConfLocal{Endpoint: cloudPath, ConcurrentReqs: 2},
+	}})
+	testCloud := &failingLocalCloud{Local: localCloud, failPath: "indexes-v2.json", err: errors.New("injected indexes failure")}
+	repo, err := NewRepo(dataPath, repoPath, filepath.Join(root, "history"), filepath.Join(root, "temp"),
+		"publication-device", "publication-device", "test", aesKey, nil, testCloud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err := repo.Index("publication", true, map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldLatest := "old-published-index"
+	if _, err = localCloud.UploadBytes("refs/latest", []byte(oldLatest), true); err != nil {
+		t.Fatal(err)
+	}
+	traffic := &TrafficStat{m: &sync.Mutex{}}
+	if err = repo.updateCloudIndexes(latest, traffic, map[string]interface{}{}); !errors.Is(err, testCloud.err) {
+		t.Fatalf("error = %v, want injected failure", err)
+	}
+	got, err := localCloud.DownloadObject("refs/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != oldLatest {
+		t.Fatalf("refs/latest advanced to %q after prerequisite failure, want %q", got, oldLatest)
+	}
+}
+
 func (testCloud *recordingLocalCloud) UploadObject(filePath string, overwrite bool) (int64, error) {
 	testCloud.mu.Lock()
 	testCloud.uploads = append(testCloud.uploads, filePath)
@@ -557,9 +635,11 @@ func TestManualSyncRecordsChunkAndFileUploadsThroughProductionPath(t *testing.T)
 	if traffic.APIPut != wantAPIPut {
 		t.Fatalf("API PUT count = %d, want %d", traffic.APIPut, wantAPIPut)
 	}
-	// SyncUpload reads refs/latest and updateCloudIndexes reads indexes-v2.json.
-	if traffic.APIGet != 2 {
-		t.Fatalf("API GET count = %d, want 2", traffic.APIGet)
+	// SyncUpload reads refs/latest and indexes-v2.json, then reads back every
+	// newly uploaded object and index before publication.
+	wantAPIGet := 2 + len(chunkIDs) + len(files) + 1
+	if traffic.APIGet != wantAPIGet {
+		t.Fatalf("API GET count = %d, want %d", traffic.APIGet, wantAPIGet)
 	}
 	for _, id := range chunkIDs {
 		if !testCloud.uploadedObject(id) {
@@ -570,6 +650,76 @@ func TestManualSyncRecordsChunkAndFileUploadsThroughProductionPath(t *testing.T)
 		if !testCloud.uploadedObject(file.ID) {
 			t.Fatalf("file %s was not uploaded through the production cloud path", file.ID)
 		}
+	}
+}
+
+func TestSyncUploadCorruptReadbackPreservesPublishedLatest(t *testing.T) {
+	root := t.TempDir()
+	dataPath := filepath.Join(root, "data")
+	repoPath := filepath.Join(root, "repo")
+	cloudPath := filepath.Join(root, "cloud")
+	for _, dir := range []string{dataPath, repoPath, cloudPath} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	documentPath := filepath.Join(dataPath, "document.txt")
+	if err := os.WriteFile(documentPath, []byte("first version"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	aesKey, err := encryption.KDF("readback-password", "readback-salt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localCloud := cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{Dir: "readback", AvailableSize: 1 << 40,
+		Local: &cloud.ConfLocal{Endpoint: cloudPath, ConcurrentReqs: 2}}})
+	testCloud := &corruptObjectReadbackCloud{Local: localCloud}
+	repo, err := NewRepo(dataPath, repoPath, filepath.Join(root, "history"), filepath.Join(root, "temp"),
+		"readback-device", "readback-device", "test", aesKey, nil, testCloud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := repo.Index("first", true, map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = repo.SyncUpload(map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(documentPath, []byte("second version with changed bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Now().Add(2 * time.Second)
+	if err = os.Chtimes(documentPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = repo.Index("second", true, map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	testCloud.corrupt.Store(true)
+	if _, err = repo.SyncUpload(map[string]interface{}{}); err == nil {
+		t.Fatal("expected corrupt uploaded object readback to fail sync")
+	}
+	testCloud.corrupt.Store(false)
+	published, err := localCloud.DownloadObject("refs/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(published) != first.ID {
+		t.Fatalf("published latest advanced to %q, want %q", published, first.ID)
+	}
+
+	testCloud.missing.Store(true)
+	if _, err = repo.SyncUpload(map[string]interface{}{}); err == nil {
+		t.Fatal("expected missing uploaded object readback to fail sync")
+	}
+	testCloud.missing.Store(false)
+	published, err = localCloud.DownloadObject("refs/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(published) != first.ID {
+		t.Fatalf("published latest advanced after missing readback to %q, want %q", published, first.ID)
 	}
 }
 

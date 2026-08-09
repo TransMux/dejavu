@@ -1268,11 +1268,9 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		} else {
 			// 文件不在upserts中，直接添加到索引
 			if isLazyFile {
-				if ensureErr := repo.ensureLazyFileStored(file, context); nil != ensureErr {
-					err = ensureErr
-					logging.LogErrorf("ensure lazy file metadata [%s] failed: %s", file.Path, ensureErr)
-					return
-				}
+				// Unchanged lazy metadata was validated when it entered the
+				// manifest. Avoid a filesystem stat for every lazy asset on every
+				// snapshot; publication performs the final closure check.
 				ret.LazyFiles = append(ret.LazyFiles, file.ID)
 			} else {
 				ret.Files = append(ret.Files, file.ID)
