@@ -804,8 +804,10 @@ func (repo *Repo) sync0(context map[string]interface{},
 		cloudLatestFiles = append(cloudLatestFiles, cloudLazyFiles...)
 	}
 
-	// 所有文件都是普通文件（懒加载文件已单独处理）
+	// 下载仅处理普通文件，上传去重基线需要包含云端已经发布的懒加载文件分块。
 	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
+	cloudUploadChunkIDs := repo.getChunks(append(append([]*entity.File{}, cloudLatestFiles...), cloudLazyFiles...))
+	uploadSession := newSyncUploadSession()
 
 	transferTraffic, transferErr := runConcurrentSyncTransfers(func(ret *TrafficStat) error { // 从云端下载缺失分块并入库
 		fetchChunkIDs, downloadErr := repo.localNotFoundChunks(cloudChunkIDs)
@@ -826,7 +828,7 @@ func (repo *Repo) sync0(context map[string]interface{},
 		}
 		return downloadResult.err
 	}, func(ret *TrafficStat) error { // 上传差异数据
-		uploadErr := repo.uploadCloud(context, latest, cloudLatest, cloudChunkIDs, ret)
+		uploadErr := repo.uploadCloud(context, latest, cloudLatest, cloudUploadChunkIDs, ret, uploadSession)
 		if nil != uploadErr {
 			logging.LogErrorf("upload cloud failed: %s", uploadErr)
 			return uploadErr
@@ -1097,7 +1099,8 @@ func (repo *Repo) sync0(context map[string]interface{},
 	}
 
 	// 处理合并
-	err = repo.mergeSync(mergeResult, localChanged, true, latest, cloudLatest, cloudChunkIDs, trafficStat, context)
+	err = repo.mergeSync(mergeResult, localChanged, true, latest, cloudLatest, cloudUploadChunkIDs, trafficStat, context,
+		uploadSession)
 	if nil != err {
 		logging.LogErrorf("merge sync failed: %s", err)
 		return
@@ -1258,7 +1261,12 @@ func (repo *Repo) restoreFiles(mergeResult *MergeResult, context map[string]inte
 	return
 }
 
-func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncCloud bool, latest, cloudLatest *entity.Index, cloudChunkIDs []string, trafficStat *TrafficStat, context map[string]interface{}) (err error) {
+func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncCloud bool, latest, cloudLatest *entity.Index,
+	cloudChunkIDs []string, trafficStat *TrafficStat, context map[string]interface{}, uploadSessions ...*syncUploadSession) (err error) {
+	var uploadSession *syncUploadSession
+	if 0 < len(uploadSessions) {
+		uploadSession = uploadSessions[0]
+	}
 	if mergeResult.DataChanged() {
 		if localChanged { // 如果云端和本地都改变了，则需要创建合并索引并再次同步
 			logging.LogInfof("creating merge index [%s]", latest.ID)
@@ -1300,7 +1308,7 @@ func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncClou
 			logging.LogInfof("created merge index [%s]", latest.ID)
 
 			if needSyncCloud {
-				err = repo.uploadCloud(context, latest, cloudLatest, cloudChunkIDs, trafficStat)
+				err = repo.uploadCloud(context, latest, cloudLatest, cloudChunkIDs, trafficStat, uploadSession)
 				if nil != err {
 					logging.LogErrorf("upload cloud failed: %s", err)
 					return
@@ -1337,7 +1345,12 @@ func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncClou
 			logging.LogErrorf("update cloud indexes failed: %s", err)
 			return
 		}
-		if err = repo.completeUploadTransactionForIndex(latest.ID); nil != err {
+		if nil != uploadSession {
+			err = repo.completeSyncUploadSession(uploadSession)
+		} else {
+			err = repo.completeUploadTransactionForIndex(latest.ID)
+		}
+		if nil != err {
 			return
 		}
 		if repo.lazyLoadEnabled && nil != repo.lazyLoader && "" != latest.LazyManifest {
@@ -2763,8 +2776,55 @@ func (repo *Repo) UpdateLatestSync(index *entity.Index) (err error) {
 	return
 }
 
-func (repo *Repo) uploadCloud(context map[string]interface{},
-	latest, cloudLatest *entity.Index, cloudChunkIDs []string, trafficStat *TrafficStat) (err error) {
+type syncUploadSession struct {
+	completedChunks map[string]bool
+	completedFiles  map[string]bool
+}
+
+func newSyncUploadSession() *syncUploadSession {
+	return &syncUploadSession{completedChunks: map[string]bool{}, completedFiles: map[string]bool{}}
+}
+
+func (session *syncUploadSession) record(tx *uploadTransaction) {
+	if nil == session || nil == tx {
+		return
+	}
+	for id, completed := range tx.CompletedChunks {
+		if completed {
+			session.completedChunks[id] = true
+		}
+	}
+	for id, completed := range tx.CompletedFiles {
+		if completed {
+			session.completedFiles[id] = true
+		}
+	}
+}
+
+func (repo *Repo) completeSyncUploadSession(session *syncUploadSession) error {
+	if nil == session {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(repo.Path, "upload-transactions", "current.json"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if nil != err {
+		return err
+	}
+	tx := &uploadTransaction{}
+	if err = json.Unmarshal(data, tx); nil != err {
+		return err
+	}
+	return repo.completeUploadTransaction(tx)
+}
+
+func (repo *Repo) uploadCloud(context map[string]interface{}, latest, cloudLatest *entity.Index, cloudChunkIDs []string,
+	trafficStat *TrafficStat, uploadSessions ...*syncUploadSession) (err error) {
+	var uploadSession *syncUploadSession
+	if 0 < len(uploadSessions) {
+		uploadSession = uploadSessions[0]
+	}
 	start := time.Now()
 	logging.LogInfof("uploadCloud: start latestID=%s cloudLatestID=%s latestFiles=%d latestLazy=%d cloudFiles=%d cloudLazy=%d cloudChunks=%d",
 		latest.ID, cloudLatest.ID, len(latest.Files), len(latest.LazyFiles), len(cloudLatest.Files), len(cloudLatest.LazyFiles), len(cloudChunkIDs))
@@ -2774,6 +2834,15 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 	if nil != err {
 		logging.LogErrorf("get local upsert files failed: %s", err)
 		return
+	}
+	if nil != uploadSession {
+		filtered := upsertFiles[:0]
+		for _, file := range upsertFiles {
+			if !uploadSession.completedFiles[file.ID] {
+				filtered = append(filtered, file)
+			}
+		}
+		upsertFiles = filtered
 	}
 
 	if 1 > len(upsertFiles) {
@@ -2794,6 +2863,15 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 	if nil != err {
 		logging.LogErrorf("get local upsert chunk ids failed: %s", err)
 		return
+	}
+	if nil != uploadSession {
+		pending := upsertChunkIDs[:0]
+		for _, id := range upsertChunkIDs {
+			if !uploadSession.completedChunks[id] {
+				pending = append(pending, id)
+			}
+		}
+		upsertChunkIDs = pending
 	}
 	logging.LogInfof("uploadCloud: upsert chunks=%d", len(upsertChunkIDs))
 	uploadFileIDs := make([]string, 0, len(upsertFiles))
@@ -2833,6 +2911,7 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 	if nil != verificationErr {
 		return verificationErr
 	}
+	uploadSession.record(uploadTx)
 	logging.LogInfof("uploadCloud: uploaded chunks=%d bytes=%d", uploadResult.completed, uploadResult.bytes)
 
 	// 上传文件
@@ -2867,6 +2946,7 @@ func (repo *Repo) uploadCloud(context map[string]interface{},
 	if nil != verificationErr {
 		return verificationErr
 	}
+	uploadSession.record(uploadTx)
 	logging.LogInfof("uploadCloud: uploaded files=%d lazy=%d bytes=%d cost=%s",
 		uploadResult.completed, upsertLazyFiles, uploadResult.bytes, time.Since(start))
 	return
