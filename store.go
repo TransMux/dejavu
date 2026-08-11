@@ -419,12 +419,12 @@ func (store *Store) PutFile(file *entity.File) (err error) {
 		return errors.New("put file failed: " + err.Error())
 	}
 
-	fileCache.Set(file.ID, file, int64(len(data)))
+	fileCache.Set(store.fileCacheKey(file.ID), file, int64(len(data)))
 	return
 }
 
 func (store *Store) GetFile(id string) (ret *entity.File, err error) {
-	cached, _ := fileCache.Get(id)
+	cached, _ := fileCache.Get(store.fileCacheKey(id))
 	if nil != cached {
 		ret = cached.(*entity.File)
 		return
@@ -445,8 +445,12 @@ func (store *Store) GetFile(id string) (ret *entity.File, err error) {
 		return
 	}
 
-	fileCache.Set(id, ret, int64(len(data)))
+	fileCache.Set(store.fileCacheKey(id), ret, int64(len(data)))
 	return
+}
+
+func (store *Store) fileCacheKey(id string) string {
+	return store.Path + "\x00" + id
 }
 
 func (store *Store) PutChunk(chunk *entity.Chunk) (err error) {
@@ -576,5 +580,5 @@ var indexCache, _ = ristretto.NewCache(&ristretto.Config{
 })
 
 func (store *Store) cacheFile(file *entity.File) {
-	fileCache.Set(file.ID, file, 256 /* 直接使用合理的均值以免进行实际计算消耗性能 */)
+	fileCache.Set(store.fileCacheKey(file.ID), file, 256 /* 直接使用合理的均值以免进行实际计算消耗性能 */)
 }

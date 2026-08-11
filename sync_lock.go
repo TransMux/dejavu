@@ -38,6 +38,8 @@ const (
 	lockSyncKey = "lock-sync"
 )
 
+var cloudLockRetryDelay = 500 * time.Millisecond
+
 func (repo *Repo) unlockCloud(context map[string]interface{}) {
 	endRefreshLock <- true
 	var err error
@@ -60,12 +62,13 @@ func (repo *Repo) unlockCloud(context map[string]interface{}) {
 var endRefreshLock = make(chan bool)
 
 func (repo *Repo) tryLockCloud(currentDeviceID string, context map[string]interface{}) (err error) {
-	for i := 0; i < 3; i++ {
+	attempts := cloudLockAttempts(context)
+	for i := 0; i < attempts; i++ {
 		err = repo.lockCloud(currentDeviceID, context)
 		if nil != err {
-			if errors.Is(err, ErrCloudLocked) {
-				logging.LogInfof("cloud repo is locked, retry after 5s")
-				time.Sleep(5 * time.Second)
+			if errors.Is(err, ErrCloudLocked) && i+1 < attempts {
+				logging.LogInfof("cloud repo is locked, retry after %s", cloudLockRetryDelay)
+				time.Sleep(cloudLockRetryDelay)
 				continue
 			}
 			return
@@ -90,6 +93,13 @@ func (repo *Repo) tryLockCloud(currentDeviceID string, context map[string]interf
 		return
 	}
 	return
+}
+
+func cloudLockAttempts(context map[string]interface{}) int {
+	if manual, _ := context["manualSync"].(bool); manual {
+		return 2
+	}
+	return 1
 }
 
 // lockCloud 锁定云端仓库，不要单独调用，应该调用 tryLockCloud，否则解锁时 endRefreshLock 会阻塞。

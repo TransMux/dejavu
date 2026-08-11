@@ -63,11 +63,23 @@ type Repo struct {
 	chunkPol chunker.Pol // 文件分块多项式值
 	cloud    cloud.Cloud // 云端存储服务
 
-	chunkSource ChunkSource // 同步时可选的只读分块来源
+	chunkSource   ChunkSource       // 同步时可选的只读分块来源
+	conflictMerge ConflictMergeFunc // 同步冲突的可选领域合并器
 
 	// 懒加载支持
-	lazyLoadEnabled bool        // 是否启用懒加载
-	lazyLoader      *LazyLoader // 懒加载管理器
+	lazyLoadEnabled        bool        // 是否启用懒加载
+	lazyLoader             *LazyLoader // 懒加载管理器
+	lazyManifestMigrations atomic.Int64
+	lazyManifestPreparedMu sync.RWMutex
+	lazyManifestPrepared   string // 当前进程已验证、等待本地 latest 成功发布的清单身份
+}
+
+// ConflictMergeFunc 尝试合并同一路径的共同祖先、本地和云端内容。
+type ConflictMergeFunc func(path string, base, local, remote []byte) (merged []byte, ok bool)
+
+// SetConflictMerge 设置可选的同步冲突合并器。
+func (repo *Repo) SetConflictMerge(merge ConflictMergeFunc) {
+	repo.conflictMerge = merge
 }
 
 // SetChunkSource 设置同步时可选的只读分块来源。
@@ -924,6 +936,9 @@ func (repo *Repo) removeCloudObjects(objects []string) (err error) {
 }
 
 func (repo *Repo) index(memo string, checkChunks bool, context map[string]interface{}) (ret *entity.Index, err error) {
+	if err = repo.prepareLocalLazyManifestClosure(context); nil != err {
+		return nil, err
+	}
 	for i := 0; i < 7; i++ {
 		ret, err = repo.index0(memo, checkChunks, context)
 		if nil == err {
@@ -944,7 +959,7 @@ func (repo *Repo) index(memo string, checkChunks bool, context map[string]interf
 func (repo *Repo) index0(memo string, checkChunks bool, context map[string]interface{}) (ret *entity.Index, err error) {
 	logging.LogInfof("index0: starting index creation process")
 
-	var files []*entity.File
+	var files, currentLazyFiles []*entity.File
 	ignoreMatcher := repo.ignoreMatcher()
 	eventbus.Publish(eventbus.EvtIndexBeforeWalkData, context, repo.DataPath)
 	logging.LogInfof("index0: phase 1/6 - starting file walk in directory: %s", repo.DataPath)
@@ -998,6 +1013,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		if lazyErr != nil {
 			logging.LogWarnf("get lazy files for index failed: %s", lazyErr)
 		} else if len(lazyFiles) > 0 {
+			currentLazyFiles = lazyFiles
 			files = append(files, lazyFiles...)
 			logging.LogInfof("index0: phase 2/6 completed - added %d lazy files", len(lazyFiles))
 		} else {
@@ -1051,6 +1067,39 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	fullLatest := repo.getFullLatest(latest)
 	if nil != fullLatest {
 		latestFiles = fullLatest.Files
+		if 1 <= fullLatest.Spec && 0 < len(latest.LazyFiles) {
+			currentManifestIdentity, identityErr := repo.lazyManifestIdentity()
+			if nil != identityErr {
+				return nil, identityErr
+			}
+			if latest.LazyManifest == currentManifestIdentity && fullLatest.LazyManifest == currentManifestIdentity {
+				// 清单身份未变时，当前清单元数据就是懒加载基线，不再读取全部对象。
+				latestFiles = append(latestFiles, currentLazyFiles...)
+			} else {
+				lazyBaseline, previousManifest, baselineErr := repo.lazyManifestBaseline(latest, context)
+				if nil != baselineErr {
+					// 旧清单根缺失或损坏时保留逐对象恢复路径，不能用未经身份绑定的目录替代权威索引。
+					logging.LogWarnf("load lazy manifest baseline [%s] failed: %s, falling back to %d metadata objects",
+						latest.LazyManifest, baselineErr, len(latest.LazyFiles))
+					lazyBaseline, baselineErr = repo.getFiles(latest.LazyFiles)
+					if nil != baselineErr {
+						return nil, baselineErr
+					}
+				} else {
+					currentManifest, manifestErr := repo.lazyLoader.getManifest()
+					if nil != manifestErr {
+						return nil, manifestErr
+					}
+					delta, diffErr := diffLazyManifests(previousManifest, currentManifest)
+					if nil != diffErr {
+						return nil, diffErr
+					}
+					logging.LogInfof("lazy manifest diff [adds=%d, updates=%d, deletes=%d, revives=%d]",
+						len(delta.Adds), len(delta.Updates), len(delta.Deletes), len(delta.Revives))
+				}
+				latestFiles = append(latestFiles, lazyBaseline...)
+			}
+		}
 		logging.LogInfof("index0: phase 4/6 completed - got %d latest files from full latest", len(latestFiles))
 	} else {
 		var workerErrs []error
@@ -1150,6 +1199,14 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	logging.LogInfof("index0: phase 5/6 completed - found %d upserts, %d removes", len(upserts), len(removes))
 
 	if 1 > len(upserts) && 1 > len(removes) {
+		if repo.lazyLoadEnabled && nil != repo.lazyLoader && "" != latest.LazyManifest {
+			if currentIdentity, identityErr := repo.lazyManifestIdentity(); nil == identityErr && currentIdentity == latest.LazyManifest {
+				if markErr := repo.markLazyManifestLocalClosurePrepared(currentIdentity); nil != markErr {
+					return nil, markErr
+				}
+				repo.setLazyManifestPrepared("")
+			}
+		}
 		logging.LogInfof("index0: no changes detected, returning existing index")
 		ret = latest
 		return
@@ -1260,7 +1317,12 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		if upsertFile, isInUpserts := upsertMap[pathKey]; isInUpserts {
 			// 文件在upserts中，需要重新处理chunks
 			if isLazyFile {
-				lazyFiles = append(lazyFiles, upsertFile)
+				if 0 < len(upsertFile.Chunks) {
+					// 清单条目是最后一次完整分块的不可变版本。即使本地索引缺少基线，也直接复用，迁移只能在云端锁内执行。
+					ret.LazyFiles = append(ret.LazyFiles, upsertFile.ID)
+				} else {
+					lazyFiles = append(lazyFiles, upsertFile)
+				}
 			} else {
 				ret.Files = append(ret.Files, upsertFile.ID)
 				ret.Size += upsertFile.Size
@@ -1306,42 +1368,96 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			logging.LogWarnf("update lazy manifest failed: %s", updateErr)
 		}
 
-		// 保存清单文件并添加到索引
-		if repo.lazyLoader != nil {
-			manifestPath := repo.lazyLoader.getManifestPath()
-			relManifestPath := repo.relPath(manifestPath)
-			if gulu.File.IsExist(manifestPath) {
-				info, statErr := os.Stat(manifestPath)
-				if statErr == nil {
-					manifestFile := entity.NewFile(relManifestPath, info.Size(), info.ModTime().UnixMilli())
-					if putErr := repo.putFileChunks(manifestFile, context, 0, 1); putErr == nil {
-						ret.LazyManifest = manifestFile.ID
-						ret.Files = append(ret.Files, manifestFile.ID)
-						ret.Size += manifestFile.Size
-					}
-				}
+	}
+	if repo.lazyLoadEnabled && nil != repo.lazyLoader {
+		manifestPath := repo.lazyLoader.getManifestPath()
+		if info, statErr := os.Stat(manifestPath); nil == statErr {
+			manifestFile := entity.NewFile(repo.relPath(manifestPath), info.Size(), info.ModTime().UnixMilli())
+			if putErr := repo.putFileChunks(manifestFile, context, 0, 1); nil != putErr {
+				return nil, fmt.Errorf("store lazy manifest root: %w", putErr)
 			}
+			ret.LazyManifest = manifestFile.ID
 		}
-
 	}
 
 	ret.Count = len(ret.Files)
-
 	err = repo.store.PutIndex(ret)
 	if nil != err {
 		logging.LogErrorf("put index failed: %s", err)
 		return
 	}
-
 	err = repo.UpdateLatest(ret)
 	if nil != err {
 		logging.LogErrorf("update latest failed: %s", err)
 		return
 	}
+	if repo.lazyLoadEnabled && nil != repo.lazyLoader && "" != ret.LazyManifest {
+		if err = repo.markLazyManifestLocalClosurePrepared(ret.LazyManifest); nil != err {
+			return nil, fmt.Errorf("mark local lazy manifest closure: %w", err)
+		}
+		repo.setLazyManifestPrepared("")
+	}
 
 	logging.LogInfof("index0: phase 6/6 completed - index creation finished")
 	logging.LogInfof("index0: successfully created index with %d files, %d lazy files", len(ret.Files), len(ret.LazyFiles))
 	return
+}
+
+func (repo *Repo) lazyManifestBaseline(latest *entity.Index, context map[string]interface{}) ([]*entity.File, *LazyManifest, error) {
+	if nil == latest || "" == latest.LazyManifest {
+		return nil, nil, fmt.Errorf("latest lazy manifest identity is empty")
+	}
+	manifest, err := repo.lazyManifestByIdentity(latest.LazyManifest, "index-baseline", context)
+	if nil != err {
+		return nil, nil, err
+	}
+	files, err := repo.lazyManifestFilesForIndex(manifest)
+	if nil != err {
+		return nil, nil, err
+	}
+	if len(files) != len(latest.LazyFiles) {
+		return nil, nil, fmt.Errorf("lazy manifest baseline count mismatch [manifest=%d, index=%d]", len(files), len(latest.LazyFiles))
+	}
+	for i, file := range files {
+		if nil == file || file.ID != latest.LazyFiles[i] {
+			got := ""
+			if nil != file {
+				got = file.ID
+			}
+			return nil, nil, fmt.Errorf("lazy manifest baseline file mismatch at [%d] [got=%s, expected=%s]", i, got, latest.LazyFiles[i])
+		}
+	}
+	return files, manifest, nil
+}
+
+func (repo *Repo) lazyManifestByIdentity(identity, name string, context map[string]interface{}) (*LazyManifest, error) {
+	manifestFile, err := repo.store.GetFile(identity)
+	if nil != err {
+		return nil, fmt.Errorf("get lazy manifest root [%s]: %w", identity, err)
+	}
+	if manifestFile.ID != identity {
+		return nil, fmt.Errorf("lazy manifest root identity mismatch [got=%s, expected=%s]", manifestFile.ID, identity)
+	}
+	manifest, err := repo.checkoutLazyManifest(manifestFile, name, context)
+	if nil != err {
+		return nil, fmt.Errorf("checkout lazy manifest root [%s]: %w", identity, err)
+	}
+	if err = validateCurrentLazyManifestCatalog(manifest); nil != err {
+		return nil, fmt.Errorf("validate lazy manifest root [%s]: %w", identity, err)
+	}
+	return manifest, nil
+}
+
+func (repo *Repo) setLazyManifestPrepared(identity string) {
+	repo.lazyManifestPreparedMu.Lock()
+	repo.lazyManifestPrepared = identity
+	repo.lazyManifestPreparedMu.Unlock()
+}
+
+func (repo *Repo) isLazyManifestPrepared(identity string) bool {
+	repo.lazyManifestPreparedMu.RLock()
+	defer repo.lazyManifestPreparedMu.RUnlock()
+	return "" != identity && repo.lazyManifestPrepared == identity
 }
 
 func (repo *Repo) ensureLazyFileStored(file *entity.File, context map[string]interface{}) error {

@@ -18,6 +18,7 @@ package dejavu
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -60,19 +62,21 @@ type MergeResult struct {
 	Time                        time.Time
 	Upserts, Removes, Conflicts []*entity.File
 	MergedLazyManifest          bool
+	MergedPaths                 []string
 
 	UpsertPetals []string // storage/petal/petals.json 中变更的插件，在思源中计算并填充
 	RemovePetals []string // storage/petal/petals.json 中删除的插件，在思源中计算并填充
 }
 
 func (mr *MergeResult) DataChanged() bool {
-	return len(mr.Upserts) > 0 || len(mr.Removes) > 0 || len(mr.Conflicts) > 0 || mr.MergedLazyManifest
+	return len(mr.Upserts) > 0 || len(mr.Removes) > 0 || len(mr.Conflicts) > 0 || mr.MergedLazyManifest || len(mr.MergedPaths) > 0
 }
 
 type DownloadTrafficStat struct {
 	DownloadFileCount      int
 	DownloadChunkCount     int
 	DownloadBytes          int64
+	PeerDownloadFileCount  int
 	PeerDownloadChunkCount int
 	PeerDownloadBytes      int64
 	PeerFallbackCount      int
@@ -101,7 +105,15 @@ func (repo *Repo) GetSyncCloudFiles(cloudLatest *entity.Index, context map[strin
 	lock.Lock()
 	defer lock.Unlock()
 
-	fetchedFiles, err = repo.getSyncCloudFiles(cloudLatest, context)
+	fetchedFiles, _, err = repo.getSyncCloudFiles(cloudLatest, context)
+	return
+}
+
+func (repo *Repo) GetSyncCloudFilesWithTraffic(cloudLatest *entity.Index, context map[string]interface{}) (fetchedFiles []*entity.File, trafficStat *DownloadTrafficStat, err error) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	fetchedFiles, trafficStat, err = repo.getSyncCloudFiles(cloudLatest, context)
 	return
 }
 
@@ -114,8 +126,8 @@ func (repo *Repo) GetCloudLatest(context map[string]interface{}) (cloudLatest *e
 }
 
 func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult, trafficStat *TrafficStat, err error) {
-	lock.Lock()
-	defer lock.Unlock()
+	unlockProcess := lockSyncProcess()
+	defer unlockProcess()
 	unlockDeviceLocalFiles := repo.lockDeviceLocalSyncFiles()
 	defer unlockDeviceLocalFiles()
 	var preflightTraffic *TrafficStat
@@ -134,12 +146,6 @@ func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult
 			err = latestErr
 			return
 		}
-		latest, _, latestErr = repo.sanitizeStoredIndex(latest, "[Sync Preflight] Remove device-local files")
-		if nil != latestErr {
-			logging.LogErrorf("sanitize latest failed: %s", latestErr)
-			err = latestErr
-			return
-		}
 		length, latestAPIGet, cloudLatest, latestErr := repo.downloadCloudLatest(context)
 		if nil != latestErr {
 			if !errors.Is(latestErr, cloud.ErrCloudObjectNotFound) {
@@ -151,7 +157,23 @@ func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult
 		trafficStat.DownloadFileCount += latestAPIGet
 		trafficStat.DownloadBytes += length
 		trafficStat.APIGet += latestAPIGet
-		if cloudLatest.ID == latest.ID {
+		latest, latestErr = repo.consumePublishedLazyManifestIfNeeded(latest, cloudLatest, context)
+		if nil != latestErr {
+			err = latestErr
+			return
+		}
+		latest, _, latestErr = repo.sanitizeStoredIndex(latest, "[Sync Preflight] Remove device-local files")
+		if nil != latestErr {
+			logging.LogErrorf("sanitize latest failed: %s", latestErr)
+			err = latestErr
+			return
+		}
+		lazyManifestRequiresSync, manifestErr := repo.localLazyManifestRequiresSync(latest)
+		if nil != manifestErr {
+			err = manifestErr
+			return
+		}
+		if cloudLatest.ID == latest.ID && !lazyManifestRequiresSync {
 			// 数据一致时不获取云端锁，减少无变更同步的远程请求。
 			return
 		}
@@ -179,6 +201,11 @@ func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult
 	return
 }
 
+var lockSyncProcess = func() func() {
+	lock.Lock()
+	return lock.Unlock
+}
+
 func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult, trafficStat *TrafficStat, err error) {
 	mergeResult = &MergeResult{Time: time.Now()}
 	trafficStat = &TrafficStat{m: &sync.Mutex{}}
@@ -189,12 +216,6 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 		logging.LogErrorf("get latest failed: %s", err)
 		return
 	}
-	latest, _, err = repo.sanitizeStoredIndex(latest, "[Sync] Remove device-local files")
-	if nil != err {
-		logging.LogErrorf("sanitize latest failed: %s", err)
-		return
-	}
-
 	// 从云端获取最新索引
 	length, latestAPIGet, cloudLatest, err := repo.downloadCloudLatest(context)
 	if nil != err {
@@ -206,6 +227,25 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 	trafficStat.DownloadFileCount += latestAPIGet
 	trafficStat.DownloadBytes += length
 	trafficStat.APIGet += latestAPIGet
+	latest, err = repo.consumePublishedLazyManifestIfNeeded(latest, cloudLatest, context)
+	if nil != err {
+		return
+	}
+	latest, _, err = repo.sanitizeStoredIndex(latest, "[Sync] Remove device-local files")
+	if nil != err {
+		logging.LogErrorf("sanitize latest failed: %s", err)
+		return
+	}
+
+	var migrationPublished bool
+	latest, migrationPublished, err = repo.publishLazyManifestRepositoryMigration(latest, cloudLatest, trafficStat, context)
+	if nil != err {
+		return
+	}
+	if migrationPublished {
+		mergeResult = &MergeResult{Time: time.Now()}
+		return
+	}
 
 	if cloudLatest.ID == latest.ID {
 		// 数据一致，直接返回
@@ -241,6 +281,467 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 	return
 }
 
+func (repo *Repo) localLazyManifestRequiresSync(latest *entity.Index) (bool, error) {
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader {
+		return false, nil
+	}
+	manifest, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return false, err
+	}
+	if err = validateLazyManifestFormat(manifest); nil != err {
+		return false, err
+	}
+	if lazyManifestFormatCurrent != lazyManifestFormat(manifest) {
+		return true, nil
+	}
+	manifestPath := repo.lazyLoader.getManifestPath()
+	info, err := os.Stat(manifestPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if nil != err {
+		return false, err
+	}
+	file := entity.NewFile(repo.relPath(manifestPath), info.Size(), info.ModTime().UnixMilli())
+	return nil == latest || latest.LazyManifest != file.ID, nil
+}
+
+func (repo *Repo) readPublishedLazyManifest(index *entity.Index, context map[string]interface{}) (*LazyManifest, error) {
+	if nil == index || "" == index.ID || "" == index.LazyManifest {
+		return &LazyManifest{Version: lazyManifestFormatLegacy, Assets: map[string]*LazyAsset{}}, nil
+	}
+	files, err := repo.getFilesWithCloudFallback([]string{index.LazyManifest}, context)
+	if nil != err {
+		return nil, err
+	}
+	if 1 != len(files) {
+		return nil, fmt.Errorf("published lazy manifest metadata [%s] not found", index.LazyManifest)
+	}
+	missingChunks, err := repo.localNotFoundChunks(files[0].Chunks)
+	if nil != err {
+		return nil, err
+	}
+	if 0 < len(missingChunks) {
+		result := repo.downloadCloudChunksPutDetailed(missingChunks, context)
+		if nil != result.err {
+			return nil, result.err
+		}
+	}
+	manifest, err := repo.checkoutLazyManifest(files[0], "published", context)
+	if nil != err {
+		return nil, fmt.Errorf("read published lazy manifest: %w", err)
+	}
+	return manifest, nil
+}
+
+func (repo *Repo) consumePublishedLazyManifestIfNeeded(latest, cloudLatest *entity.Index,
+	context map[string]interface{}) (*entity.Index, error) {
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader || nil == cloudLatest || "" == cloudLatest.ID ||
+		repo.isLazyManifestHydrated(cloudLatest.LazyManifest) {
+		return latest, nil
+	}
+	published, err := repo.readPublishedLazyManifest(cloudLatest, context)
+	if nil != err {
+		return nil, err
+	}
+	if lazyManifestFormatCurrent != lazyManifestFormat(published) {
+		return latest, nil
+	}
+	if err = validateCurrentLazyManifestCatalog(published); nil != err {
+		return nil, err
+	}
+	local, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return nil, err
+	}
+	merged := mergeLazyManifestAssets(local, published)
+	canonicalized, err := repo.canonicalizeLazyManifestLocalDeltas(merged, published)
+	if nil != err {
+		return nil, err
+	}
+	identityChanges, err := repo.canonicalizeLazyManifestObjectIdentities(merged)
+	if nil != err {
+		return nil, err
+	}
+	canonicalized += identityChanges
+	hydrated, err := repo.hydrateLazyManifestMetadata(merged, context)
+	if nil != err {
+		return nil, err
+	}
+	if err = repo.saveLazyManifestWithNewIdentity(merged); nil != err {
+		return nil, fmt.Errorf("save consumed lazy manifest migration: %w", err)
+	}
+	if err = repo.advanceLazyManifestIdentityPast(cloudLatest.LazyManifest); nil != err {
+		return nil, fmt.Errorf("separate consumed lazy manifest identity: %w", err)
+	}
+	if err = repo.advanceLazyManifestIdentityPastCloudObjects(); nil != err {
+		return nil, fmt.Errorf("reserve consumed lazy manifest identity: %w", err)
+	}
+	latest, err = repo.index("[Sync] Consume lazy manifest repository migration", false, context)
+	if nil != err {
+		return nil, err
+	}
+	if err = repo.markLazyManifestHydrated(cloudLatest.LazyManifest); nil != err {
+		return nil, fmt.Errorf("mark consumed lazy manifest migration: %w", err)
+	}
+	logging.LogInfof("lazy manifest repository migration consumed [assets=%d, hydrated=%d, localDeltas=%d, latest=%s]",
+		len(merged.Assets), hydrated, canonicalized, cloudLatest.ID)
+	return latest, nil
+}
+
+func (repo *Repo) advanceLazyManifestIdentityPastCloudObjects() error {
+	manifestPath := repo.lazyLoader.getManifestPath()
+	for {
+		identity, err := repo.lazyManifestIdentity()
+		if nil != err {
+			return err
+		}
+		_, err = repo.cloud.DownloadObject(path.Join("objects", identity[:2], identity[2:]))
+		if errors.Is(err, cloud.ErrCloudObjectNotFound) {
+			return nil
+		}
+		if nil != err {
+			return err
+		}
+		info, err := os.Stat(manifestPath)
+		if nil != err {
+			return err
+		}
+		updated := info.ModTime().Add(time.Second)
+		if err = os.Chtimes(manifestPath, updated, updated); nil != err {
+			return err
+		}
+	}
+}
+
+func (repo *Repo) publishLazyManifestRepositoryMigration(latest, cloudLatest *entity.Index, trafficStat *TrafficStat,
+	context map[string]interface{}) (ret *entity.Index, published bool, err error) {
+	ret = latest
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader || nil == cloudLatest || "" == cloudLatest.ID {
+		return
+	}
+	publishedManifest, err := repo.readPublishedLazyManifest(cloudLatest, context)
+	if nil != err {
+		return nil, false, err
+	}
+	if err = validateLazyManifestFormat(publishedManifest); nil != err {
+		return nil, false, err
+	}
+	format := lazyManifestFormat(publishedManifest)
+	if lazyManifestFormatCurrent == format {
+		ret, err = repo.consumePublishedLazyManifestIfNeeded(latest, cloudLatest, context)
+		return ret, false, err
+	}
+
+	manifest, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return nil, false, err
+	}
+	if err = validateLazyManifestFormat(manifest); nil != err {
+		return nil, false, err
+	}
+	start := time.Now()
+	logging.LogInfof("lazy manifest repository migration detected [from=%s, to=%s, assets=%d]", format,
+		lazyManifestFormatCurrent, len(manifest.Assets))
+	var migrated int
+	if !isCanonicalLazyManifestSuperset(manifest, publishedManifest) {
+		// 以云端已发布格式为准，合并旧版云端清单与本地增量后规范化完整候选清单，不能信任新设备本地清单的新版标记。
+		candidate := mergeLazyManifestAssets(manifest, publishedManifest)
+		candidate.Version = lazyManifestFormatLegacy
+		migrated, err = repo.migrateLazyManifestRepository(candidate)
+		if nil != err {
+			logging.LogWarnf("lazy manifest repository migration failed before publication: %s", err)
+			return nil, false, err
+		}
+		ret, err = repo.index("[Sync] Lazy manifest repository migration", false, context)
+		if nil != err {
+			return nil, false, err
+		}
+	}
+	cloudFiles, err := repo.getFilesWithCloudFallback(append(append([]string{}, cloudLatest.Files...), cloudLatest.LazyFiles...), context)
+	if nil != err {
+		return nil, false, err
+	}
+	cloudChunkIDs := repo.getChunks(cloudFiles)
+	if err = repo.uploadCloud(context, ret, cloudLatest, cloudChunkIDs, trafficStat); nil != err {
+		logging.LogWarnf("lazy manifest repository migration upload failed before publication: %s", err)
+		return nil, false, err
+	}
+	if err = repo.ensurePublishedLazyManifestMetadata(ret, trafficStat, context); nil != err {
+		logging.LogWarnf("lazy manifest repository migration metadata closure failed before publication: %s", err)
+		return nil, false, err
+	}
+	if err = repo.updateCloudIndexes(ret, trafficStat, context); nil != err {
+		logging.LogWarnf("lazy manifest repository migration index publication failed: %s", err)
+		return nil, false, err
+	}
+	if err = repo.completeUploadTransactionForIndex(ret.ID); nil != err {
+		return nil, false, err
+	}
+	if err = repo.UpdateLatestSync(ret); nil != err {
+		return nil, false, err
+	}
+	if err = repo.markLazyManifestHydrated(ret.LazyManifest); nil != err {
+		return nil, false, fmt.Errorf("mark published lazy manifest migration: %w", err)
+	}
+	logging.LogInfof("lazy manifest repository migration published [assets=%d, latest=%s, cost=%s]", migrated, ret.ID,
+		time.Since(start))
+	return ret, true, nil
+}
+
+func (repo *Repo) ensurePublishedLazyManifestMetadata(index *entity.Index, trafficStat *TrafficStat,
+	context map[string]interface{}) error {
+	manifest, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return err
+	}
+	if err = validateCurrentLazyManifestCatalog(manifest); nil != err {
+		return err
+	}
+	ids := make([]string, 0, len(manifest.Assets))
+	assetsByID := make(map[string]*LazyAsset, len(manifest.Assets))
+	for _, asset := range manifest.Assets {
+		ids = append(ids, asset.FileID)
+		assetsByID[asset.FileID] = asset
+	}
+	ids = uniqueUploadIDs(ids)
+	sort.Strings(ids)
+	files := make([]*entity.File, 0, len(ids))
+	for _, id := range ids {
+		asset := assetsByID[id]
+		file, buildErr := canonicalLazyManifestFile(asset)
+		if nil != buildErr {
+			return fmt.Errorf("build published lazy metadata [%s]: %w", id, buildErr)
+		}
+		if putErr := repo.store.PutFile(file); nil != putErr {
+			return fmt.Errorf("store published lazy metadata [%s]: %w", id, putErr)
+		}
+		files = append(files, file)
+	}
+	byID := make(map[string]*entity.File, len(files))
+	for _, file := range files {
+		byID[file.ID] = file
+	}
+	for path, asset := range manifest.Assets {
+		file := byID[asset.FileID]
+		if nil == file || file.Path != path || file.Size != asset.Size || file.Updated != asset.Modified ||
+			!slices.Equal(file.Chunks, asset.Chunks) {
+			return fmt.Errorf("published lazy metadata [%s] does not match manifest asset [%s]", asset.FileID, path)
+		}
+	}
+
+	plannedChunks := []string{}
+	plannedFiles := append([]string{}, ids...)
+	current := filepath.Join(repo.Path, "upload-transactions", "current.json")
+	if data, readErr := os.ReadFile(current); nil == readErr {
+		tx := &uploadTransaction{}
+		if err = json.Unmarshal(data, tx); nil != err {
+			return fmt.Errorf("read migration upload transaction: %w", err)
+		}
+		if tx.IndexID == index.ID {
+			plannedChunks = tx.PlannedChunks
+			plannedFiles = uniqueUploadIDs(append(tx.PlannedFiles, ids...))
+		}
+	} else if !os.IsNotExist(readErr) {
+		return readErr
+	}
+	tx, err := repo.beginUploadTransaction(index.ID, plannedChunks, plannedFiles)
+	if nil != err {
+		return err
+	}
+	if _, saveErr := repo.verifyAndRecordUploadIDs(tx, false, completedUploadIDs(tx.CompletedFiles), trafficStat, context); nil != saveErr {
+		return saveErr
+	}
+	pendingIDs, _ := pendingUploadIDs(ids, tx.CompletedFiles)
+	pendingSet := make(map[string]bool, len(pendingIDs))
+	for _, id := range pendingIDs {
+		pendingSet[id] = true
+	}
+	pendingFiles := make([]*entity.File, 0, len(pendingIDs))
+	for _, file := range files {
+		if pendingSet[file.ID] {
+			pendingFiles = append(pendingFiles, file)
+		}
+	}
+	result := repo.uploadFilesDetailed(pendingFiles, context)
+	trafficStat.UploadFileCount += result.completed
+	trafficStat.UploadBytes += result.bytes
+	trafficStat.APIPut += result.attempted
+	verificationErr, saveErr := repo.verifyAndRecordUploadIDs(tx, false, result.completedIDs, trafficStat, context)
+	for id, failure := range result.failedIDs {
+		tx.Failed[id] = failure.Error()
+	}
+	if nil == saveErr {
+		saveErr = repo.saveUploadTransaction(tx)
+	}
+	if nil != saveErr {
+		return saveErr
+	}
+	if nil != result.err {
+		return result.err
+	}
+	if nil != verificationErr {
+		return verificationErr
+	}
+	for _, id := range ids {
+		if !tx.CompletedFiles[id] {
+			return fmt.Errorf("published lazy metadata [%s] is not remotely verified", id)
+		}
+	}
+	logging.LogInfof("published lazy manifest metadata closure verified [files=%d, uploaded=%d]", len(ids), result.completed)
+	return nil
+}
+
+func canonicalLazyManifestFile(asset *LazyAsset) (*entity.File, error) {
+	if nil == asset {
+		return nil, errors.New("asset is nil")
+	}
+	file := entity.NewFile(asset.Path, asset.Size, asset.Modified)
+	file.Chunks = append([]string(nil), asset.Chunks...)
+	if file.ID != asset.FileID {
+		return nil, fmt.Errorf("derived file ID [%s] does not match manifest file ID [%s]", file.ID, asset.FileID)
+	}
+	return file, nil
+}
+
+func (repo *Repo) hydrateLazyManifestMetadata(manifest *LazyManifest, context map[string]interface{}) (hydrated int, err error) {
+	if err = validateCurrentLazyManifestCatalog(manifest); nil != err {
+		return 0, fmt.Errorf("hydrate lazy manifest metadata: %w", err)
+	}
+	ids := make([]string, 0, len(manifest.Assets))
+	assets := make(map[string]*LazyAsset, len(manifest.Assets))
+	for path, asset := range manifest.Assets {
+		if nil == asset {
+			return 0, fmt.Errorf("hydrate lazy manifest metadata: asset [%s] is nil", path)
+		}
+		if path != normalizeLazyPath(asset.Path) || path != asset.Path {
+			return 0, fmt.Errorf("hydrate lazy manifest metadata: invalid asset path [%s]", path)
+		}
+		if "" == asset.FileID {
+			return 0, fmt.Errorf("hydrate lazy manifest metadata: asset [%s] has empty file ID", path)
+		}
+		if existing, exists := assets[asset.FileID]; exists {
+			if existing.Path != asset.Path || existing.Size != asset.Size || existing.Modified != asset.Modified ||
+				!slices.Equal(existing.Chunks, asset.Chunks) {
+				return 0, fmt.Errorf("hydrate lazy manifest metadata: file ID [%s] is shared by conflicting assets [%s] and [%s]",
+					asset.FileID, existing.Path, asset.Path)
+			}
+		} else {
+			ids = append(ids, asset.FileID)
+		}
+		assets[asset.FileID] = asset
+	}
+	sort.Strings(ids)
+	repaired := 0
+	for _, id := range ids {
+		asset := assets[id]
+		canonical, buildErr := canonicalLazyManifestFile(asset)
+		if nil != buildErr {
+			return 0, fmt.Errorf("hydrate lazy manifest metadata: file [%s]: %w", id, buildErr)
+		}
+		local, getErr := repo.store.GetFile(id)
+		if nil == getErr && nil != local && local.ID == id && local.Path == canonical.Path && local.Size == canonical.Size &&
+			local.Updated == canonical.Updated && slices.Equal(local.Chunks, canonical.Chunks) {
+			continue
+		}
+		if nil != getErr && !os.IsNotExist(getErr) {
+			return 0, fmt.Errorf("hydrate lazy manifest metadata: read file [%s]: %w", id, getErr)
+		}
+		if nil == getErr {
+			return 0, fmt.Errorf("hydrate lazy manifest metadata: immutable file [%s] conflicts with manifest asset [%s]", id,
+				asset.Path)
+		}
+		if putErr := repo.store.PutFile(canonical); nil != putErr {
+			return 0, fmt.Errorf("hydrate lazy manifest metadata: store file [%s]: %w", id, putErr)
+		}
+		repaired++
+	}
+	return repaired, nil
+}
+
+func (repo *Repo) prepareLocalLazyManifestClosure(context map[string]interface{}) error {
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader {
+		return nil
+	}
+	if _, statErr := os.Stat(repo.lazyLoader.getManifestPath()); nil != statErr {
+		if os.IsNotExist(statErr) {
+			return nil
+		}
+		return statErr
+	}
+	identity, err := repo.lazyManifestIdentity()
+	if nil != err {
+		return err
+	}
+	if repo.isLazyManifestLocalClosurePrepared(identity) {
+		return nil
+	}
+	manifest, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return err
+	}
+	if lazyManifestFormatCurrent != lazyManifestFormat(manifest) {
+		return nil
+	}
+	start := time.Now()
+	closureManifest := manifest
+	mode := "full"
+	var delta LazyManifestDelta
+	if latest, latestErr := repo.Latest(); nil == latestErr && "" != latest.LazyManifest &&
+		repo.isLazyManifestLocalClosurePrepared(latest.LazyManifest) {
+		if previous, baselineErr := repo.lazyManifestByIdentity(latest.LazyManifest, "closure-baseline", context); nil == baselineErr {
+			delta, err = diffLazyManifests(previous, manifest)
+			if nil != err {
+				return fmt.Errorf("diff local lazy manifest closure: %w", err)
+			}
+			changedAssets := make(map[string]*LazyAsset, len(delta.Adds)+len(delta.Updates)+len(delta.Revives))
+			for _, assets := range [][]*LazyAsset{delta.Adds, delta.Updates, delta.Revives} {
+				for _, asset := range assets {
+					changedAssets[normalizeLazyPath(asset.Path)] = asset
+				}
+			}
+			closureManifest = &LazyManifest{Version: lazyManifestFormatCurrent, Assets: changedAssets}
+			mode = "delta"
+		} else {
+			logging.LogWarnf("load prepared lazy manifest baseline [%s] failed: %s, validating full closure",
+				latest.LazyManifest, baselineErr)
+		}
+	}
+	identityChanges, err := repo.canonicalizeLazyManifestObjectIdentities(closureManifest)
+	if nil != err {
+		return err
+	}
+	if 0 < identityChanges {
+		if err = repo.saveLazyManifestWithNewIdentity(manifest); nil != err {
+			return err
+		}
+	}
+	if err = validateCurrentLazyManifestCatalog(manifest); nil != err {
+		return err
+	}
+	identity, err = repo.lazyManifestIdentity()
+	if nil != err {
+		return err
+	}
+	if repo.isLazyManifestLocalClosurePrepared(identity) {
+		return nil
+	}
+	if "delta" == mode {
+		logging.LogInfof("local lazy manifest closure diff [adds=%d, updates=%d, deletes=%d, revives=%d]",
+			len(delta.Adds), len(delta.Updates), len(delta.Deletes), len(delta.Revives))
+	}
+	hydrated, err := repo.hydrateLazyManifestMetadata(closureManifest, context)
+	if nil != err {
+		return fmt.Errorf("prepare local lazy manifest closure: %w", err)
+	}
+	repo.setLazyManifestPrepared(identity)
+	// 完成标记由 Index 在本地 latest 成功发布后推进，失败的索引不能提交新的差异基线。
+	logging.LogInfof("local lazy manifest closure prepared [mode=%s, assets=%d, hydrated=%d, cost=%s]", mode,
+		len(closureManifest.Assets), hydrated, time.Since(start))
+	return nil
+}
+
 // sync0 实现了数据同步的核心逻辑。
 //
 // fetchedFiles 已从云端下载的文件
@@ -250,6 +751,23 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 // trafficStat 待返回的流量统计
 func (repo *Repo) sync0(context map[string]interface{},
 	fetchedFiles []*entity.File, cloudLatest *entity.Index, latest *entity.Index, mergeResult *MergeResult, trafficStat *TrafficStat) (err error) {
+	type mergedWorkspaceBackup struct {
+		before, merged []byte
+	}
+	mergedWorkspaceBackups := map[string]mergedWorkspaceBackup{}
+	defer func() {
+		if err == nil {
+			return
+		}
+		for path, backup := range mergedWorkspaceBackups {
+			rolledBack, rollbackErr := compareAndWriteSyncFile(path, backup.merged, backup.before)
+			if rollbackErr != nil {
+				logging.LogErrorf("rollback deterministic conflict merge [%s] failed: %s", path, rollbackErr)
+			} else if !rolledBack {
+				logging.LogInfof("skip deterministic conflict rollback for concurrently edited file [%s]", path)
+			}
+		}
+	}()
 
 	// 获取云端普通文件列表（不包含懒加载文件）
 	cloudLatestFiles, err := repo.getFiles(cloudLatest.Files)
@@ -273,7 +791,7 @@ func (repo *Repo) sync0(context map[string]interface{},
 	cloudLazyFiles, _ = repo.filterProtectedSyncFiles(cloudLazyFiles)
 
 	// 处理懒加载文件：只更新清单，不参与常规同步流程
-	if len(cloudLatest.LazyFiles) > 0 {
+	if len(cloudLatest.LazyFiles) > 0 && "" == cloudLatest.LazyManifest {
 		err = repo.updateLazyManifestFromCloudIndex(cloudLatest.LazyFiles, context)
 		if nil != err {
 			logging.LogErrorf("update lazy manifest from cloud index failed: %s", err)
@@ -425,16 +943,39 @@ func (repo *Repo) sync0(context map[string]interface{},
 				}
 			}
 
+			latestSyncFile := latestSyncFilesByPath[localUpsert.Path]
+			if nil == latestSyncFile {
+				latestSyncFile = latestSyncFilesByID[localUpsert.ID]
+			}
+			if nil != repo.conflictMerge && nil != latestSyncFile {
+				baseData, baseErr := repo.OpenFile(latestSyncFile)
+				localData, localErr := repo.OpenFile(localUpsert)
+				remoteData, remoteErr := repo.OpenFile(cloudUpsert)
+				if nil == baseErr && nil == localErr && nil == remoteErr {
+					if merged, ok := repo.conflictMerge(cloudUpsert.Path, baseData, localData, remoteData); ok {
+						absPath := filepath.Join(repo.DataPath, strings.TrimPrefix(cloudUpsert.Path, "/"))
+						if written, writeErr := compareAndWriteSyncFile(absPath, localData, merged); nil == writeErr && written {
+							// 云端原始版本仍进入同步历史，工作区仅写入已验证的合并结果。
+							tmpMergeConflicts = append(tmpMergeConflicts, cloudUpsert)
+							mergedWorkspaceBackups[absPath] = mergedWorkspaceBackup{before: append([]byte(nil), localData...), merged: append([]byte(nil), merged...)}
+							mergeResult.MergedPaths = append(mergeResult.MergedPaths, cloudUpsert.Path)
+							logging.LogInfof("sync deterministically merged conflict [%s]", cloudUpsert.Path)
+							continue
+						} else if writeErr != nil {
+							logging.LogWarnf("write deterministic conflict merge [%s] failed: %s", cloudUpsert.Path, writeErr)
+						} else {
+							logging.LogInfof("deterministic conflict merge abandoned after concurrent edit [%s]", cloudUpsert.Path)
+						}
+					}
+				}
+			}
+
 			// 无论是否发生实际下载文件，都需要生成本地历史，以确保任何情况下都能够通过数据历史恢复文件
 			tmpMergeConflicts = append(tmpMergeConflicts, cloudUpsert)
 
 			if fetchedFileIDs[cloudUpsert.ID] {
 				// 发生实际下载文件的情况，尝试解决冲突
 
-				latestSyncFile := latestSyncFilesByPath[localUpsert.Path]
-				if nil == latestSyncFile {
-					latestSyncFile = latestSyncFilesByID[localUpsert.ID]
-				}
 				if repo.ignoreLocalUpsert(localUpsert, latestSyncFile, nowStr, context) {
 					// 如果能忽略本地变更的话则不算做冲突，进行正常合并
 					mergeResult.Upserts = append(mergeResult.Upserts, cloudUpsert)
@@ -573,6 +1114,22 @@ func (repo *Repo) sync0(context map[string]interface{},
 	// 移除空目录
 	gulu.File.RemoveEmptyDirs(repo.DataPath, removeEmptyDirExcludes...)
 	return
+}
+
+func compareAndWriteSyncFile(path string, expected, replacement []byte) (written bool, err error) {
+	filelock.Lock(path)
+	defer filelock.Unlock(path)
+	actual, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	if !bytes.Equal(actual, expected) {
+		return false, nil
+	}
+	if err = gulu.File.WriteFileSafer(path, replacement, 0644); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (repo *Repo) ignoreLocalUpsert(localUpsert, latestSyncFile *entity.File, now string, context map[string]interface{}) bool {
@@ -725,6 +1282,11 @@ func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncClou
 			for _, update := range diff.UpdatesLeft {
 				logging.LogInfof("merge index update [%s, %s, %s]", update.ID, update.Path, time.UnixMilli(update.Updated).Format("2006-01-02 15:04:05"))
 			}
+			for _, file := range append(diff.AddsLeft, diff.UpdatesLeft...) {
+				if slices.Contains(mergeResult.MergedPaths, file.Path) {
+					mergeResult.Upserts = append(mergeResult.Upserts, file)
+				}
+			}
 
 			latest = mergedLatest
 			mergeElapsed := time.Since(mergeStart)
@@ -778,8 +1340,18 @@ func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncClou
 		if err = repo.completeUploadTransactionForIndex(latest.ID); nil != err {
 			return
 		}
+		if repo.lazyLoadEnabled && nil != repo.lazyLoader && "" != latest.LazyManifest {
+			if err = repo.markLazyManifestHydrated(latest.LazyManifest); nil != err {
+				return fmt.Errorf("mark published lazy manifest: %w", err)
+			}
+		}
 		if lazyFilesNeedSync {
 			logging.LogInfof("sync: successfully updated cloud indexes with lazy files (count=%d)", len(latest.LazyFiles))
+		}
+	}
+	if repo.lazyLoadEnabled && nil != repo.lazyLoader && "" != latest.LazyManifest {
+		if err = repo.lazyLoader.reloadManifest(); nil != err {
+			return fmt.Errorf("reload synchronized lazy manifest: %w", err)
 		}
 	}
 
@@ -807,12 +1379,20 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 	logging.LogInfof("updateCloudIndexes: start latestID=%s files=%d lazyFiles=%d checkIndexID=%s",
 		latest.ID, len(latest.Files), len(latest.LazyFiles), latest.CheckIndexID)
 
-	// 生成校验索引
-	files, getErr := repo.GetFiles(latest)
+	// 校验索引只展开普通文件和懒加载清单根。懒加载元数据的完整闭包在迁移发布事务中单独校验。
+	files, getErr := repo.getFiles(latest.Files)
 	if nil != getErr {
 		logging.LogErrorf("get files failed: %s", getErr)
 		err = getErr
 		return
+	}
+	if "" != latest.LazyManifest && !containsUploadID(latest.Files, latest.LazyManifest) {
+		manifestFiles, manifestErr := repo.getFiles([]string{latest.LazyManifest})
+		if nil != manifestErr {
+			logging.LogErrorf("get lazy manifest file failed: %s", manifestErr)
+			return manifestErr
+		}
+		files = append(files, manifestFiles...)
 	}
 
 	checkIndex := buildCheckIndex(latest, files)
@@ -1247,7 +1827,8 @@ func (repo *Repo) filterLocalUpserts(localUpserts, cloudUpserts []*entity.File) 
 	return
 }
 
-func (repo *Repo) getSyncCloudFiles(cloudLatest *entity.Index, context map[string]interface{}) (fetchedFiles []*entity.File, err error) {
+func (repo *Repo) getSyncCloudFiles(cloudLatest *entity.Index, context map[string]interface{}) (fetchedFiles []*entity.File, trafficStat *DownloadTrafficStat, err error) {
+	trafficStat = &DownloadTrafficStat{}
 	latest, err := repo.Latest()
 	if nil != err {
 		logging.LogErrorf("get latest failed: %s", err)
@@ -1273,22 +1854,23 @@ func (repo *Repo) getSyncCloudFiles(cloudLatest *entity.Index, context map[strin
 	}
 
 	// 从云端下载缺失文件并入库
-	length, fetchedFiles, err := repo.downloadCloudFilesPut(fetchFileIDs, context)
-	if nil != err {
+	downloadResult, fetchedFiles := repo.downloadCloudFilesPutDetailed(fetchFileIDs, context)
+	if nil != downloadResult.err {
+		err = downloadResult.err
 		logging.LogErrorf("download cloud files put failed: %s", err)
 		return
 	}
 	fetchedFiles, _ = repo.filterProtectedSyncFiles(fetchedFiles)
-	trafficStat := &TrafficStat{m: &sync.Mutex{}}
-	trafficStat.DownloadBytes += length
+	trafficStat.DownloadBytes += downloadResult.bytes
 	trafficStat.DownloadFileCount += len(fetchFileIDs)
-	trafficStat.APIGet += len(fetchFileIDs)
+	trafficStat.PeerDownloadBytes += downloadResult.peerBytes
+	trafficStat.PeerDownloadFileCount += downloadResult.peerCount
+	trafficStat.PeerFallbackCount += downloadResult.peerFallbackCount
 
 	// 统计流量
 	go repo.cloud.AddTraffic(&cloud.Traffic{
-		UploadBytes:   trafficStat.UploadBytes,
 		DownloadBytes: trafficStat.DownloadBytes,
-		APIGet:        trafficStat.APIGet,
+		APIGet:        len(fetchFileIDs) - downloadResult.peerCount,
 	})
 	return
 }
@@ -1385,12 +1967,59 @@ func (repo *Repo) downloadCloudFilesPut(fileIDs []string, context map[string]int
 }
 
 func (repo *Repo) downloadCloudFilesPutDetailed(fileIDs []string, context map[string]interface{}) (result concurrentObjectTransferResult, ret []*entity.File) {
+	peerFiles := map[string]bool{}
+	objectSource, hasObjectSource := repo.chunkSource.(ObjectSource)
+	if hasObjectSource {
+		if found, hasErr := objectSource.HasObjects(fileIDs); nil == hasErr {
+			peerFiles = found
+		} else {
+			logging.LogWarnf("query object source [%s] failed: %s", objectSource.Name(), hasErr)
+		}
+	}
+	cloudConcurrentReqs := repo.cloud.GetConcurrentReqs()
+	if cloudConcurrentReqs < 1 {
+		cloudConcurrentReqs = 1
+	}
+	peerConcurrentReqs := 0
+	if hasObjectSource {
+		peerConcurrentReqs = objectSource.GetConcurrentReqs()
+		if peerConcurrentReqs < 1 {
+			peerConcurrentReqs = 1
+		}
+	}
+	cloudSemaphore := make(chan struct{}, cloudConcurrentReqs)
+	peerSemaphore := make(chan struct{}, peerConcurrentReqs)
+	peerBytes := atomic.Int64{}
+	peerCount := atomic.Int64{}
+	peerFallbackCount := atomic.Int64{}
 	retLock := &sync.Mutex{}
 	total := len(fileIDs)
 	eventbus.Publish(eventbus.EvtCloudBeforeDownloadFiles, context, total)
-	result = runConcurrentObjectTransfers(fileIDs, repo.cloud.GetConcurrentReqs(), "download file",
+	result = runConcurrentObjectTransfers(fileIDs, cloudConcurrentReqs+peerConcurrentReqs, "download file",
 		func(fileID string, attempt int) (int64, error) {
-			length, file, dcfErr := repo.downloadCloudFile(fileID, attempt, total, context)
+			var length int64
+			var file *entity.File
+			var dcfErr error
+			downloadedFromPeer := false
+			if peerFiles[fileID] {
+				peerSemaphore <- struct{}{}
+				length, file, dcfErr = repo.downloadSourceFile(fileID)
+				<-peerSemaphore
+				if nil == dcfErr {
+					downloadedFromPeer = true
+					peerBytes.Add(length)
+					peerCount.Add(1)
+				} else {
+					peerFallbackCount.Add(1)
+					logging.LogWarnf("download file [%s] from source [%s] failed, falling back to cloud: %s",
+						fileID, objectSource.Name(), dcfErr)
+				}
+			}
+			if nil == file {
+				cloudSemaphore <- struct{}{}
+				length, file, dcfErr = repo.downloadCloudFile(fileID, attempt, total, context)
+				<-cloudSemaphore
+			}
 			if nil != dcfErr {
 				return 0, dcfErr
 			}
@@ -1401,8 +2030,14 @@ func (repo *Repo) downloadCloudFilesPutDetailed(fileIDs []string, context map[st
 			retLock.Lock()
 			ret = append(ret, file)
 			retLock.Unlock()
+			if downloadedFromPeer {
+				return 0, nil
+			}
 			return length, nil
 		})
+	result.peerBytes = peerBytes.Load()
+	result.peerCount = int(peerCount.Load())
+	result.peerFallbackCount = int(peerFallbackCount.Load())
 	return
 }
 
@@ -1852,6 +2487,16 @@ func (repo *Repo) localUpsertFiles(latest *entity.Index, cloudLatest *entity.Ind
 			ret = append(ret, file)
 		}
 	}
+	// format 2 清单是懒加载目录的权威根对象，不属于普通文件或 LazyFiles，变化时仍必须随事务上传其元数据和分块。
+	if "" != latest.LazyManifest && latest.LazyManifest != cloudLatest.LazyManifest {
+		if !containsUploadID(latest.Files, latest.LazyManifest) {
+			manifestFile, getErr := repo.store.GetFile(latest.LazyManifest)
+			if nil != getErr {
+				return nil, fmt.Errorf("get lazy manifest file [%s] failed: %w", latest.LazyManifest, getErr)
+			}
+			ret = append(ret, manifestFile)
+		}
+	}
 	lazyFiles := map[string]bool{}
 	for _, file := range latest.LazyFiles {
 		lazyFiles[file] = true
@@ -2041,6 +2686,14 @@ func (repo *Repo) filterProtectedMergeResult(mergeResult *MergeResult) {
 }
 
 func (repo *Repo) sanitizeStoredIndex(index *entity.Index, memo string) (ret *entity.Index, sanitized bool, err error) {
+	if nil == index {
+		return index, false, nil
+	}
+	markerPath := filepath.Join(repo.Path, "sanitized-current-index")
+	marker := "1:" + index.ID
+	if data, readErr := os.ReadFile(markerPath); nil == readErr && string(data) == marker {
+		return index, false, nil
+	}
 	files, err := repo.getFiles(index.Files)
 	if nil != err {
 		return nil, false, err
@@ -2050,10 +2703,19 @@ func (repo *Repo) sanitizeStoredIndex(index *entity.Index, memo string) (ret *en
 		return nil, false, err
 	}
 	ret, sanitized, err = repo.sanitizeIndexFiles(index, files, lazyFiles, memo)
-	if nil != err || !sanitized {
+	if nil != err {
+		return
+	}
+	if !sanitized {
+		if err = gulu.File.WriteFileSafer(markerPath, []byte(marker), 0644); nil != err {
+			return nil, false, err
+		}
 		return
 	}
 	err = repo.UpdateLatest(ret)
+	if nil == err {
+		err = gulu.File.WriteFileSafer(markerPath, []byte("1:"+ret.ID), 0644)
+	}
 	return
 }
 
@@ -2304,21 +2966,60 @@ func (repo *Repo) downloadCloudChunk(id string, count, total int, context map[st
 }
 
 func (repo *Repo) downloadSourceChunk(id string) (length int64, ret *entity.Chunk, err error) {
-	data, err := repo.chunkSource.DownloadChunk(id)
-	if nil != err {
-		return
-	}
 	key := path.Join("objects", id[:2], id[2:])
-	data, err = repo.decodeDownloadedData(key, data)
-	if nil != err {
+	var decoded []byte
+	validate := func(data []byte) (validateErr error) {
+		decoded, validateErr = repo.decodeDownloadedData(key, data)
+		if nil == validateErr && util.Hash(decoded) != id {
+			validateErr = fmt.Errorf("%w: source chunk [%s] hash mismatch", ErrRepoFatal, id)
+		}
 		return
 	}
-	if util.Hash(data) != id {
-		err = fmt.Errorf("%w: source chunk [%s] hash mismatch", ErrRepoFatal, id)
+	data, err := repo.downloadSourceObject(id, validate)
+	if nil != err {
 		return
 	}
 	length = int64(len(data))
-	ret = &entity.Chunk{ID: id, Data: data}
+	ret = &entity.Chunk{ID: id, Data: decoded}
+	return
+}
+
+func (repo *Repo) downloadSourceFile(id string) (length int64, ret *entity.File, err error) {
+	source, ok := repo.chunkSource.(ObjectSource)
+	if !ok {
+		return 0, nil, errors.New("object source unavailable")
+	}
+	key := path.Join("objects", id[:2], id[2:])
+	validate := func(data []byte) (validateErr error) {
+		data, validateErr = repo.decodeDownloadedData(key, data)
+		if nil != validateErr {
+			return
+		}
+		file := &entity.File{}
+		if validateErr = gulu.JSON.UnmarshalJSON(data, file); nil != validateErr {
+			return
+		}
+		if file.ID != id || entity.NewFile(file.Path, file.Size, file.Updated).ID != id {
+			return fmt.Errorf("%w: source file [%s] ID mismatch", ErrRepoFatal, id)
+		}
+		ret = file
+		return
+	}
+	data, err := source.DownloadObjectValidated(id, validate)
+	if nil == err {
+		length = int64(len(data))
+	}
+	return
+}
+
+func (repo *Repo) downloadSourceObject(id string, validate func(data []byte) error) (data []byte, err error) {
+	if source, ok := repo.chunkSource.(ValidatingChunkSource); ok {
+		return source.DownloadChunkValidated(id, validate)
+	}
+	data, err = repo.chunkSource.DownloadChunk(id)
+	if nil == err {
+		err = validate(data)
+	}
 	return
 }
 

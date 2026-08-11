@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -66,10 +67,25 @@ type LazyManifest struct {
 	Updated    int64                     `json:"updated"`
 }
 
+const (
+	lazyManifestFormatLegacy       = "1.0"
+	lazyManifestFormatCurrent      = "2.0"
+	lazyManifestHydratedMarker     = "lazy-manifest-format-2-hydrated"
+	lazyManifestLocalClosureMarker = "lazy-manifest-format-2-local-closure"
+)
+
 type LazyTombstone struct {
 	Path      string `json:"path"`
 	FileID    string `json:"fileId"`
 	DeletedAt int64  `json:"deletedAt"`
+}
+
+// LazyManifestDelta 描述两个懒加载清单之间的共享目录变化。
+type LazyManifestDelta struct {
+	Adds    []*LazyAsset
+	Updates []*LazyAsset
+	Deletes []*LazyTombstone
+	Revives []*LazyAsset
 }
 
 // LazyLoader 懒加载管理器
@@ -295,7 +311,7 @@ func (ll *LazyLoader) getManifest() (*LazyManifest, error) {
 	manifestPath := ll.getManifestPath()
 	if !gulu.File.IsExist(manifestPath) {
 		ll.manifest = &LazyManifest{
-			Version: "1.0",
+			Version: lazyManifestFormatCurrent,
 			Assets:  make(map[string]*LazyAsset),
 			Updated: time.Now().UnixMilli(),
 		}
@@ -326,6 +342,10 @@ func (ll *LazyLoader) saveManifest(manifest *LazyManifest) error {
 	}
 
 	manifestPath := ll.getManifestPath()
+	previousInfo, statErr := os.Stat(manifestPath)
+	if nil != statErr && !os.IsNotExist(statErr) {
+		return statErr
+	}
 	dir := filepath.Dir(manifestPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create manifest dir failed: %w", err)
@@ -334,8 +354,26 @@ func (ll *LazyLoader) saveManifest(manifest *LazyManifest) error {
 	if err = gulu.File.WriteFileSafer(manifestPath, data, 0644); nil != err {
 		return err
 	}
+	if nil != previousInfo {
+		updated := time.Now()
+		minimum := previousInfo.ModTime().Add(time.Second)
+		if updated.Before(minimum) {
+			updated = minimum
+		}
+		if err = os.Chtimes(manifestPath, updated, updated); nil != err {
+			return err
+		}
+	}
 	ll.manifest = manifest
 	return nil
+}
+
+func (ll *LazyLoader) reloadManifest() error {
+	ll.mutex.Lock()
+	defer ll.mutex.Unlock()
+	ll.manifest = nil
+	_, err := ll.getManifest()
+	return err
 }
 
 // getManifestPath 获取清单文件路径
@@ -421,8 +459,10 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 			appendSyncSample(&normalizedPathSamples, "%s -> %s", file.Path, normalizedPath)
 		}
 
+		canonical := entity.NewFile(normalizedPath, file.Size, file.Updated)
+		canonical.Chunks = append([]string(nil), file.Chunks...)
 		asset.Path = normalizedPath
-		asset.FileID = file.ID
+		asset.FileID = canonical.ID
 		asset.Size = file.Size
 		asset.Modified = file.Updated
 		asset.Chunks = file.Chunks
@@ -441,16 +481,24 @@ func (repo *Repo) updateLazyManifest(lazyFiles []*entity.File) error {
 
 	logging.LogInfof("updateLazyManifest: updated %d assets (new: %d, conflicts: %d, merged: %d, normalizedLeadingSlash=%d, samples=%v)",
 		len(lazyFiles), newCount, conflictCount, mergedCount, leadingSlashPathCount, normalizedPathSamples)
+	if lazyManifestFormatCurrent == lazyManifestFormat(manifest) {
+		if _, err = repo.canonicalizeLazyManifestObjectIdentities(manifest); nil != err {
+			return fmt.Errorf("canonicalize lazy manifest metadata: %w", err)
+		}
+	}
 
 	return repo.lazyLoader.saveManifest(manifest)
 }
 
 func mergeLazyManifestAssets(local, cloud *LazyManifest) *LazyManifest {
 	merged := &LazyManifest{
-		Version:    "1.0",
+		Version:    lazyManifestFormatLegacy,
 		Assets:     map[string]*LazyAsset{},
 		Tombstones: map[string]*LazyTombstone{},
 		Updated:    time.Now().UnixMilli(),
+	}
+	if lazyManifestFormat(local) == lazyManifestFormatCurrent || lazyManifestFormat(cloud) == lazyManifestFormatCurrent {
+		merged.Version = lazyManifestFormatCurrent
 	}
 	add := func(asset *LazyAsset) {
 		if nil == asset || isIgnoredLazyAssetPath(asset.Path) {
@@ -502,6 +550,359 @@ func mergeLazyManifestAssets(local, cloud *LazyManifest) *LazyManifest {
 		}
 	}
 	return merged
+}
+
+func lazyManifestFormat(manifest *LazyManifest) string {
+	if nil == manifest || "" == manifest.Version || lazyManifestFormatLegacy == manifest.Version {
+		return lazyManifestFormatLegacy
+	}
+	return manifest.Version
+}
+
+func validateLazyManifestFormat(manifest *LazyManifest) error {
+	format := lazyManifestFormat(manifest)
+	if lazyManifestFormatLegacy != format && lazyManifestFormatCurrent != format {
+		return fmt.Errorf("unsupported lazy manifest repository format [%s]", format)
+	}
+	return nil
+}
+
+func validateCurrentLazyManifestCatalog(manifest *LazyManifest) error {
+	if lazyManifestFormatCurrent != lazyManifestFormat(manifest) {
+		return nil
+	}
+	paths := make(map[string]string, len(manifest.Assets))
+	for key, asset := range manifest.Assets {
+		if nil == asset {
+			return fmt.Errorf("current lazy manifest asset [%s] is nil", key)
+		}
+		path := normalizeLazyPath(asset.Path)
+		if key != path || asset.Path != path {
+			return fmt.Errorf("current lazy manifest asset path is not canonical [key=%s, path=%s]", key, asset.Path)
+		}
+		if previous, exists := paths[path]; exists {
+			return fmt.Errorf("duplicate current lazy manifest path [%s] from [%s] and [%s]", path, previous, key)
+		}
+		paths[path] = key
+		if err := validateUploadTransactionID(asset.FileID); nil != err {
+			return fmt.Errorf("current lazy manifest asset [%s] has invalid file ID: %w", path, err)
+		}
+		if expected := entity.NewFile(path, asset.Size, asset.Modified).ID; asset.FileID != expected {
+			return fmt.Errorf("current lazy manifest asset [%s] file ID mismatch [got=%s, expected=%s]", path, asset.FileID, expected)
+		}
+	}
+	return nil
+}
+
+func (repo *Repo) isLazyManifestHydrated(identity string) bool {
+	if "" == identity {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(repo.Path, lazyManifestHydratedMarker))
+	return nil == err && identity == string(data)
+}
+
+func (repo *Repo) markLazyManifestHydrated(identity string) error {
+	if err := validateUploadTransactionID(identity); nil != err {
+		return fmt.Errorf("mark consumed lazy manifest identity: %w", err)
+	}
+	marker := filepath.Join(repo.Path, lazyManifestHydratedMarker)
+	temp := marker + ".tmp"
+	if err := os.WriteFile(temp, []byte(identity), 0600); nil != err {
+		return err
+	}
+	if err := os.Rename(temp, marker); nil != err {
+		_ = os.Remove(temp)
+		return err
+	}
+	return nil
+}
+
+func (repo *Repo) lazyManifestIdentity() (string, error) {
+	manifestPath := repo.lazyLoader.getManifestPath()
+	info, err := os.Stat(manifestPath)
+	if nil != err {
+		return "", err
+	}
+	return entity.NewFile(repo.relPath(manifestPath), info.Size(), info.ModTime().UnixMilli()).ID, nil
+}
+
+func (repo *Repo) isLazyManifestLocalClosurePrepared(identity string) bool {
+	data, err := os.ReadFile(filepath.Join(repo.Path, lazyManifestLocalClosureMarker))
+	return nil == err && identity == string(data)
+}
+
+func (repo *Repo) markLazyManifestLocalClosurePrepared(identity string) error {
+	marker := filepath.Join(repo.Path, lazyManifestLocalClosureMarker)
+	temp := marker + ".tmp"
+	if err := os.WriteFile(temp, []byte(identity), 0600); nil != err {
+		return err
+	}
+	if err := os.Rename(temp, marker); nil != err {
+		_ = os.Remove(temp)
+		return err
+	}
+	return nil
+}
+
+func (repo *Repo) saveLazyManifestWithNewIdentity(candidate *LazyManifest) error {
+	manifestPath := repo.lazyLoader.getManifestPath()
+	previousInfo, statErr := os.Stat(manifestPath)
+	if nil != statErr && !os.IsNotExist(statErr) {
+		return statErr
+	}
+	if err := repo.lazyLoader.saveManifest(candidate); nil != err {
+		return err
+	}
+	if nil != previousInfo {
+		updated := time.Now()
+		minimum := previousInfo.ModTime().Add(time.Second)
+		if updated.Before(minimum) {
+			updated = minimum
+		}
+		if err := os.Chtimes(manifestPath, updated, updated); nil != err {
+			return err
+		}
+	}
+	return nil
+}
+
+func (repo *Repo) advanceLazyManifestIdentityPast(forbidden string) error {
+	if "" == forbidden {
+		return nil
+	}
+	manifestPath := repo.lazyLoader.getManifestPath()
+	for {
+		identity, err := repo.lazyManifestIdentity()
+		if nil != err || identity != forbidden {
+			return err
+		}
+		info, err := os.Stat(manifestPath)
+		if nil != err {
+			return err
+		}
+		updated := info.ModTime().Add(time.Second)
+		if err = os.Chtimes(manifestPath, updated, updated); nil != err {
+			return err
+		}
+	}
+}
+
+// canonicalizeLazyManifestObjectIdentities 为发生秒级标识冲突的清单项分配新的不可变对象标识。
+func (repo *Repo) canonicalizeLazyManifestObjectIdentities(manifest *LazyManifest) (changed int, err error) {
+	keys := make([]string, 0, len(manifest.Assets))
+	for key := range manifest.Assets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	normalized := make(map[string]*LazyAsset, len(keys))
+	legacyPathIdentity := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		asset := manifest.Assets[key]
+		if nil == asset {
+			normalized[key] = nil
+			continue
+		}
+		path := normalizeLazyPath(asset.Path)
+		if _, exists := normalized[path]; exists {
+			return changed, fmt.Errorf("duplicate lazy manifest path after normalization [%s]", path)
+		}
+		pathChanged := key != path || asset.Path != path
+		if pathChanged {
+			changed++
+		}
+		// 只允许修复由未规范化旧路径生成的标识，其他标识不匹配必须按清单损坏处理。
+		legacyPathIdentity[path] = pathChanged && asset.FileID == entity.NewFile(asset.Path, asset.Size, asset.Modified).ID
+		asset.Path = path
+		normalized[path] = asset
+	}
+	manifest.Assets = normalized
+	keys = keys[:0]
+	for key := range manifest.Assets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		asset := manifest.Assets[key]
+		if nil == asset {
+			continue
+		}
+		desired := entity.NewFile(asset.Path, asset.Size, asset.Modified)
+		desired.Chunks = append([]string(nil), asset.Chunks...)
+		if desired.ID != asset.FileID {
+			provenLegacyIdentity := legacyPathIdentity[asset.Path]
+			if !provenLegacyIdentity {
+				if nil == validateUploadTransactionID(asset.FileID) {
+					legacy, getErr := repo.store.GetFile(asset.FileID)
+					if nil == getErr && nil != legacy && legacy.ID == asset.FileID && normalizeLazyPath(legacy.Path) == asset.Path &&
+						legacy.Size == asset.Size && legacy.Updated == asset.Modified && slices.Equal(legacy.Chunks, asset.Chunks) {
+						provenLegacyIdentity = true
+					}
+				}
+			}
+			if !provenLegacyIdentity {
+				return changed, fmt.Errorf("lazy manifest asset [%s] file ID mismatch [got=%s, expected=%s]", asset.Path,
+					asset.FileID, desired.ID)
+			}
+			// 历史清单可能使用了未规范化路径生成的旧 ID，保留旧对象并切换到规范对象。
+			existing, getErr := repo.store.GetFile(desired.ID)
+			if os.IsNotExist(getErr) {
+				if err = repo.store.PutFile(desired); nil != err {
+					return changed, err
+				}
+				asset.FileID = desired.ID
+				changed++
+				continue
+			}
+			if nil != getErr {
+				return changed, getErr
+			}
+			if existing.Path == desired.Path && existing.Size == desired.Size && existing.Updated == desired.Updated &&
+				slices.Equal(existing.Chunks, desired.Chunks) {
+				asset.FileID = desired.ID
+				changed++
+				continue
+			}
+		}
+		_, objectPath := repo.store.AbsPath(desired.ID)
+		if _, statErr := os.Stat(objectPath); os.IsNotExist(statErr) {
+			if err = repo.store.PutFile(desired); nil != err {
+				return changed, err
+			}
+			continue
+		} else if nil != statErr {
+			return changed, statErr
+		}
+		existing, getErr := repo.store.GetFile(desired.ID)
+		if nil != getErr {
+			return changed, getErr
+		}
+		if existing.Path == desired.Path && existing.Size == desired.Size && existing.Updated == desired.Updated &&
+			slices.Equal(existing.Chunks, desired.Chunks) {
+			continue
+		}
+		// File ID 仅绑定路径和秒级更新时间。同一秒内内容变化时必须生成新 ID，不能覆盖历史对象。
+		for updated := (asset.Modified/1000 + 1) * 1000; ; updated += 1000 {
+			candidate := entity.NewFile(asset.Path, asset.Size, updated)
+			candidate.Chunks = append([]string(nil), asset.Chunks...)
+			_, candidatePath := repo.store.AbsPath(candidate.ID)
+			if _, statErr := os.Stat(candidatePath); os.IsNotExist(statErr) {
+				asset.Modified = updated
+				asset.FileID = candidate.ID
+				if err = repo.store.PutFile(candidate); nil != err {
+					return changed, err
+				}
+				changed++
+				break
+			} else if nil != statErr {
+				return changed, statErr
+			}
+		}
+	}
+	return
+}
+
+func (repo *Repo) migrateLazyManifestRepository(source *LazyManifest) (migrated int, err error) {
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader {
+		return
+	}
+	repo.lazyLoader.mutex.Lock()
+	defer repo.lazyLoader.mutex.Unlock()
+	if nil == source {
+		return 0, fmt.Errorf("lazy manifest migration source is nil")
+	}
+	candidate := cloneLazyManifest(source)
+	keys := make([]string, 0, len(candidate.Assets))
+	for key := range candidate.Assets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	normalized := make(map[string]*LazyAsset, len(keys))
+	for _, key := range keys {
+		asset := candidate.Assets[key]
+		if nil == asset || isIgnoredLazyAssetPath(asset.Path) {
+			continue
+		}
+		path := normalizeLazyPath(asset.Path)
+		if _, exists := normalized[path]; exists {
+			return 0, fmt.Errorf("duplicate lazy manifest path after normalization [%s]", path)
+		}
+		file := entity.NewFile(path, asset.Size, asset.Modified)
+		file.Chunks = append([]string{}, asset.Chunks...)
+		if err = repo.store.PutFile(file); nil != err {
+			return 0, fmt.Errorf("store migrated lazy metadata [%s]: %w", path, err)
+		}
+		copy := cloneLazyAsset(asset)
+		copy.Path = path
+		copy.FileID = file.ID
+		normalized[path] = copy
+		migrated++
+	}
+	candidate.Assets = normalized
+	candidate.Version = lazyManifestFormatCurrent
+	if _, err = repo.canonicalizeLazyManifestObjectIdentities(candidate); nil != err {
+		return 0, fmt.Errorf("canonicalize migrated lazy metadata identities: %w", err)
+	}
+	if err = repo.saveLazyManifestWithNewIdentity(candidate); nil != err {
+		return 0, fmt.Errorf("save migrated lazy manifest: %w", err)
+	}
+	repo.lazyManifestMigrations.Add(1)
+	return
+}
+
+func (repo *Repo) canonicalizeLazyManifestLocalDeltas(merged, published *LazyManifest) (canonicalized int, err error) {
+	for path, asset := range merged.Assets {
+		if nil == asset {
+			continue
+		}
+		if cloudAsset := published.Assets[path]; nil != cloudAsset && cloudAsset.FileID == asset.FileID {
+			continue
+		}
+		file := entity.NewFile(path, asset.Size, asset.Modified)
+		file.Chunks = append([]string{}, asset.Chunks...)
+		if err = repo.store.PutFile(file); nil != err {
+			return canonicalized, fmt.Errorf("store canonical local lazy metadata [%s]: %w", path, err)
+		}
+		asset.FileID = file.ID
+		canonicalized++
+	}
+	return
+}
+
+func isCanonicalLazyManifestSuperset(candidate, legacy *LazyManifest) bool {
+	if lazyManifestFormatCurrent != lazyManifestFormat(candidate) {
+		return false
+	}
+	for path, asset := range candidate.Assets {
+		if nil == asset || path != normalizeLazyPath(asset.Path) {
+			return false
+		}
+		file := entity.NewFile(path, asset.Size, asset.Modified)
+		if asset.FileID != file.ID {
+			return false
+		}
+	}
+	for _, asset := range legacy.Assets {
+		if nil == asset {
+			continue
+		}
+		path := normalizeLazyPath(asset.Path)
+		current := candidate.Assets[path]
+		if nil == current || current.Modified != asset.Modified || current.Size != asset.Size ||
+			!slices.Equal(current.Chunks, asset.Chunks) {
+			return false
+		}
+	}
+	for _, tombstone := range legacy.Tombstones {
+		if nil == tombstone {
+			continue
+		}
+		current := candidate.Tombstones[normalizeLazyPath(tombstone.Path)]
+		if nil == current || current.FileID != tombstone.FileID || current.DeletedAt != tombstone.DeletedAt {
+			return false
+		}
+	}
+	return true
 }
 
 func (repo *Repo) DeleteLazyAsset(path, fileID string) error {
@@ -568,6 +969,80 @@ func cloneLazyAsset(asset *LazyAsset) *LazyAsset {
 	return &ret
 }
 
+func equalLazyAssetCatalog(left, right *LazyAsset) bool {
+	if nil == left || nil == right {
+		return left == right
+	}
+	return normalizeLazyPath(left.Path) == normalizeLazyPath(right.Path) && left.FileID == right.FileID &&
+		left.Size == right.Size && left.Hash == right.Hash && left.Modified == right.Modified &&
+		left.RevivesDeletion == right.RevivesDeletion && slices.Equal(left.Chunks, right.Chunks)
+}
+
+func equalLazyTombstone(left, right *LazyTombstone) bool {
+	if nil == left || nil == right {
+		return left == right
+	}
+	return normalizeLazyPath(left.Path) == normalizeLazyPath(right.Path) && left.FileID == right.FileID &&
+		left.DeletedAt == right.DeletedAt
+}
+
+func diffLazyManifests(previous, current *LazyManifest) (ret LazyManifestDelta, err error) {
+	if nil == previous {
+		previous = &LazyManifest{}
+	}
+	if nil == current {
+		current = &LazyManifest{}
+	}
+	for path, currentAsset := range current.Assets {
+		if nil == currentAsset {
+			continue
+		}
+		path = normalizeLazyPath(path)
+		previousAsset := previous.Assets[path]
+		if nil == previousAsset {
+			if tombstone := previous.Tombstones[path]; nil != tombstone &&
+				currentAsset.RevivesDeletion >= tombstone.DeletedAt {
+				ret.Revives = append(ret.Revives, currentAsset)
+			} else {
+				ret.Adds = append(ret.Adds, currentAsset)
+			}
+		} else if !equalLazyAssetCatalog(previousAsset, currentAsset) {
+			ret.Updates = append(ret.Updates, currentAsset)
+		}
+	}
+	for path, currentTombstone := range current.Tombstones {
+		if nil == currentTombstone {
+			continue
+		}
+		path = normalizeLazyPath(path)
+		if previousAsset := previous.Assets[path]; nil != previousAsset ||
+			!equalLazyTombstone(previous.Tombstones[path], currentTombstone) {
+			ret.Deletes = append(ret.Deletes, currentTombstone)
+		}
+	}
+	for path, previousAsset := range previous.Assets {
+		path = normalizeLazyPath(path)
+		if nil == previousAsset || nil != current.Assets[path] {
+			continue
+		}
+		currentTombstone := current.Tombstones[path]
+		if nil == currentTombstone || currentTombstone.FileID != previousAsset.FileID {
+			return ret, fmt.Errorf("lazy manifest removed asset [%s] without a matching tombstone", path)
+		}
+	}
+	for path, previousTombstone := range previous.Tombstones {
+		path = normalizeLazyPath(path)
+		if nil == previousTombstone || nil != current.Tombstones[path] {
+			continue
+		}
+		currentAsset := current.Assets[path]
+		if nil == currentAsset || currentAsset.RevivesDeletion < previousTombstone.DeletedAt {
+			return ret, fmt.Errorf("lazy manifest removed tombstone [%s] without revival proof", path)
+		}
+	}
+	return
+}
+
 func shouldUseLazyAsset(candidate, existing *LazyAsset) bool {
 	if candidate.Modified != existing.Modified {
 		return candidate.Modified > existing.Modified
@@ -631,6 +1106,10 @@ func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, co
 	manifest, err := repo.lazyLoader.getManifest()
 	if err != nil {
 		return fmt.Errorf("get manifest failed: %w", err)
+	}
+	if lazyManifestContainsFileIDs(manifest, cloudLazyFileIDs) {
+		logging.LogInfof("updateLazyManifestFromCloudIndex: manifest already contains %d cloud lazy files, skipping", len(cloudLazyFileIDs))
+		return nil
 	}
 
 	// 检查本地是否已有这些文件的元数据
@@ -704,6 +1183,28 @@ func (repo *Repo) updateLazyManifestFromCloudIndex(cloudLazyFileIDs []string, co
 		existingCount, len(missingFileIDs), len(cloudLazyFileIDs))
 
 	return repo.lazyLoader.saveManifest(manifest)
+}
+
+func lazyManifestContainsFileIDs(manifest *LazyManifest, fileIDs []string) bool {
+	if nil == manifest || len(manifest.Assets) != len(fileIDs) {
+		return false
+	}
+	ids := make(map[string]struct{}, len(manifest.Assets))
+	for _, asset := range manifest.Assets {
+		if nil == asset || "" == asset.FileID {
+			return false
+		}
+		ids[asset.FileID] = struct{}{}
+	}
+	if len(ids) != len(fileIDs) {
+		return false
+	}
+	for _, id := range fileIDs {
+		if _, ok := ids[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (repo *Repo) setLazyManifestAsset(manifest *LazyManifest, asset *LazyAsset) {
@@ -813,8 +1314,11 @@ func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
 	}
 
 	logging.LogInfof("[DEBUG] getLazyFilesForIndex: manifest has %d assets", len(manifest.Assets))
+	return repo.lazyManifestFilesForIndex(manifest)
+}
+
+func (repo *Repo) lazyManifestFilesForIndex(manifest *LazyManifest) ([]*entity.File, error) {
 	var files []*entity.File
-	manifestMigrated := false
 	assetKeys := make([]string, 0, len(manifest.Assets))
 	for key := range manifest.Assets {
 		assetKeys = append(assetKeys, key)
@@ -822,7 +1326,11 @@ func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
 	sort.Strings(assetKeys)
 	canonicalPaths := make(map[string]string, len(assetKeys))
 	for _, key := range assetKeys {
-		canonicalPath := normalizeLazyPath(manifest.Assets[key].Path)
+		asset := manifest.Assets[key]
+		if nil == asset {
+			continue
+		}
+		canonicalPath := normalizeLazyPath(asset.Path)
 		if previous, exists := canonicalPaths[canonicalPath]; exists && previous != key {
 			return nil, fmt.Errorf("duplicate lazy manifest path after normalization [%s]: keys [%s] and [%s]", canonicalPath, previous, key)
 		}
@@ -839,28 +1347,9 @@ func (repo *Repo) getLazyFilesForIndex() ([]*entity.File, error) {
 		// combine its new stat with the manifest's old chunks.
 		localPath := filepath.Join(repo.DataPath, strings.TrimPrefix(asset.Path, "/"))
 		if len(asset.Chunks) > 0 || gulu.File.IsExist(localPath) {
-			file := entity.NewFile(normalizeLazyPath(asset.Path), asset.Size, asset.Modified)
-			file.Chunks = asset.Chunks
-			if file.ID != asset.FileID {
-				if putErr := repo.store.PutFile(file); nil != putErr {
-					return nil, fmt.Errorf("migrate lazy metadata [%s]: %w", asset.Path, putErr)
-				}
-				asset.FileID = file.ID
-				asset.Path = file.Path
-				manifestMigrated = true
-			}
+			file := &entity.File{ID: asset.FileID, Path: asset.Path, Size: asset.Size, Updated: asset.Modified,
+				Chunks: append([]string{}, asset.Chunks...)}
 			files = append(files, file)
-		}
-	}
-	if manifestMigrated {
-		normalizedAssets := make(map[string]*LazyAsset, len(manifest.Assets))
-		for _, asset := range manifest.Assets {
-			asset.Path = normalizeLazyPath(asset.Path)
-			normalizedAssets[asset.Path] = asset
-		}
-		manifest.Assets = normalizedAssets
-		if saveErr := repo.lazyLoader.saveManifest(manifest); nil != saveErr {
-			return nil, fmt.Errorf("save migrated lazy manifest: %w", saveErr)
 		}
 	}
 

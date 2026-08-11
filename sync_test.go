@@ -17,7 +17,9 @@
 package dejavu
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -253,7 +255,7 @@ func TestIndexDeduplicatesLazyAssetPaths(t *testing.T) {
 	}
 }
 
-func TestIndexRewritesUnreadableLazyFileMetadata(t *testing.T) {
+func TestIndexDoesNotRewriteUnreadableManifestMetadata(t *testing.T) {
 	repo := newLazyTestRepo(t)
 
 	relPath := "assets/corrupt-metadata.png"
@@ -281,15 +283,11 @@ func TestIndexRewritesUnreadableLazyFileMetadata(t *testing.T) {
 		t.Fatalf("write bad metadata failed: %s", err)
 	}
 
-	index, err := repo.Index("Index 1", true, map[string]interface{}{})
-	if err != nil {
-		t.Fatalf("index failed: %s", err)
+	if _, err := repo.Index("Index 1", true, map[string]interface{}{}); nil == err {
+		t.Fatal("index with unreadable immutable metadata should fail closed")
 	}
-	if len(index.LazyFiles) != 1 || index.LazyFiles[0] != manifestFile.ID {
-		t.Fatalf("unexpected lazy files: %#v", index.LazyFiles)
-	}
-	if _, err = repo.store.GetFile(manifestFile.ID); err != nil {
-		t.Fatalf("lazy metadata should be readable after index: %s", err)
+	if _, err := repo.store.GetFile(manifestFile.ID); err == nil {
+		t.Fatal("ordinary index rewrote unreadable lazy metadata")
 	}
 }
 
@@ -339,6 +337,139 @@ func TestBuildCheckIndexIncludesLazyFiles(t *testing.T) {
 	}
 	if check.Files[1].ID != lazy.ID || len(check.Files[1].Chunks) != 1 || check.Files[1].Chunks[0] != "lazy-chunk" {
 		t.Fatalf("lazy file closure missing: %#v", check.Files)
+	}
+}
+
+func TestLazyManifestContainsFileIDs(t *testing.T) {
+	manifest := &LazyManifest{Assets: map[string]*LazyAsset{
+		"assets/a": {Path: "assets/a", FileID: "a"},
+		"assets/b": {Path: "assets/b", FileID: "b"},
+	}}
+	if !lazyManifestContainsFileIDs(manifest, []string{"b", "a"}) {
+		t.Fatal("same manifest closure was not recognized")
+	}
+	if lazyManifestContainsFileIDs(manifest, []string{"a", "c"}) {
+		t.Fatal("different manifest closure was recognized as unchanged")
+	}
+}
+
+func TestLazyManifestHydratedMarkerIsScopedToPublishedIdentity(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	if err := os.MkdirAll(repo.Path, 0755); nil != err {
+		t.Fatal(err)
+	}
+	first := util.RandHash()
+	second := util.RandHash()
+	if err := repo.markLazyManifestHydrated(first); nil != err {
+		t.Fatal(err)
+	}
+	if !repo.isLazyManifestHydrated(first) {
+		t.Fatal("published identity marker was not recognized")
+	}
+	if repo.isLazyManifestHydrated(second) {
+		t.Fatal("a different published manifest identity was skipped")
+	}
+	if err := os.WriteFile(filepath.Join(repo.Path, lazyManifestHydratedMarker), []byte(lazyManifestFormatCurrent), 0600); nil != err {
+		t.Fatal(err)
+	}
+	if repo.isLazyManifestHydrated(first) {
+		t.Fatal("legacy format-only marker bypassed identity-scoped consumption")
+	}
+}
+
+func TestDiffLazyManifestsClassifiesCatalogChangesAndIgnoresStatus(t *testing.T) {
+	unchanged := &LazyAsset{Path: "assets/unchanged", FileID: util.RandHash(), Size: 1, Modified: 1000,
+		Chunks: []string{util.RandHash()}, Status: LazyStatusPending}
+	updated := &LazyAsset{Path: "assets/updated", FileID: util.RandHash(), Size: 2, Modified: 2000,
+		Chunks: []string{util.RandHash()}}
+	deleted := &LazyAsset{Path: "assets/deleted", FileID: util.RandHash(), Size: 3, Modified: 3000}
+	revivedTombstone := &LazyTombstone{Path: "assets/revived", FileID: util.RandHash(), DeletedAt: 4000}
+	previous := &LazyManifest{Assets: map[string]*LazyAsset{
+		unchanged.Path: cloneLazyAsset(unchanged), updated.Path: cloneLazyAsset(updated), deleted.Path: cloneLazyAsset(deleted),
+	}, Tombstones: map[string]*LazyTombstone{revivedTombstone.Path: revivedTombstone}}
+	currentUnchanged := cloneLazyAsset(unchanged)
+	currentUnchanged.Status = LazyStatusCached
+	currentUpdated := cloneLazyAsset(updated)
+	currentUpdated.Chunks = append(currentUpdated.Chunks, util.RandHash())
+	added := &LazyAsset{Path: "assets/added", FileID: util.RandHash(), Size: 5, Modified: 5000}
+	revived := &LazyAsset{Path: revivedTombstone.Path, FileID: util.RandHash(), Size: 6, Modified: 6000,
+		RevivesDeletion: revivedTombstone.DeletedAt}
+	deletion := &LazyTombstone{Path: deleted.Path, FileID: deleted.FileID, DeletedAt: 7000}
+	current := &LazyManifest{Assets: map[string]*LazyAsset{
+		currentUnchanged.Path: currentUnchanged, currentUpdated.Path: currentUpdated, added.Path: added, revived.Path: revived,
+	}, Tombstones: map[string]*LazyTombstone{deletion.Path: deletion}}
+
+	delta, err := diffLazyManifests(previous, current)
+	if nil != err {
+		t.Fatal(err)
+	}
+	if len(delta.Adds) != 1 || delta.Adds[0] != added || len(delta.Updates) != 1 || delta.Updates[0] != currentUpdated ||
+		len(delta.Deletes) != 1 || delta.Deletes[0] != deletion || len(delta.Revives) != 1 || delta.Revives[0] != revived {
+		t.Fatalf("unexpected lazy manifest delta: %#v", delta)
+	}
+}
+
+func TestDiffLazyManifestsRejectsUnprovenDeletionAndRevival(t *testing.T) {
+	asset := &LazyAsset{Path: "assets/a", FileID: util.RandHash(), Size: 1, Modified: 1000}
+	if _, err := diffLazyManifests(&LazyManifest{Assets: map[string]*LazyAsset{asset.Path: asset}},
+		&LazyManifest{Assets: map[string]*LazyAsset{}}); nil == err {
+		t.Fatal("asset disappearance without tombstone was accepted as a deletion")
+	}
+	tombstone := &LazyTombstone{Path: asset.Path, FileID: asset.FileID, DeletedAt: 2000}
+	if _, err := diffLazyManifests(&LazyManifest{Tombstones: map[string]*LazyTombstone{asset.Path: tombstone}},
+		&LazyManifest{Assets: map[string]*LazyAsset{asset.Path: asset}}); nil == err {
+		t.Fatal("tombstone disappearance without revival proof was accepted")
+	}
+}
+
+func TestIndexChangedLazyManifestUsesManifestBaselineWithoutReadingUnchangedMetadata(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	assets := make(map[string]*LazyAsset, 256)
+	chunkID := util.Hash([]byte("asset"))
+	for i := 0; i < 256; i++ {
+		path := fmt.Sprintf("assets/%03d.bin", i)
+		file := entity.NewFile(path, 5, int64(1000+i))
+		assets[path] = &LazyAsset{Path: path, FileID: file.ID, Size: file.Size, Modified: file.Updated,
+			Chunks: []string{chunkID}}
+	}
+	manifest := &LazyManifest{Version: lazyManifestFormatCurrent, Assets: assets}
+	if err := repo.lazyLoader.saveManifest(manifest); nil != err {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repo.Path, 0755); nil != err {
+		t.Fatal(err)
+	}
+	baseline, err := repo.Index("baseline", false, map[string]interface{}{})
+	if nil != err {
+		t.Fatal(err)
+	}
+	for _, fileID := range baseline.LazyFiles {
+		if err = repo.store.Remove(fileID); nil != err {
+			t.Fatal(err)
+		}
+	}
+	fileCache.Clear()
+	changed := manifest.Assets["assets/000.bin"]
+	changed.Modified += 1000
+	changed.FileID = entity.NewFile(changed.Path, changed.Size, changed.Modified).ID
+	if err = repo.lazyLoader.saveManifest(manifest); nil != err {
+		t.Fatal(err)
+	}
+	indexed, err := repo.Index("one lazy delta", false, map[string]interface{}{})
+	if nil != err {
+		t.Fatalf("index read unchanged lazy metadata instead of the manifest baseline: %s", err)
+	}
+	if indexed.ID == baseline.ID || indexed.LazyManifest == baseline.LazyManifest {
+		t.Fatalf("changed manifest did not advance index: baseline=%s/%s indexed=%s/%s", baseline.ID,
+			baseline.LazyManifest, indexed.ID, indexed.LazyManifest)
+	}
+	if _, statErr := repo.store.Stat(changed.FileID); nil != statErr {
+		t.Fatalf("changed metadata was not materialized: %v", statErr)
+	}
+	for _, fileID := range baseline.LazyFiles[1:] {
+		if _, statErr := repo.store.Stat(fileID); !os.IsNotExist(statErr) {
+			t.Fatalf("unchanged metadata [%s] was unexpectedly rebuilt: %v", fileID, statErr)
+		}
 	}
 }
 
@@ -494,7 +625,7 @@ func TestVerifyUploadedFilesRejectsChangedChunkClosureWithSameFileID(t *testing.
 	}
 }
 
-func TestGetLazyFilesForIndexMigratesNonCanonicalFileID(t *testing.T) {
+func TestGetLazyFilesForIndexIsPureForLegacyMetadata(t *testing.T) {
 	repo := newLazyTestRepo(t)
 	updated := int64(1700000000000)
 	canonical := entity.NewFile("assets/legacy.png", 4, updated)
@@ -507,23 +638,96 @@ func TestGetLazyFilesForIndexMigratesNonCanonicalFileID(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
+	legacyMetadata := &entity.File{ID: "legacy-id", Path: "/assets/legacy.png", Size: 4, Updated: updated,
+		Chunks: []string{"chunk"}}
+	if err := repo.store.PutFile(legacyMetadata); nil != err {
+		t.Fatal(err)
+	}
 	files, err := repo.getLazyFilesForIndex()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 1 || files[0].ID != canonical.ID || files[0].Path != canonical.Path {
-		t.Fatalf("canonical lazy metadata = %#v, want %#v", files, canonical)
+	if len(files) != 1 || files[0].ID != "legacy-id" || files[0].Path != "/assets/legacy.png" {
+		t.Fatalf("legacy lazy metadata changed during read: %#v", files)
 	}
 	manifest, err := repo.lazyLoader.getManifest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	asset := manifest.Assets[canonical.Path]
-	if asset == nil || asset.FileID != canonical.ID {
-		t.Fatalf("manifest was not migrated: %#v", manifest.Assets)
+	asset := manifest.Assets["/assets/legacy.png"]
+	if asset == nil || asset.FileID != "legacy-id" || manifest.Version != lazyManifestFormatLegacy {
+		t.Fatalf("manifest changed during index read: %#v", manifest)
 	}
-	if _, err = repo.store.GetFile(canonical.ID); err != nil {
-		t.Fatalf("canonical metadata was not stored: %s", err)
+	if _, err = repo.store.GetFile(canonical.ID); err == nil {
+		t.Fatal("canonical metadata was stored during index read")
+	}
+	manifestPath := repo.lazyLoader.getManifestPath()
+	before, err := os.ReadFile(manifestPath)
+	if nil != err {
+		t.Fatal(err)
+	}
+	index, err := repo.Index("pure legacy index", false, map[string]interface{}{})
+	if nil != err {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(manifestPath)
+	if nil != err {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("ordinary index rewrote the legacy manifest")
+	}
+	if len(index.LazyFiles) != 1 || index.LazyFiles[0] != "legacy-id" {
+		t.Fatalf("ordinary index changed legacy identity: %#v", index.LazyFiles)
+	}
+	if _, err = repo.store.GetFile(canonical.ID); err == nil {
+		t.Fatal("ordinary index stored canonical metadata")
+	}
+}
+
+func TestLazyManifestFormatLegacyDecodeAndCurrentRoundTrip(t *testing.T) {
+	legacy := &LazyManifest{}
+	if err := json.Unmarshal([]byte(`{"assets":{},"updated":1}`), legacy); nil != err {
+		t.Fatal(err)
+	}
+	if got := lazyManifestFormat(legacy); got != lazyManifestFormatLegacy {
+		t.Fatalf("absent format=%s, want %s", got, lazyManifestFormatLegacy)
+	}
+	current := &LazyManifest{Version: lazyManifestFormatCurrent, Assets: map[string]*LazyAsset{}, Updated: 1}
+	data, err := json.Marshal(current)
+	if nil != err {
+		t.Fatal(err)
+	}
+	decoded := &LazyManifest{}
+	if err = json.Unmarshal(data, decoded); nil != err {
+		t.Fatal(err)
+	}
+	if got := lazyManifestFormat(decoded); got != lazyManifestFormatCurrent {
+		t.Fatalf("round-trip format=%s, want %s", got, lazyManifestFormatCurrent)
+	}
+}
+
+func TestValidateLazyManifestFormatRejectsUnknownFutureFormat(t *testing.T) {
+	err := validateLazyManifestFormat(&LazyManifest{Version: "3.0"})
+	if nil == err {
+		t.Fatal("unknown future format was accepted")
+	}
+}
+
+func TestCanonicalLazyManifestSupersetRequiresPublishedCatalogAndTombstones(t *testing.T) {
+	legacy := &LazyManifest{Assets: map[string]*LazyAsset{"/assets/a": {Path: "/assets/a", Size: 1, Modified: 1000}},
+		Tombstones: map[string]*LazyTombstone{"assets/deleted": {Path: "assets/deleted", FileID: "old", DeletedAt: 2000}}}
+	candidate := &LazyManifest{Version: lazyManifestFormatCurrent, Assets: map[string]*LazyAsset{},
+		Tombstones: map[string]*LazyTombstone{}}
+	if isCanonicalLazyManifestSuperset(candidate, legacy) {
+		t.Fatal("empty current manifest was accepted as a migrated legacy catalog")
+	}
+	file := entity.NewFile("assets/a", 1, 1000)
+	candidate.Assets[file.Path] = &LazyAsset{Path: file.Path, FileID: file.ID, Size: file.Size, Modified: file.Updated}
+	tombstone := *legacy.Tombstones["assets/deleted"]
+	candidate.Tombstones["assets/deleted"] = &tombstone
+	if !isCanonicalLazyManifestSuperset(candidate, legacy) {
+		t.Fatal("canonical manifest containing the legacy catalog was rejected")
 	}
 }
 
@@ -969,7 +1173,7 @@ func TestDownloadCloudChunkRejectsHashMismatch(t *testing.T) {
 	}
 }
 
-func newLazyTestRepo(t *testing.T) *Repo {
+func newLazyTestRepo(t testing.TB) *Repo {
 	t.Helper()
 
 	root := t.TempDir()
