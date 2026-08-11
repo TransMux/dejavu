@@ -96,6 +96,10 @@ func (manager *Manager) HasChunks(ids []string) (ret map[string]bool, err error)
 }
 
 func (manager *Manager) DownloadChunk(id string) (data []byte, err error) {
+	return manager.DownloadChunkValidated(id, nil)
+}
+
+func (manager *Manager) DownloadChunkValidated(id string, validate func(data []byte) error) (data []byte, err error) {
 	manager.peerMu.RLock()
 	routes := append([]*peer(nil), manager.routes[id]...)
 	manager.peerMu.RUnlock()
@@ -105,6 +109,9 @@ func (manager *Manager) DownloadChunk(id string) (data []byte, err error) {
 	var lastErr error
 	for _, current := range routes {
 		data, lastErr = manager.downloadPeerChunk(current, id)
+		if nil == lastErr && nil != validate {
+			lastErr = validate(data)
+		}
 		if nil == lastErr {
 			return data, nil
 		}
@@ -113,6 +120,14 @@ func (manager *Manager) DownloadChunk(id string) (data []byte, err error) {
 		lastErr = errors.New("LAN chunk source unavailable")
 	}
 	return nil, lastErr
+}
+
+func (manager *Manager) HasObjects(ids []string) (ret map[string]bool, err error) {
+	return manager.HasChunks(ids)
+}
+
+func (manager *Manager) DownloadObjectValidated(id string, validate func(data []byte) error) (data []byte, err error) {
+	return manager.DownloadChunkValidated(id, validate)
 }
 
 func (manager *Manager) NotifyCloudCommit(latestID string) {

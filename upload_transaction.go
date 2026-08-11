@@ -156,6 +156,15 @@ func uniqueUploadIDs(ids []string) []string {
 	return ret
 }
 
+func containsUploadID(ids []string, target string) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
+}
+
 func (repo *Repo) saveUploadTransaction(tx *uploadTransaction) error {
 	tx.Updated = time.Now().UnixMilli()
 	data, err := json.MarshalIndent(tx, "", "  ")

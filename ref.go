@@ -56,9 +56,10 @@ func (repo *Repo) Latest() (ret *entity.Index, err error) {
 
 // FullIndex 描述了完整的索引结构。
 type FullIndex struct {
-	ID    string         `json:"id"`
-	Files []*entity.File `json:"files"`
-	Spec  int            `json:"spec"`
+	ID           string         `json:"id"`
+	Files        []*entity.File `json:"files"`
+	LazyManifest string         `json:"lazyManifest,omitempty"`
+	Spec         int            `json:"spec"`
 }
 
 func (repo *Repo) UpdateLatest(index *entity.Index) (err error) {
@@ -69,23 +70,44 @@ func (repo *Repo) UpdateLatest(index *entity.Index) (err error) {
 	if nil != err {
 		return
 	}
-	err = gulu.File.WriteFileSafer(filepath.Join(refs, "latest"), []byte(index.ID), 0644)
-	if nil != err {
-		return
-	}
-
 	fullLatestPath := filepath.Join(repo.Path, "full-latest.json")
-	files, err := repo.GetFiles(index)
+	latestPath := filepath.Join(refs, "latest")
+	if data, readErr := os.ReadFile(latestPath); nil == readErr && string(data) == index.ID {
+		if fullLatest := repo.getFullLatest(index); nil != fullLatest && 1 <= fullLatest.Spec {
+			return nil
+		}
+	}
+	compact := 0 == len(index.LazyFiles)
+	if repo.lazyLoadEnabled && nil != repo.lazyLoader && 0 < len(index.LazyFiles) && "" != index.LazyManifest {
+		if manifest, manifestErr := repo.lazyLoader.getManifest(); nil == manifestErr &&
+			lazyManifestFormatCurrent == lazyManifestFormat(manifest) &&
+			(repo.isLazyManifestLocalClosurePrepared(index.LazyManifest) || repo.isLazyManifestPrepared(index.LazyManifest)) {
+			compact = true
+		}
+	}
+	var files []*entity.File
+	if compact {
+		files, err = repo.getFiles(index.Files)
+	} else {
+		files, err = repo.GetFiles(index)
+	}
 	if nil != err {
 		return
 	}
-
-	fullIndex := &FullIndex{ID: index.ID, Files: files, Spec: 0}
+	fullIndex := &FullIndex{ID: index.ID, Files: files}
+	if compact {
+		fullIndex.LazyManifest = index.LazyManifest
+		fullIndex.Spec = 1
+	}
 	data, err := msgpack.Marshal(fullIndex)
 	if nil != err {
 		return
 	}
 	err = gulu.File.WriteFileSafer(fullLatestPath, data, 0644)
+	if nil != err {
+		return
+	}
+	err = gulu.File.WriteFileSafer(latestPath, []byte(index.ID), 0644)
 	if nil != err {
 		return
 	}
@@ -125,6 +147,35 @@ func (repo *Repo) getFullLatest(latest *entity.Index) (ret *FullIndex) {
 			logging.LogErrorf("remove full latest [%s] failed: %s", fullLatestPath, err)
 		}
 		return
+	}
+	expectedIDs := latest.Files
+	if 1 > ret.Spec {
+		expectedIDs = append(append(make([]string, 0, len(latest.Files)+len(latest.LazyFiles)), latest.Files...), latest.LazyFiles...)
+	} else if ret.LazyManifest != latest.LazyManifest {
+		logging.LogErrorf("full latest lazy manifest [%s] not match latest [%s]", ret.LazyManifest, latest.LazyManifest)
+		ret = nil
+		if err = os.RemoveAll(fullLatestPath); nil != err {
+			logging.LogErrorf("remove full latest [%s] failed: %s", fullLatestPath, err)
+		}
+		return
+	}
+	if len(ret.Files) != len(expectedIDs) {
+		logging.LogErrorf("full latest files count [%d] not match latest files count [%d]", len(ret.Files), len(expectedIDs))
+		ret = nil
+		if err = os.RemoveAll(fullLatestPath); nil != err {
+			logging.LogErrorf("remove full latest [%s] failed: %s", fullLatestPath, err)
+		}
+		return
+	}
+	for i, file := range ret.Files {
+		if nil == file || file.ID != expectedIDs[i] {
+			logging.LogErrorf("full latest file at [%d] does not match latest", i)
+			ret = nil
+			if err = os.RemoveAll(fullLatestPath); nil != err {
+				logging.LogErrorf("remove full latest [%s] failed: %s", fullLatestPath, err)
+			}
+			return
+		}
 	}
 
 	for _, f := range ret.Files {
