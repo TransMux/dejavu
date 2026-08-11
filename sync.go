@@ -947,12 +947,12 @@ func (repo *Repo) sync0(context map[string]interface{},
 			if nil == latestSyncFile {
 				latestSyncFile = latestSyncFilesByID[localUpsert.ID]
 			}
-			if nil != repo.conflictMerge && nil != latestSyncFile {
+			if nil != latestSyncFile {
 				baseData, baseErr := repo.OpenFile(latestSyncFile)
 				localData, localErr := repo.OpenFile(localUpsert)
 				remoteData, remoteErr := repo.OpenFile(cloudUpsert)
 				if nil == baseErr && nil == localErr && nil == remoteErr {
-					if merged, ok := repo.conflictMerge(cloudUpsert.Path, baseData, localData, remoteData); ok {
+					if merged, ok := repo.TryConflictMerge(cloudUpsert.Path, baseData, localData, remoteData); ok {
 						absPath := filepath.Join(repo.DataPath, strings.TrimPrefix(cloudUpsert.Path, "/"))
 						if written, writeErr := compareAndWriteSyncFile(absPath, localData, merged); nil == writeErr && written {
 							// 云端原始版本仍进入同步历史，工作区仅写入已验证的合并结果。

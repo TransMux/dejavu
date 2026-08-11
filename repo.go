@@ -82,6 +82,14 @@ func (repo *Repo) SetConflictMerge(merge ConflictMergeFunc) {
 	repo.conflictMerge = merge
 }
 
+// TryConflictMerge 尝试使用已配置的领域合并器处理同步冲突。
+func (repo *Repo) TryConflictMerge(path string, base, local, remote []byte) (merged []byte, ok bool) {
+	if nil == repo || nil == repo.conflictMerge {
+		return nil, false
+	}
+	return repo.conflictMerge(path, base, local, remote)
+}
+
 // SetChunkSource 设置同步时可选的只读分块来源。
 func (repo *Repo) SetChunkSource(source ChunkSource) {
 	repo.chunkSource = source
