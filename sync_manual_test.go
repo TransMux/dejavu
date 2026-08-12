@@ -569,6 +569,175 @@ func (testCloud *recordingLocalCloud) uploadedObject(id string) bool {
 	return false
 }
 
+func (testCloud *recordingLocalCloud) objectUploadCount(id string) int {
+	testCloud.mu.Lock()
+	defer testCloud.mu.Unlock()
+	want := filepath.ToSlash(filepath.Join("objects", id[:2], id[2:]))
+	var ret int
+	for _, uploaded := range testCloud.uploads {
+		if uploaded == want {
+			ret++
+		}
+	}
+	return ret
+}
+
+func (testCloud *recordingLocalCloud) resetUploads() {
+	testCloud.mu.Lock()
+	testCloud.uploads = nil
+	testCloud.mu.Unlock()
+}
+
+func TestSyncDeduplicatesPreUploadAcrossMerge(t *testing.T) {
+	root := t.TempDir()
+	aesKey, err := encryption.KDF("merged-sync-password", "merged-sync-salt")
+	if nil != err {
+		t.Fatal(err)
+	}
+	var bCloud *recordingLocalCloud
+	newRepo := func(name string) *Repo {
+		dataPath := filepath.Join(root, name, "data")
+		if mkdirErr := os.MkdirAll(dataPath, 0755); nil != mkdirErr {
+			t.Fatal(mkdirErr)
+		}
+		testCloud := &recordingLocalCloud{Local: cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{
+			Dir: "merged-sync", AvailableSize: 1 << 40,
+			Local: &cloud.ConfLocal{Endpoint: filepath.Join(root, "cloud"), ConcurrentReqs: 4},
+		}})}
+		ret, newErr := NewRepo(dataPath, filepath.Join(root, name, "repo"), filepath.Join(root, name, "history"),
+			filepath.Join(root, name, "temp"), name, name, "test", aesKey, nil, testCloud)
+		if nil != newErr {
+			t.Fatal(newErr)
+		}
+		if "b" == name {
+			bCloud = testCloud
+		}
+		return ret
+	}
+
+	a := newRepo("a")
+	b := newRepo("b")
+	if err = os.WriteFile(filepath.Join(b.DataPath, "seed.txt"), []byte("receiver seed"), 0644); nil != err {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(a.DataPath, "cloud.txt"), []byte("cloud baseline"), 0644); nil != err {
+		t.Fatal(err)
+	}
+	if _, err = a.Index("baseline", true, map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+	if _, _, err = a.Sync(map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+	if _, err = b.Index("empty baseline", true, map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+	if _, _, err = b.Sync(map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+
+	if err = os.WriteFile(filepath.Join(a.DataPath, "cloud.txt"), []byte("cloud changed"), 0644); nil != err {
+		t.Fatal(err)
+	}
+	if _, err = a.Index("cloud change", true, map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+	if _, _, err = a.Sync(map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(filepath.Join(b.DataPath, "assets"), 0755); nil != err {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(b.DataPath, "assets", "local.bin"), []byte(strings.Repeat("local", 4096)), 0644); nil != err {
+		t.Fatal(err)
+	}
+	localLatest, err := b.Index("local change", true, map[string]interface{}{})
+	if nil != err {
+		t.Fatal(err)
+	}
+	localFiles, err := b.getFiles(localLatest.Files)
+	if nil != err {
+		t.Fatal(err)
+	}
+	var localFile *entity.File
+	for _, file := range localFiles {
+		if "/assets/local.bin" == file.Path || "assets/local.bin" == file.Path {
+			localFile = file
+			break
+		}
+	}
+	if nil == localFile {
+		t.Fatal("local merge fixture file not indexed")
+	}
+	bCloud.resetUploads()
+	if _, _, err = b.Sync(map[string]interface{}{}); nil != err {
+		t.Fatal(err)
+	}
+	if got := bCloud.objectUploadCount(localFile.ID); 1 != got {
+		t.Fatalf("local file upload count across pre-upload and merge = %d, want 1", got)
+	}
+	for _, id := range localFile.Chunks {
+		if got := bCloud.objectUploadCount(id); 1 != got {
+			t.Fatalf("local chunk %s upload count across pre-upload and merge = %d, want 1", id, got)
+		}
+	}
+}
+
+func TestUploadCloudSessionDeduplicatesAcrossMergedIndex(t *testing.T) {
+	root := t.TempDir()
+	dataPath := filepath.Join(root, "data")
+	if err := os.MkdirAll(dataPath, 0755); nil != err {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataPath, "document.txt"), []byte(strings.Repeat("merged", 2048)), 0644); nil != err {
+		t.Fatal(err)
+	}
+
+	aesKey, err := encryption.KDF("merged-upload-password", "merged-upload-salt")
+	if nil != err {
+		t.Fatal(err)
+	}
+	testCloud := &recordingLocalCloud{Local: cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{
+		Dir: "merged-upload", AvailableSize: 1 << 40,
+		Local: &cloud.ConfLocal{Endpoint: filepath.Join(root, "cloud"), ConcurrentReqs: 4},
+	}})}
+	repo, err := NewRepo(dataPath, filepath.Join(root, "repo"), filepath.Join(root, "history"), filepath.Join(root, "temp"),
+		"merged-device", "merged-device", "test", aesKey, nil, testCloud)
+	if nil != err {
+		t.Fatal(err)
+	}
+	latest, err := repo.Index("pre-merge", true, map[string]interface{}{})
+	if nil != err {
+		t.Fatal(err)
+	}
+	files, err := repo.getFiles(latest.Files)
+	if nil != err {
+		t.Fatal(err)
+	}
+	chunks := repo.getChunks(files)
+	session := newSyncUploadSession()
+	traffic := &TrafficStat{m: &sync.Mutex{}}
+	if err = repo.uploadCloud(map[string]interface{}{}, latest, &entity.Index{}, nil, traffic, session); nil != err {
+		t.Fatal(err)
+	}
+
+	merged := *latest
+	merged.ID = "0123456789abcdef0123456789abcdef01234567"
+	if err = repo.uploadCloud(map[string]interface{}{}, &merged, &entity.Index{}, nil, traffic, session); nil != err {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if got := testCloud.objectUploadCount(file.ID); 1 != got {
+			t.Fatalf("file %s upload count = %d, want 1", file.ID, got)
+		}
+	}
+	for _, id := range chunks {
+		if got := testCloud.objectUploadCount(id); 1 != got {
+			t.Fatalf("chunk %s upload count = %d, want 1", id, got)
+		}
+	}
+}
+
 func TestManualSyncRecordsChunkAndFileUploadsThroughProductionPath(t *testing.T) {
 	root := t.TempDir()
 	dataPath := filepath.Join(root, "data")

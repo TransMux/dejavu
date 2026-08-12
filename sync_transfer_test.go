@@ -11,12 +11,17 @@ package dejavu
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/siyuan-note/dejavu/cloud"
+	"github.com/siyuan-note/dejavu/entity"
 	"github.com/siyuan-note/dejavu/util"
 )
 
@@ -128,6 +133,103 @@ func TestUploadTransactionDemotesMissingRemoteConfirmation(t *testing.T) {
 	}
 	if persisted.CompletedChunks[chunkID] || persisted.Failed[chunkID] == "" {
 		t.Fatalf("demotion was not persisted: %#v", persisted)
+	}
+}
+
+func TestUploadVerificationUsesBoundedConcurrency(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	localCloud := cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{Dir: "verify-concurrency", RepoPath: repo.Path,
+		AvailableSize: 1 << 30, Local: &cloud.ConfLocal{Endpoint: t.TempDir(), ConcurrentReqs: 4}}})
+	repo.cloud = localCloud
+	ids := make([]string, 0, 12)
+	for i := 0; i < 12; i++ {
+		data := []byte(fmt.Sprintf("verification chunk %d", i))
+		id := util.Hash(data)
+		if err := repo.store.PutChunk(&entity.Chunk{ID: id, Data: data}); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if result := repo.uploadChunksDetailed(ids, map[string]interface{}{}); nil != result.err {
+		t.Fatal(result.err)
+	}
+	var active, maximum atomic.Int64
+	repo.cloud = &concurrentDownloadCloud{Cloud: localCloud, concurrentReqs: 4, download: func(objectPath string) ([]byte, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			previous := maximum.Load()
+			if current <= previous || maximum.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		return localCloud.DownloadObject(objectPath)
+	}}
+	tx, err := repo.beginUploadTransaction("0123456789abcdef0123456789abcdef01234567", ids, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traffic := &TrafficStat{}
+	verifyErr, saveErr := repo.verifyAndRecordUploadIDs(tx, true, ids, traffic, map[string]interface{}{})
+	if verifyErr != nil || saveErr != nil {
+		t.Fatalf("verifyErr=%v saveErr=%v", verifyErr, saveErr)
+	}
+	if maximum.Load() < 2 || maximum.Load() > 4 {
+		t.Fatalf("maximum concurrent readbacks=%d, want 2..4", maximum.Load())
+	}
+	if len(tx.CompletedChunks) != len(ids) || traffic.APIGet != len(ids) || traffic.DownloadChunkCount != len(ids) {
+		t.Fatalf("unexpected transaction or traffic: completed=%d traffic=%#v", len(tx.CompletedChunks), traffic)
+	}
+}
+
+func TestConcurrentUploadVerificationPersistsSiblingSuccesses(t *testing.T) {
+	repo := newLazyTestRepo(t)
+	localCloud := cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{Dir: "verify-failure", RepoPath: repo.Path,
+		AvailableSize: 1 << 30, Local: &cloud.ConfLocal{Endpoint: t.TempDir(), ConcurrentReqs: 3}}})
+	ids := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		data := []byte(fmt.Sprintf("failure chunk %d", i))
+		id := util.Hash(data)
+		if err := repo.store.PutChunk(&entity.Chunk{ID: id, Data: data}); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	repo.cloud = localCloud
+	if result := repo.uploadChunksDetailed(ids, map[string]interface{}{}); nil != result.err {
+		t.Fatal(result.err)
+	}
+	missing := ids[1]
+	objectPath := filepath.Join(localCloud.GetConf().Local.Endpoint, localCloud.GetConf().Dir, "objects", missing[:2], missing[2:])
+	if err := os.Remove(objectPath); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := repo.beginUploadTransaction("0123456789abcdef0123456789abcdef01234567", ids, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traffic := &TrafficStat{}
+	verifyErr, saveErr := repo.verifyAndRecordUploadIDs(tx, true, ids, traffic, map[string]interface{}{})
+	if verifyErr == nil || saveErr != nil {
+		t.Fatalf("verifyErr=%v saveErr=%v", verifyErr, saveErr)
+	}
+	if tx.CompletedChunks[missing] || !tx.CompletedChunks[ids[0]] || !tx.CompletedChunks[ids[2]] || tx.Failed[missing] == "" {
+		t.Fatalf("concurrent outcomes were not persisted exactly: %#v", tx)
+	}
+	if traffic.APIGet != len(ids) || traffic.DownloadChunkCount != len(ids)-1 {
+		t.Fatalf("all sibling readbacks were not accounted: %#v", traffic)
+	}
+	persistedData, err := os.ReadFile(filepath.Join(repo.Path, "upload-transactions", "current.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := &uploadTransaction{}
+	if err = json.Unmarshal(persistedData, persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.CompletedChunks[missing] || !persisted.CompletedChunks[ids[0]] || !persisted.CompletedChunks[ids[2]] {
+		t.Fatalf("sibling outcomes were not durably persisted: %#v", persisted)
 	}
 }
 
@@ -326,5 +428,82 @@ func TestRunConcurrentObjectTransfersReportsSkippedIDsDeterministically(t *testi
 	}
 	if len(result.skippedIDs) != 2 || result.skippedIDs[0] != "a" || result.skippedIDs[1] != "z" {
 		t.Fatalf("skipped IDs = %#v", result.skippedIDs)
+	}
+}
+
+func TestSyncAuditTransferWorkersOverlap(t *testing.T) {
+	recorder := &syncAuditRecorder{scenario: "transfer_overlap", origin: time.Now()}
+	context := map[string]interface{}{SyncAuditContextKey: recorder}
+	ready := make(chan struct{}, 2)
+	release := make(chan struct{})
+	task := func(operation string) syncTransferTask {
+		return func(*TrafficStat) (err error) {
+			finishAudit := BeginSyncAudit(context, operation, nil)
+			defer func() { finishAudit(err) }()
+			ready <- struct{}{}
+			<-release
+			return nil
+		}
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := runConcurrentSyncTransfers(task("dejavu.sync.transfer.download"), task("dejavu.sync.transfer.upload"))
+		result <- err
+	}()
+	<-ready
+	<-ready
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	events := recorder.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("transfer events = %#v", events)
+	}
+	leftEnd := events[0].StartedNS + events[0].DurationNS
+	rightEnd := events[1].StartedNS + events[1].DurationNS
+	if events[0].StartedNS >= rightEnd || events[1].StartedNS >= leftEnd {
+		t.Fatalf("transfer workers did not overlap: %#v", events)
+	}
+}
+
+func TestSyncAuditConcurrentTransferOptimizationComparison(t *testing.T) {
+	const runs = 20
+	const operationLatency = 3 * time.Millisecond
+	serialSamples := make([]time.Duration, 0, runs)
+	concurrentSamples := make([]time.Duration, 0, runs)
+	operation := func(*TrafficStat) error {
+		timer := time.NewTimer(operationLatency)
+		defer timer.Stop()
+		<-timer.C
+		return nil
+	}
+	for i := 0; i < runs; i++ {
+		started := time.Now()
+		if err := operation(&TrafficStat{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := operation(&TrafficStat{}); err != nil {
+			t.Fatal(err)
+		}
+		serialSamples = append(serialSamples, time.Since(started))
+
+		started = time.Now()
+		if _, err := runConcurrentSyncTransfers(operation, operation); err != nil {
+			t.Fatal(err)
+		}
+		concurrentSamples = append(concurrentSamples, time.Since(started))
+	}
+	median := func(samples []time.Duration) time.Duration {
+		slices.Sort(samples)
+		return samples[len(samples)/2]
+	}
+	serialMedian := median(serialSamples)
+	concurrentMedian := median(concurrentSamples)
+	t.Logf("transfer overlap comparison: serial median=%s concurrent median=%s saved=%.1f%%", serialMedian,
+		concurrentMedian, 100*(1-float64(concurrentMedian)/float64(serialMedian)))
+	if concurrentMedian >= serialMedian*3/4 {
+		t.Fatalf("concurrent transfer did not reduce the controlled critical path: serial=%s concurrent=%s", serialMedian,
+			concurrentMedian)
 	}
 }

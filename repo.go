@@ -67,11 +67,12 @@ type Repo struct {
 	conflictMerge ConflictMergeFunc // 同步冲突的可选领域合并器
 
 	// 懒加载支持
-	lazyLoadEnabled        bool        // 是否启用懒加载
-	lazyLoader             *LazyLoader // 懒加载管理器
-	lazyManifestMigrations atomic.Int64
-	lazyManifestPreparedMu sync.RWMutex
-	lazyManifestPrepared   string // 当前进程已验证、等待本地 latest 成功发布的清单身份
+	lazyLoadEnabled             bool        // 是否启用懒加载
+	lazyLoader                  *LazyLoader // 懒加载管理器
+	lazyManifestMigrations      atomic.Int64
+	lazyManifestPreparedMu      sync.RWMutex
+	lazyManifestPrepared        string      // 当前进程已验证、等待本地 latest 成功发布的清单身份
+	cloudMissingObjectsUploaded atomic.Bool // 当前仓库是否已执行云端缺失对象修复
 }
 
 // ConflictMergeFunc 尝试合并同一路径的共同祖先、本地和云端内容。
@@ -966,8 +967,23 @@ func (repo *Repo) index(memo string, checkChunks bool, context map[string]interf
 
 func (repo *Repo) index0(memo string, checkChunks bool, context map[string]interface{}) (ret *entity.Index, err error) {
 	logging.LogInfof("index0: starting index creation process")
+	indexStart := time.Now()
+	phaseStart := indexStart
 
 	var files, currentLazyFiles []*entity.File
+	type lazyIndexResult struct {
+		files []*entity.File
+		err   error
+	}
+	lazyResultCh := make(chan lazyIndexResult, 1)
+	if repo.lazyLoadEnabled && repo.lazyLoader != nil {
+		go func() {
+			lazyFiles, lazyErr := repo.getLazyFilesForIndex()
+			lazyResultCh <- lazyIndexResult{files: lazyFiles, err: lazyErr}
+		}()
+	} else {
+		lazyResultCh <- lazyIndexResult{}
+	}
 	ignoreMatcher := repo.ignoreMatcher()
 	eventbus.Publish(eventbus.EvtIndexBeforeWalkData, context, repo.DataPath)
 	logging.LogInfof("index0: phase 1/6 - starting file walk in directory: %s", repo.DataPath)
@@ -1000,6 +1016,9 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		if ignoreMatcher.MatchesPath(p) {
 			return nil
 		}
+		if isAssetPath(p) {
+			p = normalizeLazyPath(p)
+		}
 
 		// 注意：不要跳过assets文件，我们需要在索引创建时对它们进行分类处理
 		// assets文件会在索引创建时被分类为懒加载文件
@@ -1009,6 +1028,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 		return nil
 	})
 	logging.LogInfof("index0: phase 1/6 completed - file walk: processed %d files", walkCount)
+	logging.LogInfof("index0: phase timing [phase=walk, cost=%s]", time.Since(phaseStart))
 	if nil != err {
 		logging.LogErrorf("walk data failed: %s", err)
 		return
@@ -1016,14 +1036,15 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 
 	// Phase 2: Add lazy files
 	logging.LogInfof("index0: phase 2/6 - processing lazy files")
+	phaseStart = time.Now()
+	lazyResult := <-lazyResultCh
 	if repo.lazyLoadEnabled && repo.lazyLoader != nil {
-		lazyFiles, lazyErr := repo.getLazyFilesForIndex()
-		if lazyErr != nil {
-			logging.LogWarnf("get lazy files for index failed: %s", lazyErr)
-		} else if len(lazyFiles) > 0 {
-			currentLazyFiles = lazyFiles
-			files = append(files, lazyFiles...)
-			logging.LogInfof("index0: phase 2/6 completed - added %d lazy files", len(lazyFiles))
+		if lazyResult.err != nil {
+			logging.LogWarnf("get lazy files for index failed: %s", lazyResult.err)
+		} else if len(lazyResult.files) > 0 {
+			currentLazyFiles = lazyResult.files
+			files = append(files, lazyResult.files...)
+			logging.LogInfof("index0: phase 2/6 completed - added %d lazy files", len(lazyResult.files))
 		} else {
 			logging.LogInfof("index0: phase 2/6 completed - no lazy files found")
 		}
@@ -1032,6 +1053,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	}
 
 	logging.LogInfof("walk data [files=%d] completed", len(files))
+	logging.LogInfof("index0: phase timing [phase=lazy, cost=%s]", time.Since(phaseStart))
 	//sort.Slice(files, func(i, j int) bool { return files[i].Updated > files[j].Updated })
 	//for _, f := range files {
 	//	logging.LogInfof("walked data [file=%s]", f.Path)
@@ -1045,6 +1067,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 
 	// Phase 3: Get latest index
 	logging.LogInfof("index0: phase 3/6 - getting latest index")
+	phaseStart = time.Now()
 	latest, err := repo.Latest()
 	init := false
 	if nil != err {
@@ -1068,9 +1091,11 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	} else {
 		logging.LogInfof("index0: phase 3/6 completed - got latest index")
 	}
+	logging.LogInfof("index0: phase timing [phase=latest, cost=%s]", time.Since(phaseStart))
 
 	// Phase 4: Get latest files
 	logging.LogInfof("index0: phase 4/6 - getting latest files")
+	phaseStart = time.Now()
 	var upserts, removes, latestFiles []*entity.File
 	fullLatest := repo.getFullLatest(latest)
 	if nil != fullLatest {
@@ -1200,11 +1225,14 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			logging.LogInfof("index0: phase 4/6 completed - init mode, no files to load")
 		}
 	}
+	logging.LogInfof("index0: phase timing [phase=baseline, cost=%s]", time.Since(phaseStart))
 
 	// Phase 5: Calculate diffs
 	logging.LogInfof("index0: phase 5/6 - calculating file differences")
+	phaseStart = time.Now()
 	upserts, removes = repo.diffUpsertRemove(files, latestFiles, false)
 	logging.LogInfof("index0: phase 5/6 completed - found %d upserts, %d removes", len(upserts), len(removes))
+	logging.LogInfof("index0: phase timing [phase=diff, cost=%s]", time.Since(phaseStart))
 
 	if 1 > len(upserts) && 1 > len(removes) {
 		if repo.lazyLoadEnabled && nil != repo.lazyLoader && "" != latest.LazyManifest {
@@ -1216,6 +1244,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 			}
 		}
 		logging.LogInfof("index0: no changes detected, returning existing index")
+		logging.LogInfof("index0: phase timing [phase=build, cost=0s, total=%s]", time.Since(indexStart))
 		ret = latest
 		return
 	}
@@ -1236,6 +1265,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 
 	// Phase 6: Process upsert files and lazy files
 	logging.LogInfof("index0: phase 6/6 - processing upsert files and lazy files")
+	phaseStart = time.Now()
 
 	var normalUpserts []*entity.File
 	for _, file := range upserts {
@@ -1353,20 +1383,49 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	if repo.lazyLoadEnabled && len(lazyFiles) > 0 {
 		logging.LogInfof("index0: processing %d lazy files for chunk processing", len(lazyFiles))
 
-		// 处理懒加载文件的chunks - 这些都是upserts中的文件，需要重新处理
+		// 懒加载文件互不依赖，并行计算分块和写入元数据，清单仍在全部成功后统一更新。
 		totalLazyFiles := len(lazyFiles)
-		for i, file := range lazyFiles {
+		lazyCount := atomic.Int32{}
+		lazyWaitGroup := &sync.WaitGroup{}
+		lazyWorkerErrs := []error{}
+		lazyWorkerErrLock := sync.Mutex{}
+		lazyPool, poolErr := ants.NewPoolWithFunc(4, func(arg interface{}) {
+			defer lazyWaitGroup.Done()
+			file := arg.(*entity.File)
+			current := int(lazyCount.Add(1))
 			lazyContext := map[string]interface{}{eventbus.CtxPushMsg: eventbus.CtxPushMsgToNone}
-			if putErr := repo.putFileChunks(file, lazyContext, i+1, totalLazyFiles); putErr != nil {
+			if putErr := repo.putFileChunks(file, lazyContext, current, totalLazyFiles); putErr != nil {
 				logging.LogErrorf("compute chunks for lazy file [%s] failed: %s", file.Path, putErr)
-				err = putErr
+				lazyWorkerErrLock.Lock()
+				lazyWorkerErrs = append(lazyWorkerErrs, putErr)
+				lazyWorkerErrLock.Unlock()
 				return
 			}
 			if putErr := repo.ensureLazyFileStored(file, lazyContext); putErr != nil {
 				logging.LogErrorf("ensure lazy file metadata [%s] failed: %s", file.Path, putErr)
-				err = putErr
+				lazyWorkerErrLock.Lock()
+				lazyWorkerErrs = append(lazyWorkerErrs, putErr)
+				lazyWorkerErrLock.Unlock()
 				return
 			}
+		})
+		if nil != poolErr {
+			return nil, poolErr
+		}
+		for _, file := range lazyFiles {
+			lazyWaitGroup.Add(1)
+			if invokeErr := lazyPool.Invoke(file); nil != invokeErr {
+				lazyWaitGroup.Done()
+				lazyPool.Release()
+				return nil, invokeErr
+			}
+		}
+		lazyWaitGroup.Wait()
+		lazyPool.Release()
+		if 0 < len(lazyWorkerErrs) {
+			return nil, lazyWorkerErrs[0]
+		}
+		for _, file := range lazyFiles {
 			ret.LazyFiles = append(ret.LazyFiles, file.ID)
 		}
 
@@ -1407,6 +1466,7 @@ func (repo *Repo) index0(memo string, checkChunks bool, context map[string]inter
 	}
 
 	logging.LogInfof("index0: phase 6/6 completed - index creation finished")
+	logging.LogInfof("index0: phase timing [phase=build, cost=%s, total=%s]", time.Since(phaseStart), time.Since(indexStart))
 	logging.LogInfof("index0: successfully created index with %d files, %d lazy files", len(ret.Files), len(ret.LazyFiles))
 	return
 }

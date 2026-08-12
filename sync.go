@@ -126,6 +126,9 @@ func (repo *Repo) GetCloudLatest(context map[string]interface{}) (cloudLatest *e
 }
 
 func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult, trafficStat *TrafficStat, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync", nil)
+	defer func() { finishAudit(err) }()
+	syncStart := time.Now()
 	unlockProcess := lockSyncProcess()
 	defer unlockProcess()
 	unlockDeviceLocalFiles := repo.lockDeviceLocalSyncFiles()
@@ -140,13 +143,20 @@ func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult
 		mergeResult = &MergeResult{Time: time.Now()}
 		preflightTraffic = &TrafficStat{m: &sync.Mutex{}}
 		trafficStat = preflightTraffic
+		stageStart := time.Now()
+		finishLatest := BeginSyncAudit(context, "dejavu.sync.preflight.local_latest", nil)
 		latest, latestErr := repo.Latest()
+		finishLatest(latestErr)
 		if nil != latestErr {
 			logging.LogErrorf("get latest failed: %s", latestErr)
 			err = latestErr
 			return
 		}
+		logging.LogInfof("sync preflight stage [stage=latest, index=%s, cost=%s]", latest.ID, time.Since(stageStart))
+		stageStart = time.Now()
+		finishCloudLatest := BeginSyncAudit(context, "dejavu.sync.preflight.cloud_latest", nil)
 		length, latestAPIGet, cloudLatest, latestErr := repo.downloadCloudLatest(context)
+		finishCloudLatest(latestErr)
 		if nil != latestErr {
 			if !errors.Is(latestErr, cloud.ErrCloudObjectNotFound) {
 				logging.LogErrorf("download cloud latest failed: %s", latestErr)
@@ -157,36 +167,63 @@ func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult
 		trafficStat.DownloadFileCount += latestAPIGet
 		trafficStat.DownloadBytes += length
 		trafficStat.APIGet += latestAPIGet
+		logging.LogInfof("sync preflight stage [stage=cloud-latest, index=%s, bytes=%d, apiGet=%d, cost=%s]", cloudLatest.ID,
+			length, latestAPIGet, time.Since(stageStart))
+		stageStart = time.Now()
+		finishConsume := BeginSyncAudit(context, "dejavu.sync.preflight.consume_lazy", nil)
 		latest, latestErr = repo.consumePublishedLazyManifestIfNeeded(latest, cloudLatest, context)
+		finishConsume(latestErr)
 		if nil != latestErr {
 			err = latestErr
 			return
 		}
+		logging.LogInfof("sync preflight stage [stage=consume-lazy-manifest, index=%s, cost=%s]", latest.ID,
+			time.Since(stageStart))
+		stageStart = time.Now()
+		finishSanitize := BeginSyncAudit(context, "dejavu.sync.preflight.sanitize", nil)
 		latest, _, latestErr = repo.sanitizeStoredIndex(latest, "[Sync Preflight] Remove device-local files")
+		finishSanitize(latestErr)
 		if nil != latestErr {
 			logging.LogErrorf("sanitize latest failed: %s", latestErr)
 			err = latestErr
 			return
 		}
+		logging.LogInfof("sync preflight stage [stage=sanitize, index=%s, cost=%s]", latest.ID, time.Since(stageStart))
+		stageStart = time.Now()
+		finishManifestCheck := BeginSyncAudit(context, "dejavu.sync.preflight.lazy_manifest_check", nil)
 		lazyManifestRequiresSync, manifestErr := repo.localLazyManifestRequiresSync(latest)
+		finishManifestCheck(manifestErr)
 		if nil != manifestErr {
 			err = manifestErr
 			return
 		}
+		logging.LogInfof("sync preflight stage [stage=manifest-requires-sync, required=%t, cost=%s]", lazyManifestRequiresSync,
+			time.Since(stageStart))
 		if cloudLatest.ID == latest.ID && !lazyManifestRequiresSync {
 			// 数据一致时不获取云端锁，减少无变更同步的远程请求。
+			logging.LogInfof("sync fast return [reason=latest-equal, index=%s, total=%s]", latest.ID, time.Since(syncStart))
 			return
 		}
 	}
 
 	// 锁定云端，防止其他设备并发上传数据
+	lockStart := time.Now()
+	finishCloudLock := BeginSyncAudit(context, "dejavu.sync.cloud_lock", nil)
 	err = repo.tryLockCloud(repo.DeviceID, context)
+	finishCloudLock(err)
 	if nil != err {
 		return
 	}
-	defer repo.unlockCloud(context)
+	logging.LogInfof("sync stage [stage=cloud-lock, cost=%s]", time.Since(lockStart))
+	defer func() {
+		finishCloudUnlock := BeginSyncAudit(context, "dejavu.sync.cloud_unlock", nil)
+		repo.unlockCloud(context)
+		finishCloudUnlock(nil)
+	}()
 
+	coreStart := time.Now()
 	mergeResult, trafficStat, err = repo.sync(context)
+	logging.LogInfof("sync stage [stage=core, cost=%s, err=%v]", time.Since(coreStart), err)
 	mergeTrafficStat(trafficStat, preflightTraffic)
 	if e, ok := err.(*os.PathError); ok && isNoSuchFileOrDirErr(err) {
 		p := e.Path
@@ -198,6 +235,7 @@ func (repo *Repo) Sync(context map[string]interface{}) (mergeResult *MergeResult
 		logging.LogErrorf("sync failed: %s", err)
 		err = ErrRepoFatal
 	}
+	logging.LogInfof("sync completed [total=%s, err=%v]", time.Since(syncStart), err)
 	return
 }
 
@@ -207,16 +245,22 @@ var lockSyncProcess = func() func() {
 }
 
 func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult, trafficStat *TrafficStat, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.core", nil)
+	defer func() { finishAudit(err) }()
+	coreStart := time.Now()
 	mergeResult = &MergeResult{Time: time.Now()}
 	trafficStat = &TrafficStat{m: &sync.Mutex{}}
 
 	// 获取本地最新索引
+	stageStart := time.Now()
 	latest, err := repo.Latest()
 	if nil != err {
 		logging.LogErrorf("get latest failed: %s", err)
 		return
 	}
+	logging.LogInfof("sync core stage [stage=latest, index=%s, cost=%s]", latest.ID, time.Since(stageStart))
 	// 从云端获取最新索引
+	stageStart = time.Now()
 	length, latestAPIGet, cloudLatest, err := repo.downloadCloudLatest(context)
 	if nil != err {
 		if !errors.Is(err, cloud.ErrCloudObjectNotFound) {
@@ -227,15 +271,21 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 	trafficStat.DownloadFileCount += latestAPIGet
 	trafficStat.DownloadBytes += length
 	trafficStat.APIGet += latestAPIGet
+	logging.LogInfof("sync core stage [stage=cloud-latest, index=%s, bytes=%d, apiGet=%d, cost=%s]", cloudLatest.ID, length,
+		latestAPIGet, time.Since(stageStart))
+	stageStart = time.Now()
 	latest, err = repo.consumePublishedLazyManifestIfNeeded(latest, cloudLatest, context)
 	if nil != err {
 		return
 	}
+	logging.LogInfof("sync core stage [stage=consume-lazy-manifest, index=%s, cost=%s]", latest.ID, time.Since(stageStart))
+	stageStart = time.Now()
 	latest, _, err = repo.sanitizeStoredIndex(latest, "[Sync] Remove device-local files")
 	if nil != err {
 		logging.LogErrorf("sanitize latest failed: %s", err)
 		return
 	}
+	logging.LogInfof("sync core stage [stage=sanitize, index=%s, cost=%s]", latest.ID, time.Since(stageStart))
 
 	var migrationPublished bool
 	latest, migrationPublished, err = repo.publishLazyManifestRepositoryMigration(latest, cloudLatest, trafficStat, context)
@@ -249,6 +299,7 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 
 	if cloudLatest.ID == latest.ID {
 		// 数据一致，直接返回
+		logging.LogInfof("sync core fast return [reason=latest-equal, index=%s, total=%s]", latest.ID, time.Since(coreStart))
 		return
 	}
 
@@ -259,13 +310,16 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 	}
 
 	// 计算本地缺失的文件
+	stageStart = time.Now()
 	fetchFileIDs, err := repo.localNotFoundFiles(cloudLatest.Files)
 	if nil != err {
 		logging.LogErrorf("get local not found files failed: %s", err)
 		return
 	}
+	logging.LogInfof("sync core stage [stage=local-missing-files, files=%d, cost=%s]", len(fetchFileIDs), time.Since(stageStart))
 
 	// 从云端下载缺失文件并入库
+	stageStart = time.Now()
 	downloadResult, fetchedFiles := repo.downloadCloudFilesPutDetailed(fetchFileIDs, context)
 	trafficStat.DownloadBytes += downloadResult.bytes
 	trafficStat.DownloadFileCount += downloadResult.completed
@@ -275,9 +329,13 @@ func (repo *Repo) sync(context map[string]interface{}) (mergeResult *MergeResult
 		logging.LogErrorf("download cloud files put failed: %s", err)
 		return
 	}
+	logging.LogInfof("sync core stage [stage=download-missing-files, attempted=%d, completed=%d, bytes=%d, cost=%s]",
+		downloadResult.attempted, downloadResult.completed, downloadResult.bytes, time.Since(stageStart))
 
 	// 执行数据同步
+	stageStart = time.Now()
 	err = repo.sync0(context, fetchedFiles, cloudLatest, latest, mergeResult, trafficStat)
+	logging.LogInfof("sync core stage [stage=transfer-merge-publish, cost=%s, err=%v]", time.Since(stageStart), err)
 	return
 }
 
@@ -337,6 +395,14 @@ func (repo *Repo) readPublishedLazyManifest(index *entity.Index, context map[str
 
 func (repo *Repo) consumePublishedLazyManifestIfNeeded(latest, cloudLatest *entity.Index,
 	context map[string]interface{}) (*entity.Index, error) {
+	consumeStart := time.Now()
+	stageStart := consumeStart
+	logStage := func(stage string) {
+		logging.LogInfof("lazy manifest consume stage [stage=%s, cost=%s, total=%s]", stage, time.Since(stageStart), time.Since(consumeStart))
+		stageStart = time.Now()
+	}
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.lazy.consume", nil)
+	defer finishAudit(nil)
 	if !repo.lazyLoadEnabled || nil == repo.lazyLoader || nil == cloudLatest || "" == cloudLatest.ID ||
 		repo.isLazyManifestHydrated(cloudLatest.LazyManifest) {
 		return latest, nil
@@ -348,6 +414,7 @@ func (repo *Repo) consumePublishedLazyManifestIfNeeded(latest, cloudLatest *enti
 	if lazyManifestFormatCurrent != lazyManifestFormat(published) {
 		return latest, nil
 	}
+	logStage("read-published")
 	if err = validateCurrentLazyManifestCatalog(published); nil != err {
 		return nil, err
 	}
@@ -355,36 +422,59 @@ func (repo *Repo) consumePublishedLazyManifestIfNeeded(latest, cloudLatest *enti
 	if nil != err {
 		return nil, err
 	}
+	logStage("read-local")
 	merged := mergeLazyManifestAssets(local, published)
+	logStage("merge")
 	canonicalized, err := repo.canonicalizeLazyManifestLocalDeltas(merged, published)
 	if nil != err {
 		return nil, err
 	}
-	identityChanges, err := repo.canonicalizeLazyManifestObjectIdentities(merged)
+	logStage("canonicalize-local-deltas")
+	// published 已通过当前格式校验，merge 会规范化路径，本地增量也已重新生成并写入不可变元数据对象。
+	// 此处只需校验合并结果，不再对完整清单逐项读取对象并重复规范化。
+	if err = validateCurrentLazyManifestCatalog(merged); nil != err {
+		return nil, err
+	}
+	logStage("validate-identities")
+	// 本地清单在上一轮索引时已经完成闭包准备；远端清单也受已发布索引闭包保护。
+	// 只补齐两份清单之间发生变化的元数据，避免单个远端资源变化时重新读取完整清单的所有对象。
+	changedAssets := make(map[string]*LazyAsset)
+	for path, asset := range merged.Assets {
+		if nil == asset {
+			continue
+		}
+		localAsset := local.Assets[path]
+		if nil == localAsset || localAsset.FileID != asset.FileID {
+			changedAssets[path] = asset
+		}
+	}
+	hydrationManifest := &LazyManifest{Version: lazyManifestFormatCurrent, Assets: changedAssets}
+	hydrated, err := repo.hydrateLazyManifestMetadata(hydrationManifest, context)
 	if nil != err {
 		return nil, err
 	}
-	canonicalized += identityChanges
-	hydrated, err := repo.hydrateLazyManifestMetadata(merged, context)
-	if nil != err {
-		return nil, err
-	}
+	logStage("hydrate-metadata-delta")
 	if err = repo.saveLazyManifestWithNewIdentity(merged); nil != err {
 		return nil, fmt.Errorf("save consumed lazy manifest migration: %w", err)
 	}
+	logStage("save-manifest")
 	if err = repo.advanceLazyManifestIdentityPast(cloudLatest.LazyManifest); nil != err {
 		return nil, fmt.Errorf("separate consumed lazy manifest identity: %w", err)
 	}
+	logStage("separate-identity")
 	if err = repo.advanceLazyManifestIdentityPastCloudObjects(); nil != err {
 		return nil, fmt.Errorf("reserve consumed lazy manifest identity: %w", err)
 	}
+	logStage("reserve-identity")
 	latest, err = repo.index("[Sync] Consume lazy manifest repository migration", false, context)
 	if nil != err {
 		return nil, err
 	}
+	logStage("index")
 	if err = repo.markLazyManifestHydrated(cloudLatest.LazyManifest); nil != err {
 		return nil, fmt.Errorf("mark consumed lazy manifest migration: %w", err)
 	}
+	logStage("mark-hydrated")
 	logging.LogInfof("lazy manifest repository migration consumed [assets=%d, hydrated=%d, localDeltas=%d, latest=%s]",
 		len(merged.Assets), hydrated, canonicalized, cloudLatest.ID)
 	return latest, nil
@@ -417,6 +507,8 @@ func (repo *Repo) advanceLazyManifestIdentityPastCloudObjects() error {
 
 func (repo *Repo) publishLazyManifestRepositoryMigration(latest, cloudLatest *entity.Index, trafficStat *TrafficStat,
 	context map[string]interface{}) (ret *entity.Index, published bool, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.lazy.migrate_publish", nil)
+	defer func() { finishAudit(err) }()
 	ret = latest
 	if !repo.lazyLoadEnabled || nil == repo.lazyLoader || nil == cloudLatest || "" == cloudLatest.ID {
 		return
@@ -491,7 +583,9 @@ func (repo *Repo) publishLazyManifestRepositoryMigration(latest, cloudLatest *en
 }
 
 func (repo *Repo) ensurePublishedLazyManifestMetadata(index *entity.Index, trafficStat *TrafficStat,
-	context map[string]interface{}) error {
+	context map[string]interface{}) (err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.lazy.ensure_metadata", nil)
+	defer func() { finishAudit(err) }()
 	manifest, err := repo.lazyLoader.getManifest()
 	if nil != err {
 		return err
@@ -606,6 +700,8 @@ func canonicalLazyManifestFile(asset *LazyAsset) (*entity.File, error) {
 }
 
 func (repo *Repo) hydrateLazyManifestMetadata(manifest *LazyManifest, context map[string]interface{}) (hydrated int, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.lazy.hydrate_metadata", nil)
+	defer func() { finishAudit(err) }()
 	if err = validateCurrentLazyManifestCatalog(manifest); nil != err {
 		return 0, fmt.Errorf("hydrate lazy manifest metadata: %w", err)
 	}
@@ -660,7 +756,9 @@ func (repo *Repo) hydrateLazyManifestMetadata(manifest *LazyManifest, context ma
 	return repaired, nil
 }
 
-func (repo *Repo) prepareLocalLazyManifestClosure(context map[string]interface{}) error {
+func (repo *Repo) prepareLocalLazyManifestClosure(context map[string]interface{}) (err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.lazy.prepare_closure", nil)
+	defer func() { finishAudit(err) }()
 	if !repo.lazyLoadEnabled || nil == repo.lazyLoader {
 		return nil
 	}
@@ -751,6 +849,9 @@ func (repo *Repo) prepareLocalLazyManifestClosure(context map[string]interface{}
 // trafficStat 待返回的流量统计
 func (repo *Repo) sync0(context map[string]interface{},
 	fetchedFiles []*entity.File, cloudLatest *entity.Index, latest *entity.Index, mergeResult *MergeResult, trafficStat *TrafficStat) (err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.merge_publish", nil)
+	defer func() { finishAudit(err) }()
+	coreStart := time.Now()
 	type mergedWorkspaceBackup struct {
 		before, merged []byte
 	}
@@ -770,16 +871,21 @@ func (repo *Repo) sync0(context map[string]interface{},
 	}()
 
 	// 获取云端普通文件列表（不包含懒加载文件）
+	stageStart := time.Now()
 	cloudLatestFiles, err := repo.getFiles(cloudLatest.Files)
 	if nil != err {
 		logging.LogErrorf("get cloud latest files failed: %s", err)
 		return
 	}
-	cloudLazyFiles, lazyErr := repo.getFilesWithCloudFallback(cloudLatest.LazyFiles, context)
+	cloudLazyFiles, manifestBacked, lazyErr := repo.cloudLazyFilesForSync(cloudLatest, context)
 	if nil != lazyErr {
 		logging.LogErrorf("get cloud lazy files failed: %s", lazyErr)
 		return lazyErr
 	}
+	logging.LogInfof("sync core transfer stage [stage=cloud-metadata, normal=%d, lazy=%d, lazySource=%s, cost=%s]",
+		len(cloudLatestFiles), len(cloudLazyFiles), map[bool]string{true: "manifest", false: "objects"}[manifestBacked],
+		time.Since(stageStart))
+	stageStart = time.Now()
 	var ignoredCloudDeviceLocalFiles bool
 	cloudLatest, ignoredCloudDeviceLocalFiles, err = repo.sanitizeIndexFiles(cloudLatest, cloudLatestFiles, cloudLazyFiles,
 		"[Sync] Remove device-local cloud files")
@@ -789,6 +895,8 @@ func (repo *Repo) sync0(context map[string]interface{},
 	}
 	cloudLatestFiles, _ = repo.filterProtectedSyncFiles(cloudLatestFiles)
 	cloudLazyFiles, _ = repo.filterProtectedSyncFiles(cloudLazyFiles)
+	logging.LogInfof("sync core transfer stage [stage=sanitize-cloud, changed=%t, normal=%d, lazy=%d, cost=%s]",
+		ignoredCloudDeviceLocalFiles, len(cloudLatestFiles), len(cloudLazyFiles), time.Since(stageStart))
 
 	// 处理懒加载文件：只更新清单，不参与常规同步流程
 	if len(cloudLatest.LazyFiles) > 0 && "" == cloudLatest.LazyManifest {
@@ -807,9 +915,14 @@ func (repo *Repo) sync0(context map[string]interface{},
 	// 下载仅处理普通文件，上传去重基线需要包含云端已经发布的懒加载文件分块。
 	cloudChunkIDs := repo.getChunks(cloudLatestFiles)
 	cloudUploadChunkIDs := repo.getChunks(append(append([]*entity.File{}, cloudLatestFiles...), cloudLazyFiles...))
+	logging.LogInfof("sync core transfer stage [stage=chunk-plan, downloadCandidates=%d, uploadBaseline=%d]", len(cloudChunkIDs),
+		len(cloudUploadChunkIDs))
 	uploadSession := newSyncUploadSession()
 
-	transferTraffic, transferErr := runConcurrentSyncTransfers(func(ret *TrafficStat) error { // 从云端下载缺失分块并入库
+	stageStart = time.Now()
+	transferTraffic, transferErr := runConcurrentSyncTransfers(func(ret *TrafficStat) (taskErr error) { // 从云端下载缺失分块并入库
+		finishAudit := BeginSyncAudit(context, "dejavu.sync.transfer.download", nil)
+		defer func() { finishAudit(taskErr) }()
 		fetchChunkIDs, downloadErr := repo.localNotFoundChunks(cloudChunkIDs)
 		if nil != downloadErr {
 			logging.LogErrorf("get local not found chunks failed: %s", downloadErr)
@@ -827,7 +940,9 @@ func (repo *Repo) sync0(context map[string]interface{},
 			logging.LogErrorf("download cloud chunks put failed: %s", downloadResult.err)
 		}
 		return downloadResult.err
-	}, func(ret *TrafficStat) error { // 上传差异数据
+	}, func(ret *TrafficStat) (taskErr error) { // 上传差异数据
+		finishAudit := BeginSyncAudit(context, "dejavu.sync.transfer.upload", nil)
+		defer func() { finishAudit(taskErr) }()
 		uploadErr := repo.uploadCloud(context, latest, cloudLatest, cloudUploadChunkIDs, ret, uploadSession)
 		if nil != uploadErr {
 			logging.LogErrorf("upload cloud failed: %s", uploadErr)
@@ -836,12 +951,16 @@ func (repo *Repo) sync0(context map[string]interface{},
 		return nil
 	})
 	mergeTrafficStat(trafficStat, transferTraffic)
+	logging.LogInfof("sync core transfer stage [stage=transfer, uploadBytes=%d, downloadBytes=%d, apiPut=%d, apiGet=%d, cost=%s]",
+		transferTraffic.UploadBytes, transferTraffic.DownloadBytes, transferTraffic.APIPut, transferTraffic.APIGet,
+		time.Since(stageStart))
 	if nil != transferErr {
 		err = transferErr
 		return
 	}
 
 	// 计算本地相比上一个同步点的 upsert 和 remove 差异
+	stageStart = time.Now()
 	latestFiles, err := repo.getFiles(latest.Files)
 	if nil != err {
 		logging.LogErrorf("get latest files failed: %s", err)
@@ -868,6 +987,8 @@ func (repo *Repo) sync0(context map[string]interface{},
 	if "" != cloudLatest.ID {
 		cloudUpserts, cloudRemoves = repo.diffUpsertRemove(cloudLatestFiles, latestFiles, true)
 	}
+	logging.LogInfof("sync core transfer stage [stage=diff, localUpserts=%d, localRemoves=%d, cloudUpserts=%d, cloudRemoves=%d, cost=%s]",
+		len(localUpserts), len(localRemoves), len(cloudUpserts), len(cloudRemoves), time.Since(stageStart))
 
 	// 增加一些诊断日志 https://ld246.com/article/1698370932077
 	for _, c := range cloudUpserts {
@@ -1092,19 +1213,24 @@ func (repo *Repo) sync0(context map[string]interface{},
 	}
 
 	// 数据变更后还原文件
+	stageStart = time.Now()
 	err = repo.restoreFiles(mergeResult, context)
 	if nil != err {
 		logging.LogErrorf("restore files failed: %s", err)
 		return
 	}
+	logging.LogInfof("sync core transfer stage [stage=restore, upserts=%d, removes=%d, conflicts=%d, cost=%s]",
+		len(mergeResult.Upserts), len(mergeResult.Removes), len(mergeResult.Conflicts), time.Since(stageStart))
 
 	// 处理合并
+	stageStart = time.Now()
 	err = repo.mergeSync(mergeResult, localChanged, true, latest, cloudLatest, cloudUploadChunkIDs, trafficStat, context,
 		uploadSession)
 	if nil != err {
 		logging.LogErrorf("merge sync failed: %s", err)
 		return
 	}
+	logging.LogInfof("sync core transfer stage [stage=merge-publish, cost=%s]", time.Since(stageStart))
 
 	// 统计流量
 	go repo.cloud.AddTraffic(&cloud.Traffic{
@@ -1116,6 +1242,7 @@ func (repo *Repo) sync0(context map[string]interface{},
 
 	// 移除空目录
 	gulu.File.RemoveEmptyDirs(repo.DataPath, removeEmptyDirExcludes...)
+	logging.LogInfof("sync core transfer completed [total=%s]", time.Since(coreStart))
 	return
 }
 
@@ -1247,6 +1374,8 @@ func (repo *Repo) checkoutTree(file *entity.File, checkoutDir string, luteEngine
 }
 
 func (repo *Repo) restoreFiles(mergeResult *MergeResult, context map[string]interface{}) (err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.restore_files", nil)
+	defer func() { finishAudit(err) }()
 	repo.filterProtectedMergeResult(mergeResult)
 	err = repo.checkoutFiles(mergeResult.Upserts, context)
 	if nil != err {
@@ -1388,24 +1517,22 @@ func (repo *Repo) mergeSync(mergeResult *MergeResult, localChanged, needSyncClou
 }
 
 func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficStat, context map[string]interface{}) (err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.publish_indexes", nil)
+	defer func() { finishAudit(err) }()
 	start := time.Now()
 	logging.LogInfof("updateCloudIndexes: start latestID=%s files=%d lazyFiles=%d checkIndexID=%s",
 		latest.ID, len(latest.Files), len(latest.LazyFiles), latest.CheckIndexID)
 
 	// 校验索引只展开普通文件和懒加载清单根。懒加载元数据的完整闭包在迁移发布事务中单独校验。
-	files, getErr := repo.getFiles(latest.Files)
+	checkFileIDs := latest.Files
+	if "" != latest.LazyManifest && !containsUploadID(latest.Files, latest.LazyManifest) {
+		checkFileIDs = append(append([]string(nil), latest.Files...), latest.LazyManifest)
+	}
+	files, getErr := repo.getFiles(checkFileIDs)
 	if nil != getErr {
 		logging.LogErrorf("get files failed: %s", getErr)
 		err = getErr
 		return
-	}
-	if "" != latest.LazyManifest && !containsUploadID(latest.Files, latest.LazyManifest) {
-		manifestFiles, manifestErr := repo.getFiles([]string{latest.LazyManifest})
-		if nil != manifestErr {
-			logging.LogErrorf("get lazy manifest file failed: %s", manifestErr)
-			return manifestErr
-		}
-		files = append(files, manifestFiles...)
 	}
 
 	checkIndex := buildCheckIndex(latest, files)
@@ -1507,13 +1634,15 @@ func (repo *Repo) updateCloudIndexes(latest *entity.Index, trafficStat *TrafficS
 		}
 	}()
 
-	// 尝试上传修复云端缺失的数据对象
-	waitGroup.Add(1)
-	go func() {
-		defer waitGroup.Done()
+	// 官方云端才会生成缺失对象报告，其他存储无需创建空转的发布前 worker。
+	if repo.shouldUploadCloudMissingObjects() {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
 
-		repo.uploadCloudMissingObjects(trafficStat, context)
-	}()
+			repo.uploadCloudMissingObjects(trafficStat, context)
+		}()
+	}
 
 	waitGroup.Wait()
 
@@ -1841,6 +1970,8 @@ func (repo *Repo) filterLocalUpserts(localUpserts, cloudUpserts []*entity.File) 
 }
 
 func (repo *Repo) getSyncCloudFiles(cloudLatest *entity.Index, context map[string]interface{}) (fetchedFiles []*entity.File, trafficStat *DownloadTrafficStat, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.prefetch_files", nil)
+	defer func() { finishAudit(err) }()
 	trafficStat = &DownloadTrafficStat{}
 	latest, err := repo.Latest()
 	if nil != err {
@@ -2064,6 +2195,8 @@ func (repo *Repo) getFile(files []*entity.File, file *entity.File) *entity.File 
 }
 
 func (repo *Repo) updateCloudRef(ref string, context map[string]interface{}) (uploadBytes int64, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.publish_ref", map[string]string{"ref": ref})
+	defer func() { finishAudit(err) }()
 	eventbus.Publish(eventbus.EvtCloudBeforeUploadRef, context, ref)
 	absFilePath := filepath.Join(repo.cloud.GetConf().RepoPath, ref)
 	data, err := os.ReadFile(absFilePath)
@@ -2078,15 +2211,16 @@ func (repo *Repo) updateCloudRef(ref string, context map[string]interface{}) (up
 	return
 }
 
-var uploadedCloudMissingObjects = false
+func (repo *Repo) shouldUploadCloudMissingObjects() bool {
+	_, ok := repo.cloud.(*cloud.SiYuan)
+	return ok && !repo.cloudMissingObjectsUploaded.Load()
+}
 
 func (repo *Repo) uploadCloudMissingObjects(trafficStat *TrafficStat, context map[string]interface{}) {
-	if uploadedCloudMissingObjects {
+	if _, ok := repo.cloud.(*cloud.SiYuan); !ok {
 		return
 	}
-	uploadedCloudMissingObjects = true
-
-	if _, ok := repo.cloud.(*cloud.SiYuan); !ok {
+	if !repo.cloudMissingObjectsUploaded.CompareAndSwap(false, true) {
 		return
 	}
 
@@ -2205,6 +2339,8 @@ func (repo *Repo) uploadCloudMissingObjects(trafficStat *TrafficStat, context ma
 }
 
 func (repo *Repo) updateCloudCheckIndex(checkIndex *entity.CheckIndex, context map[string]interface{}) (err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.publish_check_index", nil)
+	defer func() { finishAudit(err) }()
 	switch repo.cloud.(type) {
 	case *cloud.SiYuan, *cloud.Local:
 	default:
@@ -2344,6 +2480,8 @@ func (repo *Repo) updateCloudIndexesV2(latest *entity.Index, context map[string]
 }
 
 func (repo *Repo) uploadIndex(index *entity.Index, context map[string]interface{}) (uploadBytes int64, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.upload_index", map[string]string{"index": index.ID})
+	defer func() { finishAudit(err) }()
 	eventbus.Publish(eventbus.EvtCloudBeforeUploadIndex, context, index.ID)
 	length, err := repo.cloud.UploadObject(path.Join("indexes", index.ID), false)
 	uploadBytes += length
@@ -2411,15 +2549,26 @@ func (repo *Repo) localNotFoundChunks(chunkIDs []string) (ret []string, err erro
 }
 
 func (repo *Repo) localNotFoundFiles(fileIDs []string) (ret []string, err error) {
-	for _, fileID := range fileIDs {
-		if _, getFileErr := repo.store.Stat(fileID); nil != getFileErr {
-			if isNoSuchFileOrDirErr(getFileErr) {
+	if 1 > len(fileIDs) {
+		return
+	}
+	lock := sync.Mutex{}
+	result := runConcurrentObjectTransfers(gulu.Str.RemoveDuplicatedElem(fileIDs), repo.cloud.GetConcurrentReqs(),
+		"stat local file", func(fileID string, _ int) (int64, error) {
+			if _, statErr := repo.store.Stat(fileID); nil == statErr {
+				return 0, nil
+			} else if isNoSuchFileOrDirErr(statErr) {
+				lock.Lock()
 				ret = append(ret, fileID)
-				continue
+				lock.Unlock()
+				return 0, nil
+			} else {
+				return 0, statErr
 			}
-			err = getFileErr
-			return
-		}
+		})
+	if nil != result.err {
+		err = result.err
+		return
 	}
 	ret = gulu.Str.RemoveDuplicatedElem(ret)
 	return
@@ -2699,22 +2848,38 @@ func (repo *Repo) filterProtectedMergeResult(mergeResult *MergeResult) {
 }
 
 func (repo *Repo) sanitizeStoredIndex(index *entity.Index, memo string) (ret *entity.Index, sanitized bool, err error) {
+	start := time.Now()
 	if nil == index {
 		return index, false, nil
 	}
 	markerPath := filepath.Join(repo.Path, "sanitized-current-index")
 	marker := "1:" + index.ID
 	if data, readErr := os.ReadFile(markerPath); nil == readErr && string(data) == marker {
+		logging.LogInfof("sync sanitize stored index [index=%s, marker=hit, cost=%s]", index.ID, time.Since(start))
 		return index, false, nil
 	}
+	logging.LogInfof("sync sanitize stored index [index=%s, marker=miss, normal=%d, lazy=%d]", index.ID, len(index.Files),
+		len(index.LazyFiles))
+	normalStart := time.Now()
 	files, err := repo.getFiles(index.Files)
 	if nil != err {
 		return nil, false, err
 	}
-	lazyFiles, err := repo.getFiles(index.LazyFiles)
-	if nil != err {
-		return nil, false, err
+	logging.LogInfof("sync sanitize normal metadata [index=%s, files=%d, cost=%s]", index.ID, len(files),
+		time.Since(normalStart))
+	lazyStart := time.Now()
+	lazyFiles, manifestBacked, manifestErr := repo.lazyManifestFilesForSanitize(index)
+	if nil != manifestErr {
+		return nil, false, manifestErr
 	}
+	if !manifestBacked {
+		lazyFiles, err = repo.getFiles(index.LazyFiles)
+		if nil != err {
+			return nil, false, err
+		}
+	}
+	logging.LogInfof("sync sanitize lazy metadata [index=%s, files=%d, source=%s, cost=%s]", index.ID, len(lazyFiles),
+		map[bool]string{true: "manifest", false: "objects"}[manifestBacked], time.Since(lazyStart))
 	ret, sanitized, err = repo.sanitizeIndexFiles(index, files, lazyFiles, memo)
 	if nil != err {
 		return
@@ -2723,13 +2888,114 @@ func (repo *Repo) sanitizeStoredIndex(index *entity.Index, memo string) (ret *en
 		if err = gulu.File.WriteFileSafer(markerPath, []byte(marker), 0644); nil != err {
 			return nil, false, err
 		}
+		logging.LogInfof("sync sanitize stored index completed [index=%s, changed=false, cost=%s]", index.ID,
+			time.Since(start))
 		return
 	}
 	err = repo.UpdateLatest(ret)
 	if nil == err {
 		err = gulu.File.WriteFileSafer(markerPath, []byte("1:"+ret.ID), 0644)
 	}
+	logging.LogInfof("sync sanitize stored index completed [index=%s, result=%s, changed=true, cost=%s]", index.ID, ret.ID,
+		time.Since(start))
 	return
+}
+
+// lazyManifestFilesForSanitize 在清单与索引严格对应时直接使用清单中的元数据，避免逐个读取冗余的懒加载对象。
+func (repo *Repo) lazyManifestFilesForSanitize(index *entity.Index) (files []*entity.File, usable bool, err error) {
+	if 0 == len(index.LazyFiles) {
+		return nil, true, nil
+	}
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader || "" == index.LazyManifest {
+		return nil, false, nil
+	}
+	manifest, err := repo.lazyLoader.getManifest()
+	if nil != err {
+		return nil, false, nil
+	}
+	if lazyManifestFormatCurrent != lazyManifestFormat(manifest) {
+		return nil, false, nil
+	}
+	if err = validateCurrentLazyManifestCatalog(manifest); nil != err {
+		// 本地清单可能来自旧客户端或尚未完成的迁移。清理索引属于安全边界，清单不可信时必须回退到不可变对象。
+		return nil, false, nil
+	}
+	return lazyManifestFilesForExactIndex(manifest, index)
+}
+
+// cloudLazyFilesForSync 在云端 V2 清单完整描述索引闭包时直接使用清单元数据，旧格式或闭包不匹配时回退到对象读取。
+func (repo *Repo) cloudLazyFilesForSync(index *entity.Index,
+	context map[string]interface{}) (files []*entity.File, manifestBacked bool, err error) {
+	if nil == index || 0 == len(index.LazyFiles) {
+		return nil, true, nil
+	}
+	if !repo.lazyLoadEnabled || nil == repo.lazyLoader || "" == index.LazyManifest {
+		files, err = repo.getFilesWithCloudFallback(index.LazyFiles, context)
+		return files, false, err
+	}
+	manifest, manifestErr := repo.readPublishedLazyManifest(index, context)
+	if nil == manifestErr && lazyManifestFormatCurrent == lazyManifestFormat(manifest) {
+		if files, manifestBacked, err = lazyManifestFilesForExactIndex(manifest, index); nil != err {
+			return nil, false, err
+		}
+		if manifestBacked {
+			return files, true, nil
+		}
+	}
+	if nil != manifestErr {
+		logging.LogWarnf("read cloud lazy manifest [%s] failed, falling back to metadata objects: %s",
+			index.LazyManifest, manifestErr)
+	} else {
+		logging.LogWarnf("cloud lazy manifest [%s] does not exactly match index closure, falling back to metadata objects",
+			index.LazyManifest)
+	}
+	files, err = repo.getFilesWithCloudFallback(index.LazyFiles, context)
+	return files, false, err
+}
+
+// lazyManifestFilesForExactIndex 仅在 V2 清单和索引的 FileID 多重集合完全一致时构造内存元数据。
+func lazyManifestFilesForExactIndex(manifest *LazyManifest,
+	index *entity.Index) (files []*entity.File, usable bool, err error) {
+	if nil == index || 0 == len(index.LazyFiles) {
+		return nil, true, nil
+	}
+	if nil == manifest || lazyManifestFormatCurrent != lazyManifestFormat(manifest) {
+		return nil, false, nil
+	}
+	if err = validateCurrentLazyManifestCatalog(manifest); nil != err {
+		return nil, false, nil
+	}
+	files = make([]*entity.File, 0, len(manifest.Assets))
+	for _, asset := range manifest.Assets {
+		file, buildErr := canonicalLazyManifestFile(asset)
+		if nil != buildErr {
+			return nil, false, nil
+		}
+		files = append(files, file)
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].ID < files[j].ID })
+	if nil != err {
+		return nil, false, nil
+	}
+	if len(files) != len(index.LazyFiles) {
+		return nil, false, nil
+	}
+	counts := make(map[string]int, len(index.LazyFiles))
+	for _, id := range index.LazyFiles {
+		counts[id]++
+	}
+	for _, file := range files {
+		if nil == file || 0 == counts[file.ID] {
+			return nil, false, nil
+		}
+		counts[file.ID]--
+	}
+	for _, count := range counts {
+		if 0 != count {
+			return nil, false, nil
+		}
+	}
+	return files, true, nil
 }
 
 func (repo *Repo) sanitizeIndexFiles(index *entity.Index, files, lazyFiles []*entity.File, memo string) (ret *entity.Index, sanitized bool, err error) {
@@ -2802,7 +3068,7 @@ func (session *syncUploadSession) record(tx *uploadTransaction) {
 }
 
 func (repo *Repo) completeSyncUploadSession(session *syncUploadSession) error {
-	if nil == session {
+	if nil == session || (0 == len(session.completedChunks) && 0 == len(session.completedFiles)) {
 		return nil
 	}
 	data, err := os.ReadFile(filepath.Join(repo.Path, "upload-transactions", "current.json"))
@@ -2953,6 +3219,8 @@ func (repo *Repo) uploadCloud(context map[string]interface{}, latest, cloudLates
 }
 
 func (repo *Repo) verifyUploadedChunks(ids []string, context map[string]interface{}) (downloadBytes int64, verified, apiGets int, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.verify_chunks", nil)
+	defer func() { finishAudit(err) }()
 	for i, id := range ids {
 		apiGets++
 		length, _, downloadErr := repo.downloadCloudChunk(id, i+1, len(ids), context)
@@ -2967,6 +3235,8 @@ func (repo *Repo) verifyUploadedChunks(ids []string, context map[string]interfac
 }
 
 func (repo *Repo) verifyUploadedFiles(ids []string, context map[string]interface{}) (downloadBytes int64, verified, apiGets int, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.verify_files", nil)
+	defer func() { finishAudit(err) }()
 	for i, id := range ids {
 		apiGets++
 		length, file, downloadErr := repo.downloadCloudFile(id, i+1, len(ids), context)
@@ -3151,6 +3421,8 @@ func (repo *Repo) decodeDownloadedData(key string, data []byte) (ret []byte, err
 }
 
 func (repo *Repo) downloadCloudIndex(id string, context map[string]interface{}) (downloadBytes int64, index *entity.Index, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.download_index", map[string]string{"index": id})
+	defer func() { finishAudit(err) }()
 	eventbus.Publish(eventbus.EvtCloudBeforeDownloadIndex, context, id)
 	index = &entity.Index{}
 
@@ -3174,6 +3446,8 @@ func (repo *Repo) downloadCloudIndex(id string, context map[string]interface{}) 
 }
 
 func (repo *Repo) downloadCloudLatest(context map[string]interface{}) (downloadBytes int64, apiGets int, index *entity.Index, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.download_latest", nil)
+	defer func() { finishAudit(err) }()
 	start := time.Now()
 	index = &entity.Index{}
 

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/88250/gulu"
@@ -46,23 +47,24 @@ func completedUploadIDs(completed map[string]bool) []string {
 
 func (repo *Repo) verifyAndRecordUploadIDs(tx *uploadTransaction, chunks bool, ids []string, traffic *TrafficStat,
 	context map[string]interface{}) (verifyErr, saveErr error) {
+	ids = uniqueUploadIDs(ids)
 	completed := tx.CompletedFiles
 	if chunks {
 		completed = tx.CompletedChunks
 	}
-	for _, id := range uniqueUploadIDs(ids) {
-		var bytes int64
-		var verified, gets int
-		var err error
-		if chunks {
-			bytes, verified, gets, err = repo.verifyUploadedChunks([]string{id}, context)
-			traffic.DownloadChunkCount += verified
-		} else {
-			bytes, verified, gets, err = repo.verifyUploadedFiles([]string{id}, context)
-			traffic.DownloadFileCount += verified
+	outcomes := repo.verifyUploadedIDsConcurrently(chunks, ids, context)
+	for i, id := range ids {
+		outcome := outcomes[i]
+		traffic.DownloadBytes += outcome.bytes
+		traffic.APIGet += outcome.gets
+		if nil == outcome.err {
+			if chunks {
+				traffic.DownloadChunkCount += outcome.verified
+			} else {
+				traffic.DownloadFileCount += outcome.verified
+			}
 		}
-		traffic.DownloadBytes += bytes
-		traffic.APIGet += gets
+		err := outcome.err
 		if nil != err {
 			delete(completed, id)
 			tx.Failed[id] = err.Error()
@@ -85,6 +87,61 @@ func (repo *Repo) verifyAndRecordUploadIDs(tx *uploadTransaction, chunks bool, i
 		saveErr = txSaveErr
 	}
 	return
+}
+
+type uploadVerificationOutcome struct {
+	bytes    int64
+	verified int
+	gets     int
+	err      error
+}
+
+// verifyUploadedIDsConcurrently 使用云端配置的并发上限读取并精确校验所有对象，结果顺序与输入顺序一致。
+func (repo *Repo) verifyUploadedIDsConcurrently(chunks bool, ids []string,
+	context map[string]interface{}) []uploadVerificationOutcome {
+	outcomes := make([]uploadVerificationOutcome, len(ids))
+	if 0 == len(ids) {
+		return outcomes
+	}
+	workers := repo.cloud.GetConcurrentReqs()
+	if workers < 1 {
+		workers = 1
+	}
+	if len(ids) < workers {
+		workers = len(ids)
+	}
+
+	jobs := make(chan int)
+	waitGroup := sync.WaitGroup{}
+	waitGroup.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer waitGroup.Done()
+			for index := range jobs {
+				func() {
+					defer func() {
+						if recovered := recover(); nil != recovered {
+							outcomes[index] = uploadVerificationOutcome{err: concurrentTransferPanicError("verify upload", recovered)}
+						}
+					}()
+					id := ids[index]
+					if chunks {
+						outcomes[index].bytes, outcomes[index].verified, outcomes[index].gets, outcomes[index].err =
+							repo.verifyUploadedChunks([]string{id}, context)
+					} else {
+						outcomes[index].bytes, outcomes[index].verified, outcomes[index].gets, outcomes[index].err =
+							repo.verifyUploadedFiles([]string{id}, context)
+					}
+				}()
+			}
+		}()
+	}
+	for index := range ids {
+		jobs <- index
+	}
+	close(jobs)
+	waitGroup.Wait()
+	return outcomes
 }
 
 func (repo *Repo) beginUploadTransaction(indexID string, chunks, files []string) (*uploadTransaction, error) {

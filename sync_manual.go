@@ -29,6 +29,8 @@ import (
 )
 
 func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *MergeResult, trafficStat *TrafficStat, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.download", nil)
+	defer func() { finishAudit(err) }()
 	lock.Lock()
 	defer lock.Unlock()
 	unlockDeviceLocalFiles := repo.lockDeviceLocalSyncFiles()
@@ -243,6 +245,8 @@ func (repo *Repo) SyncDownload(context map[string]interface{}) (mergeResult *Mer
 }
 
 func (repo *Repo) SyncUpload(context map[string]interface{}) (trafficStat *TrafficStat, err error) {
+	finishAudit := BeginSyncAudit(context, "dejavu.sync.upload", nil)
+	defer func() { finishAudit(err) }()
 	lock.Lock()
 	defer lock.Unlock()
 
